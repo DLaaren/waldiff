@@ -2,7 +2,7 @@
 #include <pg_config_manual.h>
 #include <xlog_internal.h>
 #include <xlogreader.h>
-#include <port.h>
+// #include <port.h>
 #include <c.h>
 
 #include <stdio.h>
