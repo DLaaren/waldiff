@@ -1,0 +1,5 @@
+# wal_diff extension
+comment = 'faster recovery and better memory consuming'
+default_version = '1.0'
+module_pathname = '$libdir/wal_diff'
+relocatable = true
