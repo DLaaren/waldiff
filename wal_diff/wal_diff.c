@@ -14,52 +14,143 @@
  */
 #include "postgres.h"
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "archive/archive_module.h"
 #include "storage/copydir.h"
-// extern void copydir(const char *fromdir, const char *todir, bool recurse);
-// extern void copy_file(const char *fromfile, const char *tofile);
 #include "storage/fd.h"
-// здесь функции для работы с файлами
-
-
-// https://www.postgresql.org/docs/current/archive-modules.html
-
+#include "utils/guc.h"
+#include "utils/memutils.h"
 
 PG_MODULE_MAGIC;
 
-static char *archive_directory = NULL;
+static char *wal_directory = NULL;
+static char *wal_diff_directory = NULL;
 
-// что-то типо такого
-static void archive_startup(ArchiveModuleState *state);
-static bool archive_configured(ArchiveModuleState *state);
-static bool archive_file(ArchiveModuleState *state, const char *file, const char *path);
-static bool compress_file(); // or create_wal_diff()
-static void archive_compressed_file(); // or archive_wal_diff()
-static void archive_shutdown(ArchiveModuleState *state)
+static bool check_wal_directory(char **newval, void **extra, GucSource source);
+static bool create_wal_diff();
+static void generate_temp_name(char *temp);
+static bool is_file_archived(char *file);
+static void wal_diff_startup(ArchiveModuleState *state);
+static bool wal_diff_configured(ArchiveModuleState *state);
+static bool wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path);
+static void wall_diff_shutdown(ArchiveModuleState *state);
 
 
-// An archive library is loaded by dynamically loading a shared library 
-// with the archive_library's name as the library base name.
-static const ArchiveModuleCallbacks basic_archive_callbacks = {
-    .startup_cb = archive_startup,                  // additional required initialization
-	.check_configured_cb = archive_configured,      // whether the module id ready to work (is configured)
-                                                    // the server will periodically call this function, 
-                                                    // and archiving will proceed only when it returns true
-	.archive_file_cb = archive_file,                // MUST HAVE -- archive single WAL file
-	.shutdown_cb = archive_shutdown
+static const ArchiveModuleCallbacks wal_diff_callbacks = {
+    .startup_cb = wal_diff_startup,
+	.check_configured_cb = wal_diff_configured,
+	.archive_file_cb = wal_diff_archive,
+	.shutdown_cb = wall_diff_shutdown
 };
-
 
 void
 _PG_init(void)
 {
-    //get archive_dir from GUC
+    DefineCustomStringVariable("wal_diff.wal_directory",
+							   gettext_noop("Archive WAL destination directory."),
+							   NULL,
+							   &wal_directory,
+							   "",
+							   PGC_SIGHUP,
+							   0,
+							   check_wal_directory, NULL, NULL);
+							   
+	DefineCustomStringVariable("wal_diff.wal_diff_directory",
+							   gettext_noop("Archive WAL-diff destination directory."),
+							   NULL,
+							   &wal_diff_directory,
+							   "",
+							   PGC_SIGHUP,
+							   0,
+							   check_wal_directory, NULL, NULL);
+
+	MarkGUCPrefixReserved("wal_diff");
 }
 
-
-// returns to Postgres archiving callbacks
 const ArchiveModuleCallbacks *
 _PG_archive_module_init(void)
 {
-	return &basic_archive_callbacks;
+	return &wal_diff_callbacks;
+}
+
+void 
+wal_diff_startup(ArchiveModuleState *state)
+{
+    ///
+}
+
+// typedef bool (*GucStringCheckHook) (char **newval, void **extra, GucSource source);
+static bool 
+check_wal_directory(char **newval, void **extra, GucSource source)
+{
+
+}
+
+static bool 
+wal_diff_configured(ArchiveModuleState *state)
+{
+    return wal_diff_directory != NULL && wal_diff_directory[0] != '\0' && wal_directory != NULL && wal_directory[0] != '\0';
+}
+
+// file -- just name of the WAL file 
+// path -- the full path including the WAL file name
+static bool 
+wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
+{
+	char wal_diff_destination[MAXPGPATH];
+	char wal_destination[MAXPGPATH];
+	char temp[MAXPGPATH + 256]; // temp location for created wal_diff
+
+	ereport(DEBUG3,
+			(errmsg("archiving \"%s\" via WAL-diff", file)));
+
+	snprintf(wal_destination, MAXPGPATH, "%s/%s", wal_directory, file);
+	snprintf(wal_diff_destination, MAXPGPATH, "%s/%s", wal_diff_directory, file);
+
+	if (!is_file_archived(wal_destination))
+	{
+		(void) durable_rename(path, wal_destination, ERROR);
+	}
+
+	if (!is_file_archived(wal_diff_destination))
+	{
+		generate_temp_file_name(temp);
+		copy_file(path, temp);
+
+		if (!create_wal_diff(temp))
+		{
+
+		}
+
+		(void) durable_rename(temp, wal_diff_destination, ERROR);
+
+		ereport(DEBUG3,
+				(errmsg("created WAL-diff for file \"%s\"", file)));
+	}
+
+	return true;
+}
+
+static bool 
+is_file_archived(char *file) {
+	struct stat st;
+}
+
+static void
+generate_temp_name(char *temp) {
+
+}
+
+static bool 
+create_wal_diff()
+{
+
+}
+
+static void 
+wall_diff_shutdown(ArchiveModuleState *state)
+{
+	///
 }
