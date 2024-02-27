@@ -1,4 +1,4 @@
 .vscode/
-.depts/
+.deps/
 *.o
 *.so

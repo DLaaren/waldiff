@@ -5,6 +5,7 @@ OBJS = \
 	WALReader_implementation.o
 
 EXTENSION = wal_diff
+DATA = wal_diff--1.0.sql
 
 PGFILEDESC = "wal_diff"
 
