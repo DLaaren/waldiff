@@ -3,6 +3,8 @@
 MODULES = wal_diff
 PGFILEDESC = "wal_diff - archive module with compressing"
 
+NO_INSTALLCHECK = 1
+
 ifdef USE_PGXS
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

@@ -9,7 +9,7 @@ if host_system == 'windows'
 endif
 
 wal_diff = shared_module('wal_diff',
-  basic_archive_sources,
-  kwargs: contrib_mod_args,
+  wal_diff_sources,
+  kwargs: contrib_mod_args, 
 )
 contrib_targets += wal_diff
