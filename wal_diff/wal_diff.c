@@ -173,13 +173,14 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 
 	if (!is_file_archived(path, wal_destination, wal_directory))
 	{
-		(void) durable_rename(path, wal_destination, ERROR);
+		copy_file(path, wal_destination);
 	}
 
 	if (!is_file_archived(path, wal_diff_destination, wal_diff_directory))
 	{
-		generate_temp_file_name(temp, path);
-		copy_file(path, temp);
+		/* here is the problem */
+		generate_temp_file_name(temp, wal_diff_destination);
+		copy_file(wal_destination, temp);
 
 		if (!create_wal_diff(temp, wal_diff_destination))
 		{
@@ -187,8 +188,6 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 					errmsg("error while creating WAL-diff"));
 			return false;
 		}
-
-		(void) durable_rename(temp, wal_diff_destination, ERROR);
 
 		ereport(DEBUG3,
 				errmsg("created WAL-diff for file \"%s\"", file));
@@ -265,6 +264,7 @@ compare_files(const char *file, const char *destination)
 static bool 
 create_wal_diff(const char *temp, const char *destination)
 {
+	(void) durable_rename(temp, destination, ERROR);
 	return true;
 }
 
