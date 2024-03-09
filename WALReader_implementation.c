@@ -6,11 +6,16 @@
 #include "c.h"
 #include "fmgr.h"
 #include "utils/builtins.h"
+#include "access/htup.h"
+#include "access/htup_details.h"
+#include "access/heapam_xlog.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h> // for "open" function
 #include <unistd.h>
+
+#include <stdio.h>
 
 PG_MODULE_MAGIC;
 typedef struct XLogDumpPrivate {
@@ -122,11 +127,24 @@ static void _read_header(const char* wal_file_name, const char* wal_dir_path) {
     XLogDumpPrivate private;
     XLogSegNo	segno;
     XLogRecPtr first_record;
-    char* errmsg;
     XLogReaderState* xlogreader;
-    XLogRecord* record;
 
-    int headers_length = 0;
+    XLogPageHeader page_hdr;
+    XLogRecord* record;
+    char* errmsg;
+
+    RelFileLocator target_locator;
+    BlockNumber blknum;
+    ForkNumber forknum;
+    char* data;
+    Size data_len;
+    HeapTupleHeader tuple_hdr;
+    uint8 info_bits;
+
+    union {
+		HeapTupleHeaderData hdr;
+		char		data[MaxHeapTupleSize];
+	} tbuf;
 
     int fd = open_file_in_directory(wal_dir_path, wal_file_name);
     if (fd < 0) {
@@ -169,21 +187,43 @@ static void _read_header(const char* wal_file_name, const char* wal_dir_path) {
         elog(FATAL, "could not find a valid record after %X/%X", LSN_FORMAT_ARGS(private.startptr));
         return;
     }
+
+    page_hdr = (XLogPageHeader) xlogreader->readBuf;
+    if (XLogPageHeaderSize(page_hdr) == SizeOfXLogLongPHD)
+        elog(INFO, "Got long page header\n");
+    else
+        elog(INFO, "Got short page header\n");
+
+    elog(INFO, "Remaining data from a previous page : %d\n", page_hdr->xlp_rem_len);
     
-    record = XLogReadRecord(xlogreader, &errmsg);
-    // После этой функции, xlogreader->record указывает на структуру DecodedXLogRecord. При этом xlogreader->read_buf содержит непосредственно информацию, вычитанную из файла
+    while (true) {
+        record = XLogReadRecord(xlogreader, &errmsg);
+        // После этой функции, xlogreader->record указывает на структуру DecodedXLogRecord. При этом xlogreader->read_buf содержит непосредственно информацию, вычитанную из файла
+        if (!record)
+            break;
+        if (record == InvalidXLogRecPtr) {
+            elog(INFO, "XLogReadRecord failed to read first record\n");
+            return;
+        }
+        if (strcmp(GetRmgr(xlogreader->record->header.xl_rmid).rm_name, "Heap") == 0 || strcmp(GetRmgr(xlogreader->record->header.xl_rmid).rm_name, "Heap2") == 0) {
+            elog(INFO, "Resource manager : %s\n", GetRmgr(xlogreader->record->header.xl_rmid).rm_name);
 
-    if (record == InvalidXLogRecPtr) {
-        elog(INFO, "XLogReadRecord failed to read first record\n");
-        return;
-    }    
+            info_bits = XLogRecGetInfo(xlogreader) & ~XLR_INFO_MASK;
+            if ((info_bits & XLOG_HEAP_OPMASK) == XLOG_HEAP_INSERT) {
+                elog(INFO, "Got INSERT record\n");
 
-    elog(INFO, "Location of read record : %ld\n", xlogreader->record->lsn);
-    elog(INFO, "Max block id : %d\n", xlogreader->record->max_block_id);
+                XLogRecGetBlockTag(xlogreader, 0, &target_locator, &forknum, &blknum); // указатель record в структуре XLogReaderSate указывает на последнюю декодированную запись
+                data = XLogRecGetBlockData(xlogreader, 0, &data_len); // насколько я понял, heap и heap2 держат информацию в одном единственном блоке
 
-    headers_length = xlogreader->record->size - 24 - xlogreader->record->main_data_len;
-    if (headers_length > 2) { // that means that we have at least one XLogRecordBlockHeader
-        XLogRecordBlockHeader* block_header = (XLogRecordBlockHeader*) (xlogreader->readBuf + SizeOfXLogRecord);
-        elog(INFO, "block reference id : %hhu\t payload bytes %hu\n", block_header->id, block_header->data_length);
+                tuple_hdr = &tbuf.hdr;
+                MemSet((char *) tuple_hdr, 0, data_len); //TODO заменить на data_len
+                memcpy((char *) tuple_hdr, data, data_len);
+
+                elog(INFO, "XMIN for this record : %d\n", tuple_hdr->t_choice.t_heap.t_xmin);
+                break;
+            }
+        }
     }
+    
+	XLogReaderFree(xlogreader);
 }
