@@ -25,7 +25,7 @@ typedef struct XLogDumpPrivate {
     bool  endptr_reached;
 } XLogDumpPrivate;
 
-static void _read_header(const char* wal_file_name, const char* wal_dir_path);
+static void fetch_readable_info_from_wal(const char* wal_file_name, const char* wal_dir_path);
 int open_file_in_directory(const char *directory, const char *fname);
 
 static int WalSegSz;
@@ -107,21 +107,116 @@ static void CloseSegmentCallback(XLogReaderState *state) {
     state->seg.ws_file = -1;
 }
 
-PG_FUNCTION_INFO_V1(read_header);
+static void fetch_from_insert(XLogReaderState* xlogreader) {
+    RelFileLocator target_locator;
+    BlockNumber blknum;
+    ForkNumber forknum;
+    ItemPointerData target_tid;
+    xl_heap_insert *xlrec;
+    char* data;
+    Size data_len;
+    HeapTupleHeader tuple_hdr;
+    xl_heap_header xlhdr;
 
-Datum read_header(PG_FUNCTION_ARGS) {
+    union {
+		HeapTupleHeaderData hdr;
+		char		data[MaxHeapTupleSize];
+	} tbuf;
+
+    elog(INFO, "Got INSERT record\n");
+
+    XLogRecGetBlockTag(xlogreader, 0, &target_locator, &forknum, &blknum); // указатель record в структуре XLogReaderSate указывает на последнюю декодированную запись
+    xlrec = (xl_heap_insert *) XLogRecGetData(xlogreader);
+    ItemPointerSetBlockNumber(&target_tid, blknum);
+    ItemPointerSetOffsetNumber(&target_tid, xlrec->offnum);
+
+    data = XLogRecGetBlockData(xlogreader, 0, &data_len); // насколько я понял, heap и heap2 держат информацию в одном единственном блоке
+
+    /*
+    насколько я понял, в целях экономии в insert или update записях содержатся не все данные, необходимые для HeapTupleHeader,
+    поэтому вычитываем имеющиеся данные в xl_heap_header
+    */
+    memcpy((char *) &xlhdr, data, SizeOfHeapHeader);
+
+    tuple_hdr = &tbuf.hdr; // инициализируем, чтобы не ругался Make
+    MemSet((char *) tuple_hdr, 0, SizeofHeapTupleHeader);
+    memcpy((char *) tuple_hdr + SizeofHeapTupleHeader, data + SizeOfHeapHeader, data_len - SizeOfHeapHeader);
+
+    tuple_hdr->t_infomask2 = xlhdr.t_infomask2;
+    tuple_hdr->t_infomask = xlhdr.t_infomask;
+    tuple_hdr->t_hoff = xlhdr.t_hoff;
+    HeapTupleHeaderSetXmin(tuple_hdr, XLogRecGetXid(xlogreader));
+    HeapTupleHeaderSetCmin(tuple_hdr, FirstCommandId);
+    tuple_hdr->t_ctid = target_tid;
+
+    /*
+    После этих действий, tuple_hdr может быть прикастована к Item и вставлена в страницу с offset = xlrec->offnum
+    (указание для использования конкретного line pointer)
+
+    Вставка в страницу происходит посредством обычного memcpy
+    */
+
+    // Попытаемя теперь узнать, к какой таблице относится данная запись
+    elog(INFO, "Tablespace : %d\nDatabase : %d\nRelation : %d\n", target_locator.spcOid, target_locator.dbOid, target_locator.relNumber);
+    /*
+    Имея на руках target_locator, мы можем узнать табличное пространство, базу данных и отношение, к которому относится запись WAL :
+    SELECT datname FROM pg_database WHERE oid = 'ваш_oid_базы_данных';
+    SELECT spcname FROM pg_tablespace WHERE oid = 'ваш_oid_tablespace';
+    SELECT relname FROM pg_class WHERE oid = 'ваш_oid_таблицы';
+    */
+}
+
+static void fetch_from_update(XLogReaderState* xlogreader) {
+    xl_heap_update* xlrec;
+    RelFileLocator rlocator;
+	BlockNumber oldblk;
+	BlockNumber newblk;
+    ItemPointerData newtid;
+    HeapTupleData oldtup;
+	HeapTupleHeader htup;
+    ItemId		lp = NULL;
+
+    union
+	{
+		HeapTupleHeaderData hdr;
+		char		data[MaxHeapTupleSize];
+	}			tbuf;
+	xl_heap_header xlhdr;
+
+    elog(INFO, "Got UPDATE record\n");
+
+    oldtup.t_data = NULL; // инициализируем, чтобы не ругался компилятор
+	oldtup.t_len = 0;
+
+    XLogRecGetBlockTag(xlogreader, 0, &rlocator, NULL, &newblk);
+    /*
+    Про это написано в xl_heap_update - нам могут передать второй блок, ссылающийся на старую запись
+    */
+    if (!XLogRecGetBlockTagExtended(xlogreader, 1, NULL, NULL, &oldblk, NULL))
+        oldblk = newblk;
+
+    ItemPointerSet(&newtid, newblk, xlrec->new_offnum);
+
+    /*
+    Найдем информацию о старой записи
+    */
+}
+
+PG_FUNCTION_INFO_V1(explain_wal_record);
+
+Datum explain_wal_record(PG_FUNCTION_ARGS) {
     text* arg_1 = PG_GETARG_TEXT_PP(0);
     text* arg_2 = PG_GETARG_TEXT_PP(1);
 
     const char* wal_dir = text_to_cstring(arg_1);
     const char* wal_file = text_to_cstring(arg_2);
 
-    _read_header(wal_file, wal_dir);
+    fetch_readable_info_from_wal(wal_file, wal_dir);
 
     PG_RETURN_VOID();
 }
 
-static void _read_header(const char* wal_file_name, const char* wal_dir_path) {
+static void fetch_readable_info_from_wal(const char* wal_file_name, const char* wal_dir_path) {
     PGAlignedXLogBlock buff; // local variable, holding a page buffer
     int read_count = 0;
     XLogDumpPrivate private;
@@ -132,19 +227,7 @@ static void _read_header(const char* wal_file_name, const char* wal_dir_path) {
     XLogPageHeader page_hdr;
     XLogRecord* record;
     char* errmsg;
-
-    RelFileLocator target_locator;
-    BlockNumber blknum;
-    ForkNumber forknum;
-    char* data;
-    Size data_len;
-    HeapTupleHeader tuple_hdr;
     uint8 info_bits;
-
-    union {
-		HeapTupleHeaderData hdr;
-		char		data[MaxHeapTupleSize];
-	} tbuf;
 
     int fd = open_file_in_directory(wal_dir_path, wal_file_name);
     if (fd < 0) {
@@ -202,7 +285,7 @@ static void _read_header(const char* wal_file_name, const char* wal_dir_path) {
         if (!record)
             break;
         if (record == InvalidXLogRecPtr) {
-            elog(INFO, "XLogReadRecord failed to read first record\n");
+            elog(INFO, "XLogReadRecord failed to read record\n");
             return;
         }
         if (strcmp(GetRmgr(xlogreader->record->header.xl_rmid).rm_name, "Heap") == 0 || strcmp(GetRmgr(xlogreader->record->header.xl_rmid).rm_name, "Heap2") == 0) {
@@ -210,17 +293,11 @@ static void _read_header(const char* wal_file_name, const char* wal_dir_path) {
 
             info_bits = XLogRecGetInfo(xlogreader) & ~XLR_INFO_MASK;
             if ((info_bits & XLOG_HEAP_OPMASK) == XLOG_HEAP_INSERT) {
-                elog(INFO, "Got INSERT record\n");
-
-                XLogRecGetBlockTag(xlogreader, 0, &target_locator, &forknum, &blknum); // указатель record в структуре XLogReaderSate указывает на последнюю декодированную запись
-                data = XLogRecGetBlockData(xlogreader, 0, &data_len); // насколько я понял, heap и heap2 держат информацию в одном единственном блоке
-
-                tuple_hdr = &tbuf.hdr;
-                MemSet((char *) tuple_hdr, 0, data_len); //TODO заменить на data_len
-                memcpy((char *) tuple_hdr, data, data_len);
-
-                elog(INFO, "XMIN for this record : %d\n", tuple_hdr->t_choice.t_heap.t_xmin);
+                fetch_from_insert(xlogreader);
                 break;
+            }
+            else if ((info_bits & XLOG_HEAP_OPMASK) == XLOG_HEAP_UPDATE) {
+                
             }
         }
     }
