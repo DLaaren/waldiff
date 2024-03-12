@@ -165,8 +165,8 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 	char wal_destination[MAXPGPATH];
 	char temp[MAXPGPATH + 256]; // temp location for creating WAL-diff
 
-	ereport(DEBUG3,
-			errmsg("archiving \"%s\" via WAL-diff", file));
+	ereport(LOG,
+			errmsg("archiving \"%s\" via WAL-diff", path));
 
 	snprintf(wal_destination, MAXPGPATH, "%s/%s", wal_directory, file);
 	snprintf(wal_diff_destination, MAXPGPATH, "%s/%s", wal_diff_directory, file);
@@ -178,7 +178,6 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 
 	if (!is_file_archived(path, wal_diff_destination, wal_diff_directory))
 	{
-		/* here is the problem */
 		generate_temp_file_name(temp, wal_diff_destination);
 		copy_file(wal_destination, temp);
 
@@ -189,7 +188,7 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 			return false;
 		}
 
-		ereport(DEBUG3,
+		ereport(LOG,
 				errmsg("created WAL-diff for file \"%s\"", file));
 	}
 
@@ -209,7 +208,7 @@ is_file_archived(const char *file, const char *destination, const char *archive_
 	{
 		if (compare_files(file, destination))
 		{
-			ereport(DEBUG3,
+			ereport(WARNING,
 					errmsg("file \"%s\" already exists with identical contents",
 							destination));
 
@@ -233,16 +232,18 @@ is_file_archived(const char *file, const char *destination, const char *archive_
 
 static void
 generate_temp_file_name(char *temp, const char *file) {
+	const size_t temp_size = MAXPGPATH + 256;
 	struct timeval tv;
 	uint64 epoch;
 
 	gettimeofday(&tv, NULL);
 	if (pg_mul_u64_overflow((uint64) 1000, (uint64) tv.tv_sec, &epoch) ||
 		pg_add_u64_overflow(epoch, (uint64) (tv.tv_usec / 1000), &epoch))
-		elog(ERROR, "could not generate temporary file name for archiving");
+		ereport(ERROR, errmsg("could not generate temporary file name for archiving"));
 
-	snprintf(temp, sizeof(temp), "%s.%s.%d." UINT64_FORMAT,
+	snprintf(temp, temp_size, "%s.%s.%d." UINT64_FORMAT,
 			 file, "temp", MyProcPid, epoch);
+	ereport(LOG, errmsg("temp name is \"%s\"", temp));
 }
 
 /*
