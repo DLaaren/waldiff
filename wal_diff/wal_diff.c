@@ -28,13 +28,11 @@
 
 PG_MODULE_MAGIC;
 
-static char *wal_directory = NULL;
 static char *wal_diff_directory = NULL;
 
 static bool check_archive_directory(char **newval, void **extra, GucSource source);
 static bool create_wal_diff(const char *file, const char *destination);
 static bool compare_files(const char *file1, const char *file2);
-static void generate_temp_file_name(char *temp, const char *file);
 static bool is_file_archived(const char *file, const char *destination, const char *archive_directory);
 static void wal_diff_startup(ArchiveModuleState *state);
 static bool wal_diff_configured(ArchiveModuleState *state);
@@ -55,16 +53,7 @@ static const ArchiveModuleCallbacks wal_diff_callbacks = {
  */
 void
 _PG_init(void)
-{
-    DefineCustomStringVariable("wal_diff.wal_directory",
-							   gettext_noop("Archive WAL destination directory."),
-							   NULL,
-							   &wal_directory,
-							   "wal_directory",
-							   PGC_SIGHUP,
-							   0,
-							   check_archive_directory, NULL, NULL);
-							   
+{							   
 	DefineCustomStringVariable("wal_diff.wal_diff_directory",
 							   gettext_noop("Archive WAL-diff destination directory."),
 							   NULL,
@@ -140,13 +129,12 @@ check_archive_directory(char **newval, void **extra, GucSource source)
 /*
  * wal_diff_configured
  *
- * Checks that wal_directory and wal_diff_directory are not blank.
+ * Checks if wal_diff_directory is not blank.
  */
 static bool 
 wal_diff_configured(ArchiveModuleState *state)
 {
-    return wal_diff_directory != NULL && wal_diff_directory[0] != '\0' 
-			&& wal_directory != NULL && wal_directory[0] != '\0';
+    return wal_diff_directory != NULL && wal_diff_directory[0] != '\0';
 }
 
 /*
@@ -158,7 +146,7 @@ wal_diff_configured(ArchiveModuleState *state)
 /*
  * wal_diff_archive
  *
- * Archives one WAL file and WAL-diff file.
+ * Archives one WAL-diff file.
  * 
  * file -- just name of the WAL file 
  * path -- the full path including the WAL file name
@@ -166,11 +154,9 @@ wal_diff_configured(ArchiveModuleState *state)
 static bool 
 wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 {
+#define TEMP_MAXPATH (MAXPGPATH + 256)
 	char wal_diff_destination[MAXPGPATH];
-	char wal_destination[MAXPGPATH];
-	char temp[MAXPGPATH + 256]; // temp location for creating WAL-diff
 
-	snprintf(wal_destination, MAXPGPATH, "%s/%s", wal_directory, file);
 	snprintf(wal_diff_destination, MAXPGPATH, "%s/%s", wal_diff_directory, file);
 
 	/*
@@ -178,19 +164,9 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 	 * This scenario is possible if the server chrashed after archiving the file
 	 * but before renaming its .ready to .done
 	 */
-	if (!is_file_archived(path, wal_destination, wal_directory))
-	{
-		copy_file(path, wal_destination);
-		ereport(LOG,
-				errmsg("archived wal-file \"%s\"", file));
-	}
-
 	if (!is_file_archived(path, wal_diff_destination, wal_diff_directory))
 	{
-		generate_temp_file_name(temp, wal_diff_destination);
-		copy_file(wal_destination, temp);
-
-		if (!create_wal_diff(temp, wal_diff_destination))
+		if (!create_wal_diff(path, wal_diff_destination))
 		{
 			ereport(ERROR,
 					errmsg("error while creating WAL-diff"));
@@ -237,22 +213,6 @@ is_file_archived(const char *file, const char *destination, const char *archive_
 	}
 
 	return false;
-}
-
-static void
-generate_temp_file_name(char *temp, const char *file) {
-	const size_t temp_size = MAXPGPATH + 256;
-	struct timeval tv;
-	uint64 epoch;
-
-	gettimeofday(&tv, NULL);
-	if (pg_mul_u64_overflow((uint64) 1000, (uint64) tv.tv_sec, &epoch) ||
-		pg_add_u64_overflow(epoch, (uint64) (tv.tv_usec / 1000), &epoch))
-		ereport(ERROR, errmsg("could not generate temporary file name for archiving"));
-
-	snprintf(temp, temp_size, "%s.%s.%d." UINT64_FORMAT,
-			 file, "temp", MyProcPid, epoch);
-	// ereport(LOG, errmsg("temp name is \"%s\"", temp));
 }
 
 /*
@@ -344,6 +304,18 @@ compare_files(const char *file1, const char *file2)
 static bool 
 create_wal_diff(const char *file, const char *destination)
 {
+#define CMP_BUF_SIZE (4096)
+	char buf[CMP_BUF_SIZE];
+	int fd;
+
+	fd = OpenTransientFile(file, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", file)));
+
+
+
 	(void) durable_rename(file, destination, ERROR);
 	return true;
 }
