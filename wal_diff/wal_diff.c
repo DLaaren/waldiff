@@ -213,7 +213,7 @@ static bool
 is_file_archived(const char *file, const char *destination, const char *archive_directory) {
 	struct stat st;
 	
-	if (stat(file, &st) == 0)
+	if (stat(destination, &st) == 0)
 	{
 		if (compare_files(file, destination))
 		{
