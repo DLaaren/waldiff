@@ -9,6 +9,7 @@
 #include "access/htup.h"
 #include "access/htup_details.h"
 #include "access/heapam_xlog.h"
+#include "utils/syscache.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -167,39 +168,38 @@ static void fetch_from_insert(XLogReaderState* xlogreader) {
 }
 
 static void fetch_from_update(XLogReaderState* xlogreader) {
-    xl_heap_update* xlrec;
+    xl_heap_update* xlrec = (xl_heap_update *) XLogRecGetData(xlogreader);
     RelFileLocator rlocator;
 	BlockNumber oldblk;
 	BlockNumber newblk;
     ItemPointerData newtid;
     HeapTupleData oldtup;
-	HeapTupleHeader htup;
-    ItemId		lp = NULL;
 
-    union
-	{
-		HeapTupleHeaderData hdr;
-		char		data[MaxHeapTupleSize];
-	}			tbuf;
-	xl_heap_header xlhdr;
+    ForkNumber forknum;
 
-    elog(INFO, "Got UPDATE record\n");
+    Oid table_oid;
+    HeapTuple tuple;
 
     oldtup.t_data = NULL; // инициализируем, чтобы не ругался компилятор
 	oldtup.t_len = 0;
 
-    XLogRecGetBlockTag(xlogreader, 0, &rlocator, NULL, &newblk);
-    /*
-    Про это написано в xl_heap_update - нам могут передать второй блок, ссылающийся на старую запись
-    */
-    if (!XLogRecGetBlockTagExtended(xlogreader, 1, NULL, NULL, &oldblk, NULL))
-        oldblk = newblk;
+    XLogRecGetBlockTag(xlogreader, 0, &rlocator, &forknum, &newblk);
+	if (!XLogRecGetBlockTagExtended(xlogreader, 1, NULL, NULL, &oldblk, NULL))
+		oldblk = newblk;
 
     ItemPointerSet(&newtid, newblk, xlrec->new_offnum);
 
-    /*
-    Найдем информацию о старой записи
-    */
+    if (rlocator.dbOid == 5 && rlocator.relNumber == 16397) {
+        elog(INFO, "Tablespace : %d\tDatabase : %d\tRelation : %d\n", rlocator.spcOid, rlocator.dbOid, rlocator.relNumber);
+        elog(INFO, "Forknumber : %d\nOldBlockNumber : %d\nInBLockOffset : %d\n", forknum, oldblk, newtid.ip_posid);
+    }
+
+    table_oid = rlocator.relNumber;
+    tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(table_oid));
+    elog(INFO, "Found tuple id : %d\n", tuple->t_tableOid);
+    memcpy(&(oldtup.t_data), tuple->t_data, tuple->t_len);
+    oldtup.t_len = tuple->t_len;
+    ReleaseSysCache(tuple);
 }
 
 PG_FUNCTION_INFO_V1(explain_wal_record);
@@ -217,6 +217,10 @@ Datum explain_wal_record(PG_FUNCTION_ARGS) {
 }
 
 static void fetch_readable_info_from_wal(const char* wal_file_name, const char* wal_dir_path) {
+    /*
+    Много чего взято из файла src/bin/pg_waldump/pg_waldump.c
+    Если что, идем туда
+    */
     PGAlignedXLogBlock buff; // local variable, holding a page buffer
     int read_count = 0;
     XLogDumpPrivate private;
@@ -289,15 +293,16 @@ static void fetch_readable_info_from_wal(const char* wal_file_name, const char* 
             return;
         }
         if (strcmp(GetRmgr(xlogreader->record->header.xl_rmid).rm_name, "Heap") == 0 || strcmp(GetRmgr(xlogreader->record->header.xl_rmid).rm_name, "Heap2") == 0) {
-            elog(INFO, "Resource manager : %s\n", GetRmgr(xlogreader->record->header.xl_rmid).rm_name);
+            // elog(INFO, "Resource manager : %s\n", GetRmgr(xlogreader->record->header.xl_rmid).rm_name);
 
             info_bits = XLogRecGetInfo(xlogreader) & ~XLR_INFO_MASK;
             if ((info_bits & XLOG_HEAP_OPMASK) == XLOG_HEAP_INSERT) {
-                fetch_from_insert(xlogreader);
-                break;
+                // fetch_from_insert(xlogreader);
+                // break;
             }
-            else if ((info_bits & XLOG_HEAP_OPMASK) == XLOG_HEAP_UPDATE) {
-                
+            else if ((info_bits & XLOG_HEAP_OPMASK) == XLOG_HEAP_UPDATE || (info_bits & XLOG_HEAP_OPMASK) == XLOG_HEAP_HOT_UPDATE) {
+                fetch_from_update(xlogreader);
+                // break;
             }
         }
     }
