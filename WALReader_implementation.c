@@ -9,14 +9,21 @@
 #include "access/htup.h"
 #include "access/htup_details.h"
 #include "access/heapam_xlog.h"
-#include "utils/syscache.h"
+#include "storage/bufpage.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h> // for "open" function
 #include <unistd.h>
-
 #include <stdio.h>
+
+#ifndef DEFAULTTABLESPACE_OID
+#define DEFAULTTABLESPACE_OID 1663
+#endif
+
+#ifndef GLOBALTABLESPACE_OID
+#define GLOBALTABLESPACE_OID 1664
+#endif
 
 PG_MODULE_MAGIC;
 typedef struct XLogDumpPrivate {
@@ -27,9 +34,18 @@ typedef struct XLogDumpPrivate {
 } XLogDumpPrivate;
 
 static void fetch_readable_info_from_wal(const char* wal_file_name, const char* wal_dir_path);
+static char* find_path2relation_directory(RelFileLocator rlocator, ForkNumber forknum);
+static char* form_relation_filename(RelFileLocator rlocator, ForkNumber forknum);
 int open_file_in_directory(const char *directory, const char *fname);
 
 static int WalSegSz;
+
+const char *const forkNames[] = {
+	"main",						/* MAIN_FORKNUM */
+	"fsm",						/* FSM_FORKNUM */
+	"vm",						/* VISIBILITYMAP_FORKNUM */
+	"init"						/* INIT_FORKNUM */
+};
 
 /*
  * Open the file in the valid target directory.
@@ -49,6 +65,58 @@ int open_file_in_directory(const char *directory, const char *fname) {
     printf("could not open file \"%s\": %m", fname);
     
     return fd;
+}
+
+// TODO не забыть, что при создании копии, все имена каталогов оканчиваются на .tar (вроде как)
+// TODO На будущее : если таблица достаточно большая (занимает как минимум два файла), то мы должны это учесть
+static char* find_path2relation_directory(RelFileLocator rlocator, ForkNumber forknum) {
+    char* path;
+    if (rlocator.spcOid == GLOBALTABLESPACE_OID) {
+        Assert(rlocator.dbOid == 0);
+        if (forknum != MAIN_FORKNUM)
+            path = psprintf("global");
+        else
+            path = psprintf("global");
+    }
+    else if (rlocator.spcOid == DEFAULTTABLESPACE_OID) {
+        if (forknum != MAIN_FORKNUM)
+            path = psprintf("base/%u", rlocator.dbOid);
+        else
+            path = psprintf("base/%u", rlocator.dbOid);
+    }
+    else {
+        if (forknum != MAIN_FORKNUM)
+			path = psprintf("pg_tblspc/%u/%s/%u", rlocator.spcOid, TABLESPACE_VERSION_DIRECTORY, rlocator.dbOid);
+        else
+            path = psprintf("pg_tblspc/%u/%s/%u", rlocator.spcOid, TABLESPACE_VERSION_DIRECTORY, rlocator.dbOid);
+    }
+    return path;
+}
+
+static char* form_relation_filename(RelFileLocator rlocator, ForkNumber forknum) {
+    char* filename;
+
+    if (rlocator.spcOid == GLOBALTABLESPACE_OID) {
+        Assert(rlocator.dbOid == 0);
+        if (forknum != MAIN_FORKNUM)
+            filename = psprintf("%u_%s", rlocator.relNumber, forkNames[forknum]);
+        else
+            filename = psprintf("%u", rlocator.relNumber);
+    }
+    else if (rlocator.spcOid == DEFAULTTABLESPACE_OID) {
+        if (forknum != MAIN_FORKNUM)
+            filename = psprintf("%u_%s", rlocator.relNumber, forkNames[forknum]);
+        else
+            filename = psprintf("%u", rlocator.relNumber);
+    }
+    else {
+        if (forknum != MAIN_FORKNUM)
+			filename = psprintf("%u_%s", rlocator.relNumber, forkNames[forknum]);
+        else
+            filename = psprintf("%u/%u", rlocator.dbOid, rlocator.relNumber);
+    }
+
+    return filename;
 }
 
 static int PageReadCallback (XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen, XLogRecPtr targetPtr, char *readBuff) {
@@ -167,6 +235,8 @@ static void fetch_from_insert(XLogReaderState* xlogreader) {
     */
 }
 
+static const char* pgdata_path = "/usr/local/pgsql/data"; // TODO это заглушка. не забыть удалить потом
+
 static void fetch_from_update(XLogReaderState* xlogreader) {
     xl_heap_update* xlrec = (xl_heap_update *) XLogRecGetData(xlogreader);
     RelFileLocator rlocator;
@@ -177,8 +247,8 @@ static void fetch_from_update(XLogReaderState* xlogreader) {
 
     ForkNumber forknum;
 
-    Oid table_oid;
-    HeapTuple tuple;
+    // Oid table_oid;
+    // HeapTuple tuple;
 
     oldtup.t_data = NULL; // инициализируем, чтобы не ругался компилятор
 	oldtup.t_len = 0;
@@ -190,16 +260,63 @@ static void fetch_from_update(XLogReaderState* xlogreader) {
     ItemPointerSet(&newtid, newblk, xlrec->new_offnum);
 
     if (rlocator.dbOid == 5 && rlocator.relNumber == 16397) {
+        Page page;
+        char* relation_directory_path;
+        char* relation_file_name;
+        char* full_relation_directory_path;
+        int fd;
+        PGAlignedXLogBlock buff;
+        PageHeader page_hdr;
+        int read_count;
+
+        OffsetNumber offnum;
+        ItemId lp;
+        HeapTupleHeader htup;
+
         elog(INFO, "Tablespace : %d\tDatabase : %d\tRelation : %d\n", rlocator.spcOid, rlocator.dbOid, rlocator.relNumber);
         elog(INFO, "Forknumber : %d\nOldBlockNumber : %d\nInBLockOffset : %d\n", forknum, oldblk, newtid.ip_posid);
-    }
 
-    table_oid = rlocator.relNumber;
-    tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(table_oid));
-    elog(INFO, "Found tuple id : %d\n", tuple->t_tableOid);
-    memcpy(&(oldtup.t_data), tuple->t_data, tuple->t_len);
-    oldtup.t_len = tuple->t_len;
-    ReleaseSysCache(tuple);
+        relation_directory_path = find_path2relation_directory(rlocator, forknum);
+        full_relation_directory_path = psprintf("%s/%s", pgdata_path, relation_directory_path);
+        relation_file_name = form_relation_filename(rlocator, forknum);
+
+        elog(INFO, "Full path to the relation : %s/%s\n", full_relation_directory_path, relation_file_name);
+
+        fd = open_file_in_directory(full_relation_directory_path, relation_file_name);
+        if (fd < 0) {
+            elog(INFO, "Cannot not open file\n");
+        }
+        read_count = read(fd, buff.data, BLCKSZ);
+        if (read_count == BLCKSZ) {
+            elog(INFO, "Read from file succesfully\n");
+        }
+        close(fd);
+
+        page = (Page) buff.data;
+        page_hdr = (PageHeader) buff.data;
+        elog(INFO, "Page lower offset : %d\tUpper offset : %d\tSpecial space : %d\n", page_hdr->pd_lower, page_hdr->pd_upper, page_hdr->pd_special);
+        offnum = xlrec->old_offnum;
+        if (PageGetMaxOffsetNumber(page) < offnum)
+            elog(INFO, "Target tuple cannot be found on page\n");
+        lp = PageGetItemId(page, offnum);
+
+        htup = (HeapTupleHeader) PageGetItem(page, lp);
+
+		oldtup.t_data = htup;
+		oldtup.t_len = ItemIdGetLength(lp);
+
+		htup->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
+		htup->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+        // TODO после этого мы должны учесть еще и HOT update - см. в heap_xlog_update
+        HeapTupleHeaderSetXmax(htup, xlrec->old_xmax);
+		HeapTupleHeaderSetCmax(htup, FirstCommandId, false);
+		/* Set forward chain link in t_ctid */
+		htup->t_ctid = newtid;
+
+        pfree(relation_directory_path);
+        pfree(full_relation_directory_path);
+        pfree(relation_file_name);
+    }
 }
 
 PG_FUNCTION_INFO_V1(explain_wal_record);
@@ -232,13 +349,16 @@ static void fetch_readable_info_from_wal(const char* wal_file_name, const char* 
     XLogRecord* record;
     char* errmsg;
     uint8 info_bits;
+    int fd;
 
-    int fd = open_file_in_directory(wal_dir_path, wal_file_name);
+    fd = open_file_in_directory(wal_dir_path, wal_file_name);
     if (fd < 0) {
         elog(INFO, "Cannot not open file\n");
     }
     
     read_count = read(fd, buff.data, XLOG_BLCKSZ);
+    close(fd);
+
     if (read_count == XLOG_BLCKSZ) {
         XLogLongPageHeader longhdr = (XLogLongPageHeader) buff.data;
         WalSegSz = longhdr->xlp_seg_size;
@@ -300,7 +420,7 @@ static void fetch_readable_info_from_wal(const char* wal_file_name, const char* 
                 // fetch_from_insert(xlogreader);
                 // break;
             }
-            else if ((info_bits & XLOG_HEAP_OPMASK) == XLOG_HEAP_UPDATE || (info_bits & XLOG_HEAP_OPMASK) == XLOG_HEAP_HOT_UPDATE) {
+            else if ((info_bits & XLOG_HEAP_OPMASK) == XLOG_HEAP_UPDATE || (info_bits & XLOG_HEAP_OPMASK) == XLOG_HEAP_HOT_UPDATE) { //TODO временно объединяем update и hot update
                 fetch_from_update(xlogreader);
                 // break;
             }
