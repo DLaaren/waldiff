@@ -244,14 +244,27 @@ static void fetch_from_update(XLogReaderState* xlogreader) {
 	BlockNumber newblk;
     ItemPointerData newtid;
     HeapTupleData oldtup;
-
     ForkNumber forknum;
-
-    // Oid table_oid;
-    // HeapTuple tuple;
+    HeapTupleHeader htup;
 
     oldtup.t_data = NULL; // инициализируем, чтобы не ругался компилятор
 	oldtup.t_len = 0;
+
+    uint16 prefixlen = 0;
+	uint16 suffixlen = 0;
+    char* recdata;
+    char* newtup;
+    char *recdata_end;
+    xl_heap_header xlhdr;
+    Size data_len;
+    Size tuplen;
+
+    union
+	{
+		HeapTupleHeaderData hdr;
+		char data[MaxHeapTupleSize];
+	} tbuf;
+
 
     XLogRecGetBlockTag(xlogreader, 0, &rlocator, &forknum, &newblk);
 	if (!XLogRecGetBlockTagExtended(xlogreader, 1, NULL, NULL, &oldblk, NULL))
@@ -259,7 +272,10 @@ static void fetch_from_update(XLogReaderState* xlogreader) {
 
     ItemPointerSet(&newtid, newblk, xlrec->new_offnum);
 
-    if (rlocator.dbOid == 5 && rlocator.relNumber == 16397) {
+    /*
+    Тут мы формируем старую версию строки
+    */
+    if (rlocator.dbOid == 5 && rlocator.relNumber == 16397) { // TODO временная заглушка, естественно
         Page page;
         char* relation_directory_path;
         char* relation_file_name;
@@ -271,7 +287,6 @@ static void fetch_from_update(XLogReaderState* xlogreader) {
 
         OffsetNumber offnum;
         ItemId lp;
-        HeapTupleHeader htup;
 
         elog(INFO, "Tablespace : %d\tDatabase : %d\tRelation : %d\n", rlocator.spcOid, rlocator.dbOid, rlocator.relNumber);
         elog(INFO, "Forknumber : %d\nOldBlockNumber : %d\nInBLockOffset : %d\n", forknum, oldblk, newtid.ip_posid);
@@ -317,6 +332,65 @@ static void fetch_from_update(XLogReaderState* xlogreader) {
         pfree(full_relation_directory_path);
         pfree(relation_file_name);
     }
+
+    /*
+    Теперь сформируем новую версию строки
+    */
+    recdata = XLogRecGetBlockData(xlogreader, 0, &data_len);
+    if (xlrec->flags & XLH_UPDATE_PREFIX_FROM_OLD) {
+        Assert(newblk == oldblk);
+        memcpy(&prefixlen, recdata, sizeof(uint16));
+        recdata += sizeof(uint16);
+    }
+    if (xlrec->flags & XLH_UPDATE_SUFFIX_FROM_OLD) {
+        Assert(newblk == oldblk);
+        memcpy(&suffixlen, recdata, sizeof(uint16));
+        recdata += sizeof(uint16);
+    }
+    memcpy((char *) &xlhdr, recdata, SizeOfHeapHeader);
+    recdata += SizeOfHeapHeader;
+
+    tuplen = recdata_end - recdata;
+    htup = &tbuf.hdr;
+    MemSet((char *) htup, 0, SizeofHeapTupleHeader);
+
+    newtup = (char *) htup + SizeofHeapTupleHeader; // по факту вычитываем все данные в htup
+
+    if (prefixlen > 0) {
+        int	len;
+        /* copy bitmap [+ padding] [+ oid] from WAL record */
+        len = xlhdr.t_hoff - SizeofHeapTupleHeader;
+        memcpy(newtup, recdata, len);
+        recdata += len;
+        newtup += len;
+
+        /* copy prefix from old tuple */
+        memcpy(newtup, (char *) oldtup.t_data + oldtup.t_data->t_hoff, prefixlen);
+        newtup += prefixlen;
+
+        /* copy new tuple data from WAL record */
+        len = tuplen - (xlhdr.t_hoff - SizeofHeapTupleHeader);
+        memcpy(newtup, recdata, len);
+        recdata += len;
+        newtup += len;
+    }
+    else {
+        memcpy(newtup, recdata, tuplen);
+        recdata += tuplen;
+        newtup += tuplen;
+    }
+
+    if (suffixlen > 0)
+        memcpy(newtup, (char *) oldtup.t_data + oldtup.t_len - suffixlen, suffixlen);
+
+    htup->t_infomask2 = xlhdr.t_infomask2;
+    htup->t_infomask = xlhdr.t_infomask;
+    htup->t_hoff = xlhdr.t_hoff;
+
+    HeapTupleHeaderSetXmin(htup, XLogRecGetXid(xlogreader));
+    HeapTupleHeaderSetCmin(htup, FirstCommandId);
+    HeapTupleHeaderSetXmax(htup, xlrec->new_xmax);
+    htup->t_ctid = newtid;
 }
 
 PG_FUNCTION_INFO_V1(explain_wal_record);
