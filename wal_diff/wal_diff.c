@@ -34,7 +34,6 @@ PG_MODULE_MAGIC;
 
 static char wal_directory[MAXPGPATH];
 static char *wal_diff_directory = NULL;
-static XLogReaderState *xlogreader_state = NULL;
 static int	WalSegSz;
 
 static bool check_archive_directory(char **newval, void **extra, GucSource source);
@@ -152,26 +151,51 @@ wal_diff_configured(ArchiveModuleState *state)
 			wal_diff_directory[0] != '\0';
 }
 
-/*
- * TODO:
- * 
- * Add funcionality for a scenario when we are recovering after crash
- */
-
-/*
- * wal_diff_archive
- *
- * Archives one WAL-diff file.
- * 
- * file -- just name of the WAL file 
- * path -- the full path including the WAL file name
- */
-
 static int 
 WalReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 				XLogRecPtr targetPtr, char *readBuff)
 {
-	return 0;
+	XLogDumpPrivate *private = state->private_data;
+	int			count = XLOG_BLCKSZ;
+	WALReadError errinfo;
+
+	if (private->endptr != InvalidXLogRecPtr)
+	{
+		if (targetPagePtr + XLOG_BLCKSZ <= private->endptr)
+			count = XLOG_BLCKSZ;
+		else if (targetPagePtr + reqLen <= private->endptr)
+			count = private->endptr - targetPagePtr;
+		else
+		{
+			private->endptr_reached = true;
+			return -1;
+		}
+	}
+
+	if (!WALRead(state, readBuff, targetPagePtr, count, private->timeline,
+				 &errinfo))
+	{
+		WALOpenSegment *seg = &errinfo.wre_seg;
+		char		fname[MAXPGPATH];
+
+		XLogFileName(fname, seg->ws_tli, seg->ws_segno,
+					 state->segcxt.ws_segsize);
+
+		if (errinfo.wre_errno != 0)
+		{
+			errno = errinfo.wre_errno;
+			ereport(ERROR, 
+					errmsg("could not read from file %s, offset %d: %m",
+					fname, errinfo.wre_off));
+		}
+		else
+			ereport(ERROR,
+					errmsg("could not read from file %s, offset %d: read %d of %d",
+					fname, errinfo.wre_off, errinfo.wre_read,
+					errinfo.wre_req));
+	}
+
+	return count;
 }
 
 static void 
@@ -204,11 +228,25 @@ static void
 getWalDirecotry(char *wal_directory, const char *path, const char *file)
 {
 	strcpy(wal_directory, path);
-	memset(wal_directory + (char)(strlen(path) - strlen(file)), 0, strlen(file));
+	memset(wal_directory + (char)(strlen(path) - strlen(file) - 1), 0, strlen(file));
 	ereport(LOG, 
 			errmsg("wal directory is : %s", wal_directory));
 }
 
+/*
+ * TODO:
+ * 
+ * Add funcionality for a scenario when we are recovering after crash
+ */
+
+/*
+ * wal_diff_archive
+ *
+ * Archives one WAL-diff file.
+ * 
+ * file -- just name of the WAL file 
+ * path -- the full path including the WAL file name
+ */
 static bool 
 wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 {
@@ -219,8 +257,12 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 	XLogPageHeader page_hdr;
 	XLogSegNo segno;
 	XLogRecPtr first_record;
+	XLogReaderState* xlogreader_state;
 
 	// snprintf(wal_diff_destination, MAXPGPATH, "%s/%s", wal_diff_directory, file);
+
+	ereport(LOG, 
+			errmsg("archiving file : %s", file));
 
 	if (strlen(wal_directory) == 0)
 		getWalDirecotry(wal_directory, path, file);
@@ -254,25 +296,27 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 	private.endptr = InvalidXLogRecPtr;
 	private.endptr_reached = false;
 
-	XLogFromFileName(file, &(private.timeline), &segno, WalSegSz);
+	XLogFromFileName(file, &private.timeline, &segno, WalSegSz);
     XLogSegNoOffsetToRecPtr(segno, 0, WalSegSz, private.startptr);
+	XLogSegNoOffsetToRecPtr(segno + 1, 0, WalSegSz, private.endptr);
 
-	if (xlogreader_state == NULL)
+	xlogreader_state = 
+		XLogReaderAllocate(WalSegSz, wal_directory,
+							XL_ROUTINE(.page_read = WalReadPage,
+										.segment_open = WalOpenSegment,
+										.segment_close = WalCloseSegment),
+							&private);
+
+	if (xlogreader_state == NULL) 
 	{
-		xlogreader_state = 
-			XLogReaderAllocate(WalSegSz, wal_directory,
-								XL_ROUTINE(.page_read = WalReadPage,
-											.segment_open = WalOpenSegment,
-											.segment_close = WalCloseSegment),
-								&private);
-
-		if (xlogreader_state == NULL) 
-			ereport(ERROR, errmsg("out of memory while allocating a WAL reading processor"));
+		ereport(FATAL, errmsg("out of memory while allocating a WAL reading processor"));
+		return false;
 	}
 
 	first_record = XLogFindNextRecord(xlogreader_state, private.startptr);
 
-	if (first_record == InvalidXLogRecPtr) {
+	if (first_record == InvalidXLogRecPtr)
+	{
         ereport(FATAL, 
 				errmsg("could not find a valid record after %X/%X", 
 						LSN_FORMAT_ARGS(private.startptr)));
@@ -281,11 +325,11 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 
 	page_hdr = (XLogPageHeader) xlogreader_state->readBuf;
     if (XLogPageHeaderSize(page_hdr) == SizeOfXLogLongPHD)
-        ereport(INFO, errmsg("Got long page header\n"));
+        ereport(LOG, errmsg("Got long page header"));
     else
-        ereport(INFO, errmsg("Got short page header\n"));
+        ereport(LOG, errmsg("Got short page header"));
 
-    ereport(INFO, errmsg("Remaining data from a previous page : %d\n", page_hdr->xlp_rem_len));
+    ereport(LOG, errmsg("Remaining data from a previous page : %d", page_hdr->xlp_rem_len));
 
 
 
@@ -451,6 +495,4 @@ wall_diff_shutdown(ArchiveModuleState *state)
 		pfree(data);
 
 	state->private_data = NULL;
-	
-	XLogReaderFree(xlogreader_state);
 }
