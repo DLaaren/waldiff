@@ -14,13 +14,17 @@
  */
 #include "postgres.h"
 
+#include <assert.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "access/xlogreader.h"
+#include "access/xlog_internal.h"
 #include "archive/archive_module.h"
 #include "common/int.h"
 #include "miscadmin.h"
+#include "common/logging.h"
 #include "storage/copydir.h"
 #include "storage/fd.h"
 #include "utils/guc.h"
@@ -28,7 +32,10 @@
 
 PG_MODULE_MAGIC;
 
+static char wal_directory[MAXPGPATH];
 static char *wal_diff_directory = NULL;
+static XLogReaderState *xlogreader_state = NULL;
+static int	WalSegSz;
 
 static bool check_archive_directory(char **newval, void **extra, GucSource source);
 static bool create_wal_diff(const char *file, const char *destination);
@@ -38,6 +45,14 @@ static void wal_diff_startup(ArchiveModuleState *state);
 static bool wal_diff_configured(ArchiveModuleState *state);
 static bool wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path);
 static void wall_diff_shutdown(ArchiveModuleState *state);
+
+typedef struct XLogDumpPrivate
+{
+	TimeLineID	timeline;
+	XLogRecPtr	startptr;
+	XLogRecPtr	endptr;
+	bool		endptr_reached;
+} XLogDumpPrivate;
 
 static const ArchiveModuleCallbacks wal_diff_callbacks = {
     .startup_cb = wal_diff_startup,
@@ -87,7 +102,6 @@ _PG_archive_module_init(void)
 void 
 wal_diff_startup(ArchiveModuleState *state)
 {
-    return;
 }
 
 /*
@@ -134,7 +148,8 @@ check_archive_directory(char **newval, void **extra, GucSource source)
 static bool 
 wal_diff_configured(ArchiveModuleState *state)
 {
-    return wal_diff_directory != NULL && wal_diff_directory[0] != '\0';
+    return  wal_diff_directory != NULL && 
+			wal_diff_directory[0] != '\0';
 }
 
 /*
@@ -151,31 +166,144 @@ wal_diff_configured(ArchiveModuleState *state)
  * file -- just name of the WAL file 
  * path -- the full path including the WAL file name
  */
+
+static int 
+WalReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
+				XLogRecPtr targetPtr, char *readBuff)
+{
+	return 0;
+}
+
+static void 
+WalOpenSegment(XLogReaderState *state, XLogSegNo nextSegNo,
+				   TimeLineID *tli_p)
+{
+	TimeLineID tli = *tli_p;
+    char fname[MAXPGPATH];
+	char fpath[MAXPGPATH];
+
+    XLogFileName(fname, tli, nextSegNo, state->segcxt.ws_segsize);
+
+	snprintf(fpath, MAXPGPATH, "%s/%s", state->segcxt.ws_dir, fname);
+
+	state->seg.ws_file = OpenTransientFile(fpath, O_RDONLY | PG_BINARY);
+	if (state->seg.ws_file < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", fpath)));
+}
+
+static void 
+WalCloseSegment(XLogReaderState *state)
+{
+	close(state->seg.ws_file);
+	state->seg.ws_file = -1;
+}
+
+static void
+getWalDirecotry(char *wal_directory, const char *path, const char *file)
+{
+	strcpy(wal_directory, path);
+	memset(wal_directory + (char)(strlen(path) - strlen(file)), 0, strlen(file));
+	ereport(LOG, 
+			errmsg("wal directory is : %s", wal_directory));
+}
+
 static bool 
 wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 {
-#define TEMP_MAXPATH (MAXPGPATH + 256)
-	char wal_diff_destination[MAXPGPATH];
+	int fd = -1;
+	PGAlignedXLogBlock buff; // local variable, holding a page buffer
+    int read_count = 0;
+    XLogDumpPrivate private;
+	XLogPageHeader page_hdr;
+	XLogSegNo segno;
+	XLogRecPtr first_record;
 
-	snprintf(wal_diff_destination, MAXPGPATH, "%s/%s", wal_diff_directory, file);
+	// snprintf(wal_diff_destination, MAXPGPATH, "%s/%s", wal_diff_directory, file);
 
-	/*
-	 * We check if the file has been alreafy archived.
-	 * This scenario is possible if the server chrashed after archiving the file
-	 * but before renaming its .ready to .done
-	 */
-	if (!is_file_archived(path, wal_diff_destination, wal_diff_directory))
+	if (strlen(wal_directory) == 0)
+		getWalDirecotry(wal_directory, path, file);
+
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				errmsg("could not open file \"%s\": %m", path)));
+
+	read_count = read(fd, buff.data, XLOG_BLCKSZ);
+
+	CloseTransientFile(fd);
+
+    if (read_count == XLOG_BLCKSZ) {
+        XLogLongPageHeader longhdr = (XLogLongPageHeader) buff.data;
+        WalSegSz = longhdr->xlp_seg_size;
+        if (!IsValidWalSegSize(WalSegSz)) {
+            ereport(ERROR, 
+					errmsg("Invalid wal segment size : %d\n", WalSegSz));
+        }
+    }
+    else {
+        ereport(ERROR,
+				errmsg("Could not read file \"%s\": %m", path));
+    }
+
+    memset(&private, 0, sizeof(XLogDumpPrivate));
+    private.timeline = 1;
+	private.startptr = InvalidXLogRecPtr;
+	private.endptr = InvalidXLogRecPtr;
+	private.endptr_reached = false;
+
+	XLogFromFileName(file, &(private.timeline), &segno, WalSegSz);
+    XLogSegNoOffsetToRecPtr(segno, 0, WalSegSz, private.startptr);
+
+	if (xlogreader_state == NULL)
 	{
-		if (!create_wal_diff(path, wal_diff_destination))
-		{
-			ereport(ERROR,
-					errmsg("error while creating WAL-diff"));
-			return false;
-		}
+		xlogreader_state = 
+			XLogReaderAllocate(WalSegSz, wal_directory,
+								XL_ROUTINE(.page_read = WalReadPage,
+											.segment_open = WalOpenSegment,
+											.segment_close = WalCloseSegment),
+								&private);
 
-		ereport(LOG,
-				errmsg("created WAL-diff for file \"%s\"", file));
+		if (xlogreader_state == NULL) 
+			ereport(ERROR, errmsg("out of memory while allocating a WAL reading processor"));
 	}
+
+	first_record = XLogFindNextRecord(xlogreader_state, private.startptr);
+
+	if (first_record == InvalidXLogRecPtr) {
+        ereport(FATAL, 
+				errmsg("could not find a valid record after %X/%X", 
+						LSN_FORMAT_ARGS(private.startptr)));
+        return false;
+    }
+
+	page_hdr = (XLogPageHeader) xlogreader_state->readBuf;
+    if (XLogPageHeaderSize(page_hdr) == SizeOfXLogLongPHD)
+        ereport(INFO, errmsg("Got long page header\n"));
+    else
+        ereport(INFO, errmsg("Got short page header\n"));
+
+    ereport(INFO, errmsg("Remaining data from a previous page : %d\n", page_hdr->xlp_rem_len));
+
+
+
+
+
+
+
+
+	// if (create_wal_diff(path, wal_diff_destination))
+	// {
+	// 	ereport(LOG, errmsg("created WAL-diff for file \"%s\"", file));
+	// 	return true;
+	// } 
+	// else 
+	// {
+	// 	ereport(ERROR, errmsg("error while creating WAL-diff"));
+	// 	return false;
+	// }
 
 	return true;
 }
@@ -304,19 +432,8 @@ compare_files(const char *file1, const char *file2)
 static bool 
 create_wal_diff(const char *file, const char *destination)
 {
-#define CMP_BUF_SIZE (4096)
-	char buf[CMP_BUF_SIZE];
-	int fd;
 
-	fd = OpenTransientFile(file, O_RDONLY | PG_BINARY);
-	if (fd < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open file \"%s\": %m", file)));
-
-
-
-	(void) durable_rename(file, destination, ERROR);
+	
 	return true;
 }
 
@@ -330,9 +447,10 @@ wall_diff_shutdown(ArchiveModuleState *state)
 {
 	void *data = state->private_data;
 
-	if (data == NULL)
-		return;
-	
-	pfree(data);
+	if (data != NULL)
+		pfree(data);
+
 	state->private_data = NULL;
+	
+	XLogReaderFree(xlogreader_state);
 }
