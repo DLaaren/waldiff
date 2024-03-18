@@ -19,11 +19,14 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "access/heapam_xlog.h"
 #include "access/xlogreader.h"
+#include "access/xlogstats.h"
 #include "access/xlog_internal.h"
 #include "archive/archive_module.h"
 #include "common/int.h"
 #include "miscadmin.h"
+#include "lib/stringinfo.h"
 #include "common/logging.h"
 #include "storage/copydir.h"
 #include "storage/fd.h"
@@ -37,13 +40,24 @@ static char *wal_diff_directory = NULL;
 static int	WalSegSz;
 
 static bool check_archive_directory(char **newval, void **extra, GucSource source);
-static bool create_wal_diff(const char *file, const char *destination);
+static bool create_wal_diff();
 static bool compare_files(const char *file1, const char *file2);
 static bool is_file_archived(const char *file, const char *destination, const char *archive_directory);
 static void wal_diff_startup(ArchiveModuleState *state);
 static bool wal_diff_configured(ArchiveModuleState *state);
 static bool wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path);
 static void wall_diff_shutdown(ArchiveModuleState *state);
+
+static void fetch_insert(XLogReaderState *record);
+static void fetch_update(XLogReaderState *record);
+static void fetch_delete(XLogReaderState *record);
+static void XLogDisplayRecord(XLogReaderState *record);
+
+typedef struct ArchiveData
+{
+	MemoryContext oldcontext;
+	MemoryContext context;
+} ArchiveData;
 
 typedef struct XLogDumpPrivate
 {
@@ -101,6 +115,15 @@ _PG_archive_module_init(void)
 void 
 wal_diff_startup(ArchiveModuleState *state)
 {
+	ArchiveData *data;
+
+	data = (ArchiveData *) MemoryContextAllocZero(TopMemoryContext,
+													   sizeof(ArchiveData));
+	data->context = AllocSetContextCreate(TopMemoryContext,
+										  "archive",
+										  ALLOCSET_DEFAULT_SIZES);
+	state->private_data = (void *) data;
+	data->oldcontext = MemoryContextSwitchTo(data->context);
 }
 
 /*
@@ -253,11 +276,15 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 	int fd = -1;
 	PGAlignedXLogBlock buff; // local variable, holding a page buffer
     int read_count = 0;
+	char *errormsg;
     XLogDumpPrivate private;
 	XLogPageHeader page_hdr;
+	XLogRecord *record;
 	XLogSegNo segno;
 	XLogRecPtr first_record;
-	XLogReaderState* xlogreader_state;
+	XLogReaderState *xlogreader_state;
+	uint8 info_bits;
+
 
 	// snprintf(wal_diff_destination, MAXPGPATH, "%s/%s", wal_diff_directory, file);
 
@@ -307,7 +334,7 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 										.segment_close = WalCloseSegment),
 							&private);
 
-	if (xlogreader_state == NULL) 
+	if (!xlogreader_state) 
 	{
 		ereport(FATAL, errmsg("out of memory while allocating a WAL reading processor"));
 		return false;
@@ -324,6 +351,7 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
     }
 
 	page_hdr = (XLogPageHeader) xlogreader_state->readBuf;
+
     if (XLogPageHeaderSize(page_hdr) == SizeOfXLogLongPHD)
         ereport(LOG, errmsg("Got long page header"));
     else
@@ -331,26 +359,121 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 
     ereport(LOG, errmsg("Remaining data from a previous page : %d", page_hdr->xlp_rem_len));
 
+	for (;;)
+	{
+		ereport(LOG, errmsg("Reading a record"));
+
+		record = XLogReadRecord(xlogreader_state, &errormsg);
+
+		if (record == InvalidXLogRecPtr) {
+			if (private.endptr_reached)
+				break;
+            ereport(ERROR, errmsg("XLogReadRecord failed to read record: %s", errormsg));
+            return false;
+        }
+
+		ereport(LOG, errmsg("RMGR: %s", GetRmgr(XLogRecGetRmid(xlogreader_state)).rm_name));
+
+		if (XLogRecGetRmid(xlogreader_state) == RM_HEAP_ID)
+		{
+			info_bits = XLogRecGetInfo(xlogreader_state) & ~XLR_INFO_MASK;
+
+			switch (info_bits & XLOG_HEAP_OPMASK)
+			{
+				case XLOG_HEAP_INSERT:
+					ereport(LOG, errmsg("fetch INSERT record"));
+					fetch_insert(xlogreader_state);
+					break;
+				case XLOG_HEAP_UPDATE:
+				case XLOG_HEAP_HOT_UPDATE:
+					ereport(LOG, errmsg("fetch UPDATE record"));
+					fetch_update(xlogreader_state);
+					break;
+				case XLOG_HEAP_DELETE:
+					ereport(LOG, errmsg("fetch DELETE record"));
+					fetch_delete(xlogreader_state);
+					break;
+				default:
+					ereport(PANIC, errmsg("unknown op code %u", info_bits));
+			}
+		}
+		
+	}
+
+	// а потом жоско скрафтим wal_diff
 
 
+	if (create_wal_diff())
+	{
+		ereport(LOG, errmsg("created WAL-diff for file \"%s\"", file));
+		return true;
+	} 
+	else 
+	{
+		ereport(ERROR, errmsg("error while creating WAL-diff"));
+		return false;
+	}
 
+	ereport(LOG, errmsg("Done"));
 
-
-
-
-	// if (create_wal_diff(path, wal_diff_destination))
-	// {
-	// 	ereport(LOG, errmsg("created WAL-diff for file \"%s\"", file));
-	// 	return true;
-	// } 
-	// else 
-	// {
-	// 	ereport(ERROR, errmsg("error while creating WAL-diff"));
-	// 	return false;
-	// }
+	XLogReaderFree(xlogreader_state);
 
 	return true;
 }
+
+static void fetch_insert(XLogReaderState *record) 
+{
+
+}
+
+static void fetch_update(XLogReaderState *record)
+{
+
+}
+
+static void fetch_delete(XLogReaderState *record)
+{
+
+}
+
+// pring record to stdout
+static void
+XLogDisplayRecord(XLogReaderState *record)
+{
+	const char *id;
+	const RmgrData desc = GetRmgr(XLogRecGetRmid(record));
+	uint32		rec_len;
+	uint32		fpi_len;
+	uint8		info = XLogRecGetInfo(record);
+	XLogRecPtr	xl_prev = XLogRecGetPrev(record);
+	StringInfoData s;
+
+	XLogRecGetLen(record, &rec_len, &fpi_len);
+
+	ereport(LOG, errmsg("rmgr: %-11s \nlen (rec/tot): %6u/%6u, \ntx: %10u, \nlsn: %X/%08X, \nprev %X/%08X, \n",
+		   desc.rm_name,
+		   rec_len, XLogRecGetTotalLen(record),
+		   XLogRecGetXid(record),
+		   LSN_FORMAT_ARGS(record->ReadRecPtr),
+		   LSN_FORMAT_ARGS(xl_prev)));
+
+	id = desc.rm_identify(info);
+	if (id == NULL)
+		ereport(LOG, errmsg("desc: UNKNOWN (%x) ", info & ~XLR_INFO_MASK));
+	else
+		ereport(LOG, errmsg("desc: %s ", id));
+
+	initStringInfo(&s);
+	desc.rm_desc(&s, record);
+	ereport(LOG, errmsg("%s", s.data));
+
+	resetStringInfo(&s);
+	XLogRecGetBlockRefInfo(record, true, true, &s, NULL);
+	ereport(LOG, errmsg("%s", s.data));
+	pfree(s.data);
+}
+
+
 
 /*
  * is_file_archived
@@ -474,7 +597,7 @@ compare_files(const char *file1, const char *file2)
  * Creates one WAL-diff file.
  */
 static bool 
-create_wal_diff(const char *file, const char *destination)
+create_wal_diff()
 {
 
 	
@@ -489,10 +612,7 @@ create_wal_diff(const char *file, const char *destination)
 static void 
 wall_diff_shutdown(ArchiveModuleState *state)
 {
-	void *data = state->private_data;
-
-	if (data != NULL)
-		pfree(data);
-
-	state->private_data = NULL;
+	ArchiveData *data = (ArchiveData *) state->private_data;
+	MemoryContextSwitchTo(data->oldcontext);
+	MemoryContextReset(data->context);
 }
