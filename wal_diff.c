@@ -231,7 +231,9 @@ WalOpenSegment(XLogReaderState *state, XLogSegNo nextSegNo,
 
     XLogFileName(fname, tli, nextSegNo, state->segcxt.ws_segsize);
 
-	snprintf(fpath, MAXPGPATH, "%s/%s", state->segcxt.ws_dir, fname);
+	if (snprintf(fpath, MAXPGPATH, "%s/%s", state->segcxt.ws_dir, fname) == -1)
+		ereport(ERROR,
+				errmsg("error during reading WAL absolute path : %s/%s", state->segcxt.ws_dir, fname));
 
 	state->seg.ws_file = OpenTransientFile(fpath, O_RDONLY | PG_BINARY);
 	if (state->seg.ws_file < 0)
@@ -250,8 +252,15 @@ WalCloseSegment(XLogReaderState *state)
 static void
 getWalDirecotry(char *wal_directory, const char *path, const char *file)
 {
-	strcpy(wal_directory, path);
-	memset(wal_directory + (char)(strlen(path) - strlen(file) - 1), 0, strlen(file));
+	if (strlen(path) + strlen(file) > MAXPGPATH)
+		ereport(ERROR,
+				errmsg("WAL file absolute name is too long : %s/%s", path, file));
+
+	if (snprintf(wal_directory, strlen(path), "%s", path) == -1)
+		ereport(ERROR,
+				errmsg("error during reading WAL directory path : %s", path));
+
+	MemSet(wal_directory + (strlen(path) - strlen(file) - 1), 0, strlen(file));
 	ereport(LOG, 
 			errmsg("wal directory is : %s", wal_directory));
 }
@@ -312,9 +321,13 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 					errmsg("Invalid wal segment size : %d\n", WalSegSz));
         }
     }
+	else if (read_count < 0) {
+		ereport(ERROR,
+				errmsg("Could not read file \"%s\": %m", path));
+	}
     else {
         ereport(ERROR,
-				errmsg("Could not read file \"%s\": %m", path));
+				errmsg("Could not read file \"%s\": read %d of %d", path, read_count, XLOG_BLCKSZ));
     }
 
     memset(&private, 0, sizeof(XLogDumpPrivate));
@@ -352,27 +365,29 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 
 	page_hdr = (XLogPageHeader) xlogreader_state->readBuf;
 
-    if (XLogPageHeaderSize(page_hdr) == SizeOfXLogLongPHD)
-        ereport(LOG, errmsg("Got long page header"));
-    else
-        ereport(LOG, errmsg("Got short page header"));
+	/*
+	 * This cases we should consider later 
+	 */
+	if (page_hdr->xlp_rem_len)
+    	ereport(LOG, 
+				errmsg("got some remaining data from a previous page : %d", page_hdr->xlp_rem_len));
 
-    ereport(LOG, errmsg("Remaining data from a previous page : %d", page_hdr->xlp_rem_len));
+	if (first_record != private.startptr && 
+		XLogSegmentOffset(private.startptr, WalSegSz) != 0)
+		ereport(LOG, 
+				errmsg("skipping over %u bytes", (uint32) (first_record - private.startptr)));
 
 	for (;;)
 	{
-		ereport(LOG, errmsg("Reading a record"));
-
 		record = XLogReadRecord(xlogreader_state, &errormsg);
 
 		if (record == InvalidXLogRecPtr) {
 			if (private.endptr_reached)
 				break;
-            ereport(ERROR, errmsg("XLogReadRecord failed to read record: %s", errormsg));
+            ereport(ERROR, 
+					errmsg("XLogReadRecord failed to read record: %s", errormsg));
             return false;
         }
-
-		ereport(LOG, errmsg("RMGR: %s", GetRmgr(XLogRecGetRmid(xlogreader_state)).rm_name));
 
 		if (XLogRecGetRmid(xlogreader_state) == RM_HEAP_ID)
 		{
@@ -381,23 +396,29 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 			switch (info_bits & XLOG_HEAP_OPMASK)
 			{
 				case XLOG_HEAP_INSERT:
-					ereport(LOG, errmsg("fetch INSERT record"));
 					fetch_insert(xlogreader_state);
 					break;
 				case XLOG_HEAP_UPDATE:
 				case XLOG_HEAP_HOT_UPDATE:
-					ereport(LOG, errmsg("fetch UPDATE record"));
 					fetch_update(xlogreader_state);
 					break;
 				case XLOG_HEAP_DELETE:
-					ereport(LOG, errmsg("fetch DELETE record"));
 					fetch_delete(xlogreader_state);
 					break;
 				default:
-					ereport(PANIC, errmsg("unknown op code %u", info_bits));
+					ereport(PANIC, 
+							errmsg("unknown op code %u", info_bits));
 			}
 		}
-		
+		else if (XLogRecGetRmid(xlogreader_state) == RM_HEAP2_ID) {
+			// TODO
+		}
+
+		/*
+		 * Now we deal only with HEAP and HEAP2 rmgrs 
+		 */
+		else
+			continue;
 	}
 
 	// а потом жоско скрафтим wal_diff
