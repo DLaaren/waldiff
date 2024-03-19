@@ -33,6 +33,9 @@
 #include "utils/guc.h"
 #include "utils/memutils.h"
 
+#define INSERT_CHAIN 1
+#define UPDATE_CHAIN 2
+
 PG_MODULE_MAGIC;
 
 static char wal_directory[MAXPGPATH];
@@ -48,9 +51,10 @@ static bool wal_diff_configured(ArchiveModuleState *state);
 static bool wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path);
 static void wall_diff_shutdown(ArchiveModuleState *state);
 
-static void fetch_insert(XLogReaderState *record);
+static ChainRecord fetch_insert(XLogReaderState *record);
 static void fetch_update(XLogReaderState *record);
 static void fetch_delete(XLogReaderState *record);
+static ChainRecord overlay_update(ChainRecord old_tup, ChainRecord new_tup);
 static void XLogDisplayRecord(XLogReaderState *record);
 
 typedef struct ArchiveData
@@ -67,11 +71,55 @@ typedef struct XLogDumpPrivate
 	bool		endptr_reached;
 } XLogDumpPrivate;
 
+typedef struct HashMapKey
+{
+	RelFileLocator file_loc;
+	ForkNumber forknum;
+
+	/*
+	 * BlockNumber and OffsetNumber lays in ChainRecordData.tctid 
+	 */
+} HashMapKey;
+typedef struct ChainRecordData
+{
+	HeapTupleFields htup;
+	ItemPointerData t_ctid;
+	HashMapKey 		key_data;
+	uint16			t_infomask2;
+	uint16			t_infomask;
+	uint16 			main_data_len;
+	uint8 			chain_type;
+	uint8			t_hoff;
+
+	/*
+	 * Here comes appropriate header and then main data
+	 */
+	bits8			t_bits[FLEXIBLE_ARRAY_MEMBER];
+} ChainRecordData;
+
+typedef ChainRecordData* ChainRecord;
+
+#define SizeOfChainRecord offsetof(ChainRecordData, t_bits)
+
+/*
+ * Use this to verify, which hashmap cell must contain specifided ChainRecord
+ *
+ * Это пока что самая тупая идея
+ */
+#define GetHashMapKeyFromChainRecord(chain_record) \
+( \
+	(chain_record)->key_data.file_loc.spcOid + \
+	(chain_record)->key_data.file_loc.dbOid + \
+	(chain_record)->key_data.file_loc.relNumber + \
+	(chain_record)->t_ctid.ip_blkid + \
+	(chain_record)->t_ctid.ip_posid \
+)
+
 static const ArchiveModuleCallbacks wal_diff_callbacks = {
-    .startup_cb = wal_diff_startup,
+    .startup_cb 		 = wal_diff_startup,
 	.check_configured_cb = wal_diff_configured,
-	.archive_file_cb = wal_diff_archive,
-	.shutdown_cb = wall_diff_shutdown
+	.archive_file_cb 	 = wal_diff_archive,
+	.shutdown_cb 		 = wall_diff_shutdown
 };
 
 /*
@@ -399,9 +447,10 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 					fetch_insert(xlogreader_state);
 					break;
 				case XLOG_HEAP_UPDATE:
-				case XLOG_HEAP_HOT_UPDATE:
 					fetch_update(xlogreader_state);
 					break;
+				case XLOG_HEAP_HOT_UPDATE:
+					// TODO
 				case XLOG_HEAP_DELETE:
 					fetch_delete(xlogreader_state);
 					break;
@@ -442,17 +491,67 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 	return true;
 }
 
-static void fetch_insert(XLogReaderState *record) 
+static ChainRecord 
+fetch_insert(XLogReaderState *record) 
+{
+	RelFileLocator 	target_locator;
+    BlockNumber 	blknum;
+    ForkNumber 		forknum;
+    xl_heap_insert 	*xlrec;
+    char* 			data;
+    Size 			data_len;
+    xl_heap_header 	xlhdr;
+
+	ChainRecord fetched_record;
+
+    XLogRecGetBlockTag(record, 0, &target_locator, &forknum, &blknum);
+    xlrec = (xl_heap_insert *) XLogRecGetData(record);
+
+    data = XLogRecGetBlockData(record, 0, &data_len);
+
+    memcpy((char *) &xlhdr, data, SizeOfHeapHeader);
+
+    MemSet((char *) fetched_record, 0, SizeOfChainRecord);
+	fetched_record->chain_type = INSERT_CHAIN;
+	fetched_record->key_data.file_loc = target_locator;
+	fetched_record->key_data.forknum = forknum;
+
+	ItemPointerSetBlockNumber(&(fetched_record->t_ctid), blknum);
+    ItemPointerSetOffsetNumber(&(fetched_record->t_ctid), xlrec->offnum);
+	memcpy((char*) fetched_record + SizeOfChainRecord, (char*) xlrec, SizeOfHeapInsert);
+
+    memcpy((char *) fetched_record + SizeOfChainRecord + SizeOfHeapInsert, 
+			data + SizeOfHeapHeader, 
+			data_len - SizeOfHeapHeader);
+
+	fetched_record->main_data_len = data_len - SizeOfHeapHeader;
+	fetched_record->t_hoff = SizeOfChainRecord + SizeOfHeapInsert;
+
+    fetched_record->t_infomask2 = xlhdr.t_infomask2;
+    fetched_record->t_infomask = xlhdr.t_infomask;
+	fetched_record->htup.t_xmin = (record)->record->header.xl_xid;
+
+	Assert(!(fetched_record->t_infomask & HEAP_MOVED));
+	fetched_record->htup.t_field3.t_cid = FirstCommandId;
+	fetched_record->t_infomask &= ~HEAP_COMBOCID;
+
+	return fetched_record;
+}
+
+static void 
+fetch_update(XLogReaderState *record)
 {
 
 }
 
-static void fetch_update(XLogReaderState *record)
+static void 
+fetch_delete(XLogReaderState *record)
 {
 
 }
 
-static void fetch_delete(XLogReaderState *record)
+static ChainRecord 
+overlay_update(ChainRecord old_tup, ChainRecord new_tup)
 {
 
 }
