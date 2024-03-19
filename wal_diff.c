@@ -524,7 +524,6 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 
 	// а потом жоско скрафтим wal_diff
 
-
 	if (create_wal_diff())
 	{
 		ereport(LOG, errmsg("created WAL-diff for file \"%s\"", file));
