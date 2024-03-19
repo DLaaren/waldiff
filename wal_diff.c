@@ -14,11 +14,13 @@
  */
 #include "postgres.h"
 
+/* system stuff */
 #include <assert.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
+/* postgreSQL stuff */
 #include "access/heapam_xlog.h"
 #include "access/xlogreader.h"
 #include "access/xlogstats.h"
@@ -28,19 +30,31 @@
 #include "miscadmin.h"
 #include "lib/stringinfo.h"
 #include "common/logging.h"
+#include "common/hashfn.h"
 #include "storage/copydir.h"
 #include "storage/fd.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
+#include "utils/hsearch.h"
 
 #define INSERT_CHAIN 1
 #define UPDATE_CHAIN 2
+#define INITIAL_HASHTABLE_SIZE 100 // TODO скорее всего впоследствии мы его увеличим
 
 PG_MODULE_MAGIC;
 
-static char wal_directory[MAXPGPATH];
-static char *wal_diff_directory = NULL;
-static int	WalSegSz;
+/**********************************************************************
+  * Global data
+  **********************************************************************/
+
+static char 	wal_directory[MAXPGPATH];
+static char 	*wal_diff_directory = NULL;
+static int		WalSegSz;
+static HTAB*	hashtable = NULL;
+
+/**********************************************************************
+  * Forward declarations
+  **********************************************************************/
 
 static bool check_archive_directory(char **newval, void **extra, GucSource source);
 static bool create_wal_diff();
@@ -51,12 +65,23 @@ static bool wal_diff_configured(ArchiveModuleState *state);
 static bool wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path);
 static void wall_diff_shutdown(ArchiveModuleState *state);
 
+/*
+ * This three fuctions returns palloced struct
+ * 
+ * At end of struct you can find xl_heap_insert[update][delete] and main tuple data
+ */
 static ChainRecord fetch_insert(XLogReaderState *record);
 static void fetch_update(XLogReaderState *record);
 static void fetch_delete(XLogReaderState *record);
+
 static ChainRecord overlay_update(ChainRecord old_tup, ChainRecord new_tup);
 static void XLogDisplayRecord(XLogReaderState *record);
 
+static uint32_t wal_diff_hash_key(const void *key, size_t keysize);
+
+ /**********************************************************************
+  * Information for PostgreSQL
+  **********************************************************************/
 typedef struct ArchiveData
 {
 	MemoryContext oldcontext;
@@ -71,20 +96,22 @@ typedef struct XLogDumpPrivate
 	bool		endptr_reached;
 } XLogDumpPrivate;
 
-typedef struct HashMapKey
-{
-	RelFileLocator file_loc;
-	ForkNumber forknum;
+static const ArchiveModuleCallbacks wal_diff_callbacks = {
+    .startup_cb 		 = wal_diff_startup,
+	.check_configured_cb = wal_diff_configured,
+	.archive_file_cb 	 = wal_diff_archive,
+	.shutdown_cb 		 = wall_diff_shutdown
+};
 
-	/*
-	 * BlockNumber and OffsetNumber lays in ChainRecordData.tctid 
-	 */
-} HashMapKey;
-typedef struct ChainRecordData
+ /**********************************************************************
+  * The information we store about processed by wal-diff records
+  **********************************************************************/
+typedef struct ChainRecordData // TODO глянуть, как лучше раскидать поля для выравнивания
 {
 	HeapTupleFields htup;
 	ItemPointerData t_ctid;
-	HashMapKey 		key_data;
+	ForkNumber 		forknum;
+	RelFileLocator 	file_loc;
 	uint16			t_infomask2;
 	uint16			t_infomask;
 	uint16 			main_data_len;
@@ -101,26 +128,24 @@ typedef ChainRecordData* ChainRecord;
 
 #define SizeOfChainRecord offsetof(ChainRecordData, t_bits)
 
-/*
- * Use this to verify, which hashmap cell must contain specifided ChainRecord
- *
- * Это пока что самая тупая идея
- */
-#define GetHashMapKeyFromChainRecord(chain_record) \
-( \
-	(chain_record)->key_data.file_loc.spcOid + \
-	(chain_record)->key_data.file_loc.dbOid + \
-	(chain_record)->key_data.file_loc.relNumber + \
-	(chain_record)->t_ctid.ip_blkid + \
-	(chain_record)->t_ctid.ip_posid \
-)
+typedef struct ChainRecordHashEntry
+{
+	uint32_t 	hash_key;
+	ChainRecord data;
+} ChainRecordHashEntry;
 
-static const ArchiveModuleCallbacks wal_diff_callbacks = {
-    .startup_cb 		 = wal_diff_startup,
-	.check_configured_cb = wal_diff_configured,
-	.archive_file_cb 	 = wal_diff_archive,
-	.shutdown_cb 		 = wall_diff_shutdown
-};
+/*
+ * Use this to create key of struct ChainRecord for hashmap
+ */
+#define GetHashKeyFromChainRecord(record) \
+( \
+	(uint32_t)((record)->file_loc.spcOid + \
+			   (record)->file_loc.dbOid + \
+			   (record)->file_loc.relNumber + \
+			   (record)->t_ctid.ip_blkid.bi_hi + \
+			   (record)->t_ctid.ip_blkid.bi_lo + \
+			   (record)->t_ctid.ip_posid) \
+)
 
 /*
  * _PG_init
@@ -172,6 +197,22 @@ wal_diff_startup(ArchiveModuleState *state)
 										  ALLOCSET_DEFAULT_SIZES);
 	state->private_data = (void *) data;
 	data->oldcontext = MemoryContextSwitchTo(data->context);
+
+	HASHCTL hash_ctl;
+	hash_ctl.keysize 	= sizeof(uint32_t);
+	hash_ctl.entrysize 	= sizeof(ChainRecordHashEntry);
+
+	/*
+	 * reference to tag_hash from src/common/hashfn.c
+	 */
+	hash_ctl.hash 		= &tag_hash;
+
+	hash_ctl.hcxt 		= data->context;
+
+	hashtable = hash_create("ChainRecordHashTable",
+							INITIAL_HASHTABLE_SIZE,
+							&hash_ctl,
+							HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 }
 
 /*
@@ -327,23 +368,24 @@ getWalDirecotry(char *wal_directory, const char *path, const char *file)
  * file -- just name of the WAL file 
  * path -- the full path including the WAL file name
  */
-static bool 
+static bool // TODO может быть вынести цикл for (472 строка) в отдельную функцию? В этой уже тяжело ориентироваться
 wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 {
-	int fd = -1;
-	PGAlignedXLogBlock buff; // local variable, holding a page buffer
-    int read_count = 0;
-	char *errormsg;
-    XLogDumpPrivate private;
-	XLogPageHeader page_hdr;
-	XLogRecord *record;
-	XLogSegNo segno;
-	XLogRecPtr first_record;
-	XLogReaderState *xlogreader_state;
-	uint8 info_bits;
+	int 				fd = -1;
+	PGAlignedXLogBlock 	buff; // local variable, holding a page buffer
+    int 				read_count;
+	char 				*errormsg;
+    XLogDumpPrivate 	private;
+	XLogPageHeader 		page_hdr;
+	XLogRecord 			*record;
+	XLogSegNo 			segno;
+	XLogRecPtr 			first_record;
+	XLogReaderState 	*xlogreader_state;
+	uint8 				info_bits;
+	ChainRecord 		rec;
+	bool 				is_found;
 
-
-	// snprintf(wal_diff_destination, MAXPGPATH, "%s/%s", wal_diff_directory, file);
+	ChainRecordHashEntry* entry;
 
 	ereport(LOG, 
 			errmsg("archiving file : %s", file));
@@ -444,7 +486,17 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 			switch (info_bits & XLOG_HEAP_OPMASK)
 			{
 				case XLOG_HEAP_INSERT:
-					fetch_insert(xlogreader_state);
+					rec = fetch_insert(xlogreader_state);
+					if (!rec)
+						continue;
+
+					hash_search(hashtable, GetHashKeyFromChainRecord(rec), HASH_FIND, &is_found);
+					if (is_found)
+						hash_search(hashtable, GetHashKeyFromChainRecord(rec), HASH_REMOVE, &is_found);
+
+					entry = (ChainRecordHashEntry*) hash_search(hashtable, GetHashKeyFromChainRecord(rec), HASH_ENTER, &is_found);
+					entry->data = rec;
+
 					break;
 				case XLOG_HEAP_UPDATE:
 					fetch_update(xlogreader_state);
@@ -492,7 +544,7 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 }
 
 static ChainRecord 
-fetch_insert(XLogReaderState *record) 
+fetch_insert(XLogReaderState *record)
 {
 	RelFileLocator 	target_locator;
     BlockNumber 	blknum;
@@ -502,7 +554,7 @@ fetch_insert(XLogReaderState *record)
     Size 			data_len;
     xl_heap_header 	xlhdr;
 
-	ChainRecord fetched_record;
+	ChainRecord 	fetched_record = NULL;
 
     XLogRecGetBlockTag(record, 0, &target_locator, &forknum, &blknum);
     xlrec = (xl_heap_insert *) XLogRecGetData(record);
@@ -511,13 +563,24 @@ fetch_insert(XLogReaderState *record)
 
     memcpy((char *) &xlhdr, data, SizeOfHeapHeader);
 
-    MemSet((char *) fetched_record, 0, SizeOfChainRecord);
+	fetched_record = (ChainRecord) palloc0((Size) (SizeOfChainRecord + SizeOfHeapInsert + data_len - SizeOfHeapHeader));
+	if (! fetched_record)
+	{
+		ereport(FATAL, 
+				errmsg("out of memory while allocating a WAL reading processor"));
+		return NULL;
+	}
 	fetched_record->chain_type = INSERT_CHAIN;
-	fetched_record->key_data.file_loc = target_locator;
-	fetched_record->key_data.forknum = forknum;
+	fetched_record->file_loc = target_locator;
+	fetched_record->forknum = forknum;
 
+	/*
+	 * In our case, t_ctid always will be point to itself,
+	 * so we can learn about blknum and offset from this filed
+	 */
 	ItemPointerSetBlockNumber(&(fetched_record->t_ctid), blknum);
     ItemPointerSetOffsetNumber(&(fetched_record->t_ctid), xlrec->offnum);
+
 	memcpy((char*) fetched_record + SizeOfChainRecord, (char*) xlrec, SizeOfHeapInsert);
 
     memcpy((char *) fetched_record + SizeOfChainRecord + SizeOfHeapInsert, 
@@ -528,8 +591,8 @@ fetch_insert(XLogReaderState *record)
 	fetched_record->t_hoff = SizeOfChainRecord + SizeOfHeapInsert;
 
     fetched_record->t_infomask2 = xlhdr.t_infomask2;
-    fetched_record->t_infomask = xlhdr.t_infomask;
-	fetched_record->htup.t_xmin = (record)->record->header.xl_xid;
+    fetched_record->t_infomask 	= xlhdr.t_infomask;
+	fetched_record->htup.t_xmin = record->record->header.xl_xid;
 
 	Assert(!(fetched_record->t_infomask & HEAP_MOVED));
 	fetched_record->htup.t_field3.t_cid = FirstCommandId;
@@ -732,6 +795,7 @@ create_wal_diff()
 static void 
 wall_diff_shutdown(ArchiveModuleState *state)
 {
+	hash_destroy(hashtable);
 	ArchiveData *data = (ArchiveData *) state->private_data;
 	MemoryContextSwitchTo(data->oldcontext);
 	MemoryContextReset(data->context);
