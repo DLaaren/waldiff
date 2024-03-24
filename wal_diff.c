@@ -119,6 +119,8 @@ typedef struct ChainRecordHashEntry
 			   (record)->t_ctid.ip_posid) \
 )
 
+static void continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *private);
+
 /*
  * This three fuctions returns palloced struct
  * 
@@ -366,19 +368,11 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 	int 				fd = -1;
 	PGAlignedXLogBlock 	buff; // local variable, holding a page buffer
     int 				read_count;
-	char 				*errormsg;
     XLogDumpPrivate 	private;
 	XLogPageHeader 		page_hdr;
-	XLogRecord 			*record;
 	XLogSegNo 			segno;
 	XLogRecPtr 			first_record;
 	XLogReaderState 	*xlogreader_state;
-	uint8 				info_bits;
-	ChainRecord 		chain_record;
-	bool 				is_found;
-	uint32_t 			hash_key;
-
-	ChainRecordHashEntry* entry;
 
 	ereport(LOG, 
 			errmsg("archiving file : %s", file));
@@ -461,12 +455,46 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 		ereport(LOG, 
 				errmsg("skipping over %u bytes", (uint32) (first_record - private.startptr)));
 
+	continuous_reading_wal_file(xlogreader_state, &private);
+
+	// а потом жоско скрафтим wal_diff
+
+	if (create_wal_diff())
+	{
+		ereport(LOG, errmsg("created WAL-diff for file \"%s\"", file));
+		return true;
+	} 
+	else 
+	{
+		ereport(ERROR, errmsg("error while creating WAL-diff"));
+		return false;
+	}
+
+	ereport(LOG, errmsg("Done"));
+
+	XLogReaderFree(xlogreader_state);
+
+	return true;
+}
+
+static void 
+continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *private)
+{
+	char 			*errormsg;
+	XLogRecord 		*record;
+	uint8 			info_bits;
+	ChainRecord 	chain_record;
+	bool 			is_found;
+	uint32_t 		hash_key;
+
+	ChainRecordHashEntry* entry;
+
 	for (;;)
 	{
 		record = XLogReadRecord(xlogreader_state, &errormsg);
 
 		if (record == InvalidXLogRecPtr) {
-			if (private.endptr_reached)
+			if (private->endptr_reached)
 				break;
             ereport(ERROR, 
 					errmsg("XLogReadRecord failed to read record: %s", errormsg));
@@ -507,6 +535,7 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 							errmsg("unknown op code %u", info_bits));
 			}
 		}
+		// лол сделали второй RMGR только потому что закончились op коды
 		else if (XLogRecGetRmid(xlogreader_state) == RM_HEAP2_ID) {
 			// TODO
 		}
@@ -517,25 +546,6 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 		else
 			continue;
 	}
-
-	// а потом жоско скрафтим wal_diff
-
-	if (create_wal_diff())
-	{
-		ereport(LOG, errmsg("created WAL-diff for file \"%s\"", file));
-		return true;
-	} 
-	else 
-	{
-		ereport(ERROR, errmsg("error while creating WAL-diff"));
-		return false;
-	}
-
-	ereport(LOG, errmsg("Done"));
-
-	XLogReaderFree(xlogreader_state);
-
-	return true;
 }
 
 static ChainRecord 
@@ -650,7 +660,6 @@ XLogDisplayRecord(XLogReaderState *record)
 	ereport(LOG, errmsg("%s", s.data));
 	pfree(s.data);
 }
-
 
 
 /*
