@@ -1,17 +1,3 @@
-/*-------------------------------------------------------------------------
- * 
- * Идея пока такая 
- * 
- * Сохраняем файл с логами во временное хранилище
- * Скидываем на диск сервера
- * Обрабатываем копию этого файла -- компрессуем wal записи
- * Скидываем на архив-диск теперь уже wal diff
- *
- * postgres/contrib/basic_archive
- * postgres/include/archive
- *
- *-------------------------------------------------------------------------
- */
 #include "postgres.h"
 
 /* system stuff */
@@ -50,7 +36,7 @@ PG_MODULE_MAGIC;
 static char 	wal_directory[MAXPGPATH];
 static char 	*wal_diff_directory = NULL;
 static int		WalSegSz;
-static HTAB*	hashtable = NULL;
+static HTAB*	hash_table = NULL;
 
 /**********************************************************************
   * Forward declarations
@@ -64,20 +50,6 @@ static void wal_diff_startup(ArchiveModuleState *state);
 static bool wal_diff_configured(ArchiveModuleState *state);
 static bool wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path);
 static void wall_diff_shutdown(ArchiveModuleState *state);
-
-/*
- * This three fuctions returns palloced struct
- * 
- * At end of struct you can find xl_heap_insert[update][delete] and main tuple data
- */
-static ChainRecord fetch_insert(XLogReaderState *record);
-static void fetch_update(XLogReaderState *record);
-static void fetch_delete(XLogReaderState *record);
-
-static ChainRecord overlay_update(ChainRecord old_tup, ChainRecord new_tup);
-static void XLogDisplayRecord(XLogReaderState *record);
-
-static uint32_t wal_diff_hash_key(const void *key, size_t keysize);
 
  /**********************************************************************
   * Information for PostgreSQL
@@ -148,6 +120,20 @@ typedef struct ChainRecordHashEntry
 )
 
 /*
+ * This three fuctions returns palloced struct
+ * 
+ * At end of struct you can find xl_heap_insert[update][delete] and main tuple data
+ */
+static ChainRecord fetch_insert(XLogReaderState *record);
+static void fetch_update(XLogReaderState *record);
+static void fetch_delete(XLogReaderState *record);
+
+static ChainRecord overlay_update(ChainRecord old_tup, ChainRecord new_tup);
+static void XLogDisplayRecord(XLogReaderState *record);
+
+static uint32_t wal_diff_hash_key(const void *key, size_t keysize);
+
+/*
  * _PG_init
  *
  * Defines the module's GUC.
@@ -189,6 +175,7 @@ void
 wal_diff_startup(ArchiveModuleState *state)
 {
 	ArchiveData *data;
+	HASHCTL hash_ctl;
 
 	data = (ArchiveData *) MemoryContextAllocZero(TopMemoryContext,
 													   sizeof(ArchiveData));
@@ -198,7 +185,6 @@ wal_diff_startup(ArchiveModuleState *state)
 	state->private_data = (void *) data;
 	data->oldcontext = MemoryContextSwitchTo(data->context);
 
-	HASHCTL hash_ctl;
 	hash_ctl.keysize 	= sizeof(uint32_t);
 	hash_ctl.entrysize 	= sizeof(ChainRecordHashEntry);
 
@@ -209,7 +195,7 @@ wal_diff_startup(ArchiveModuleState *state)
 
 	hash_ctl.hcxt 		= data->context;
 
-	hashtable = hash_create("ChainRecordHashTable",
+	hash_table = hash_create("ChainRecordHashTable",
 							INITIAL_HASHTABLE_SIZE,
 							&hash_ctl,
 							HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
@@ -341,9 +327,9 @@ WalCloseSegment(XLogReaderState *state)
 static void
 getWalDirecotry(char *wal_directory, const char *path, const char *file)
 {
-	if (strlen(path) + strlen(file) > MAXPGPATH)
+	if (strlen(path) > MAXPGPATH)
 		ereport(ERROR,
-				errmsg("WAL file absolute name is too long : %s/%s", path, file));
+				errmsg("WAL file absolute name is too long : %s", path));
 
 	if (snprintf(wal_directory, strlen(path), "%s", path) == -1)
 		ereport(ERROR,
@@ -352,6 +338,12 @@ getWalDirecotry(char *wal_directory, const char *path, const char *file)
 	MemSet(wal_directory + (strlen(path) - strlen(file) - 1), 0, strlen(file));
 	ereport(LOG, 
 			errmsg("wal directory is : %s", wal_directory));
+}
+
+static uint32_t 
+wal_diff_hash_key(const void *key, size_t keysize) 
+{
+
 }
 
 /*
@@ -382,8 +374,9 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 	XLogRecPtr 			first_record;
 	XLogReaderState 	*xlogreader_state;
 	uint8 				info_bits;
-	ChainRecord 		rec;
+	ChainRecord 		chain_record;
 	bool 				is_found;
+	uint32_t 			hash_key;
 
 	ChainRecordHashEntry* entry;
 
@@ -439,7 +432,8 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 
 	if (!xlogreader_state) 
 	{
-		ereport(FATAL, errmsg("out of memory while allocating a WAL reading processor"));
+		ereport(FATAL, 
+				errmsg("out of memory while allocating a WAL reading processor"));
 		return false;
 	}
 
@@ -486,16 +480,17 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 			switch (info_bits & XLOG_HEAP_OPMASK)
 			{
 				case XLOG_HEAP_INSERT:
-					rec = fetch_insert(xlogreader_state);
-					if (!rec)
+					chain_record = fetch_insert(xlogreader_state);
+					if (!chain_record)
 						continue;
 
-					hash_search(hashtable, GetHashKeyFromChainRecord(rec), HASH_FIND, &is_found);
+					hash_key = GetHashKeyFromChainRecord(chain_record);
+					hash_search(hash_table, &hash_key, HASH_FIND, &is_found);
 					if (is_found)
-						hash_search(hashtable, GetHashKeyFromChainRecord(rec), HASH_REMOVE, &is_found);
+						hash_search(hash_table, &hash_key, HASH_REMOVE, &is_found);
 
-					entry = (ChainRecordHashEntry*) hash_search(hashtable, GetHashKeyFromChainRecord(rec), HASH_ENTER, &is_found);
-					entry->data = rec;
+					entry = (ChainRecordHashEntry*) hash_search(hash_table, &hash_key, HASH_ENTER, &is_found);
+					entry->data = chain_record;
 
 					break;
 				case XLOG_HEAP_UPDATE:
@@ -503,6 +498,7 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 					break;
 				case XLOG_HEAP_HOT_UPDATE:
 					// TODO
+					break;
 				case XLOG_HEAP_DELETE:
 					fetch_delete(xlogreader_state);
 					break;
@@ -794,8 +790,8 @@ create_wal_diff()
 static void 
 wall_diff_shutdown(ArchiveModuleState *state)
 {
-	hash_destroy(hashtable);
 	ArchiveData *data = (ArchiveData *) state->private_data;
+	hash_destroy(hash_table);
 	MemoryContextSwitchTo(data->oldcontext);
 	MemoryContextReset(data->context);
 }
