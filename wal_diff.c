@@ -513,11 +513,15 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *
 						continue;
 
 					hash_key = GetHashKeyFromChainRecord(chain_record);
-					hash_search(hash_table, &hash_key, HASH_FIND, &is_found);
+					hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
 					if (is_found)
-						hash_search(hash_table, &hash_key, HASH_REMOVE, &is_found);
+					{
+						entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, &is_found);
+						if (entry)
+							pfree(entry->data);
+					}
 
-					entry = (ChainRecordHashEntry*) hash_search(hash_table, &hash_key, HASH_ENTER, &is_found);
+					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, &is_found);
 					entry->data = chain_record;
 
 					break;
