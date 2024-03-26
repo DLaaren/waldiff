@@ -25,6 +25,7 @@
 
 #define INSERT_CHAIN 1
 #define UPDATE_CHAIN 2
+#define DELETE_CHAIN 3
 #define INITIAL_HASHTABLE_SIZE 100 // TODO скорее всего впоследствии мы его увеличим
 
 PG_MODULE_MAGIC;
@@ -80,18 +81,45 @@ static const ArchiveModuleCallbacks wal_diff_callbacks = {
   **********************************************************************/
 typedef struct ChainRecordData // TODO глянуть, как лучше раскидать поля для выравнивания
 {
-	HeapTupleFields htup;
-	ItemPointerData t_ctid;
+	/*
+	 * These 3 fields are representing HeapTupleFields struct.
+
+	 * If some of them not used in ChainRecord (for example. insert does not need t_xmax), they will be null'd 
+	 * during fetching.
+	 */
+	TransactionId t_xmin;
+	TransactionId t_xmax;
+	CommandId	t_cid;
+
+	/*
+	 * Pointer to latest tuple version
+	 */
+	ItemPointerData current_t_ctid;
+
+	/*
+	 * In delete/update case this is the pointer on deleted tuple version.
+	 */
+	ItemPointerData old_t_ctid;
+
 	ForkNumber 		forknum;
 	RelFileLocator 	file_loc;
 	uint16			t_infomask2;
 	uint16			t_infomask;
-	uint16 			main_data_len;
+
+	/*
+	 * Size of appropriate header + [bitmap] + [padding] + user_data.
+	 */
+	uint16 			data_len;
+
 	uint8 			chain_type;
+
+	/*
+	 * Offset to user data.
+	 */
 	uint8			t_hoff;
 
 	/*
-	 * Here comes appropriate header and then main data
+	 * Here comes appropriate header and then [bitmap] + [padding] + user_data.
 	 */
 	bits8			t_bits[FLEXIBLE_ARRAY_MEMBER];
 } ChainRecordData;
@@ -107,16 +135,30 @@ typedef struct ChainRecordHashEntry
 } ChainRecordHashEntry;
 
 /*
- * Use this to create key of struct ChainRecord for hashmap
+ * Use this to create key for struct ChainRecord in hashmap
  */
 #define GetHashKeyFromChainRecord(record) \
 ( \
 	(uint32_t)((record)->file_loc.spcOid + \
 			   (record)->file_loc.dbOid + \
 			   (record)->file_loc.relNumber + \
-			   (record)->t_ctid.ip_blkid.bi_hi + \
-			   (record)->t_ctid.ip_blkid.bi_lo + \
-			   (record)->t_ctid.ip_posid) \
+			   (record)->current_t_ctid.ip_blkid.bi_hi + \
+			   (record)->current_t_ctid.ip_blkid.bi_lo + \
+			   (record)->current_t_ctid.ip_posid) \
+)
+
+/*
+ * Use this to find previous chain record 
+ * (in case of delete/udate) in hashmap
+ */
+#define GetHashKeyOfPrevChainRecord(record) \
+( \
+	(uint32_t)((record)->file_loc.spcOid + \
+			   (record)->file_loc.dbOid + \
+			   (record)->file_loc.relNumber + \
+			   (record)->old_t_ctid.ip_blkid.bi_hi + \
+			   (record)->old_t_ctid.ip_blkid.bi_lo + \
+			   (record)->old_t_ctid.ip_posid) \
 )
 
 static void continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *private);
@@ -127,8 +169,8 @@ static void continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogD
  * At end of struct you can find xl_heap_insert[update][delete] and main tuple data
  */
 static ChainRecord fetch_insert(XLogReaderState *record);
-static void fetch_update(XLogReaderState *record);
-static void fetch_delete(XLogReaderState *record);
+static ChainRecord fetch_update(XLogReaderState *record);
+static ChainRecord fetch_delete(XLogReaderState *record);
 
 static ChainRecord overlay_update(ChainRecord old_tup, ChainRecord new_tup);
 static void XLogDisplayRecord(XLogReaderState *record);
@@ -571,8 +613,10 @@ fetch_insert(XLogReaderState *record)
     data = XLogRecGetBlockData(record, 0, &data_len);
 
     memcpy((char *) &xlhdr, data, SizeOfHeapHeader);
+	data_len -= SizeOfHeapHeader;
+	data += SizeOfHeapHeader;
 
-	fetched_record = (ChainRecord) palloc0((Size) (SizeOfChainRecord + SizeOfHeapInsert + data_len - SizeOfHeapHeader));
+	fetched_record = (ChainRecord) palloc0((Size) (SizeOfChainRecord + SizeOfHeapInsert + data_len));
 	if (! fetched_record)
 	{
 		ereport(FATAL, 
@@ -583,40 +627,49 @@ fetch_insert(XLogReaderState *record)
 	fetched_record->file_loc = target_locator;
 	fetched_record->forknum = forknum;
 
+	fetched_record->data_len = data_len + SizeOfHeapInsert;
+
 	/*
 	 * In our case, t_ctid always will be point to itself,
 	 * so we can learn about blknum and offset from this filed
 	 */
-	ItemPointerSetBlockNumber(&(fetched_record->t_ctid), blknum);
-    ItemPointerSetOffsetNumber(&(fetched_record->t_ctid), xlrec->offnum);
+	ItemPointerSetBlockNumber(&(fetched_record->current_t_ctid), blknum);
+    ItemPointerSetOffsetNumber(&(fetched_record->current_t_ctid), xlrec->offnum);
+	fetched_record->old_t_ctid = fetched_record->current_t_ctid;
 
+	/*
+	 * Copy xl_heap_insert to our struct
+	 */
 	memcpy((char*) fetched_record + SizeOfChainRecord, (char*) xlrec, SizeOfHeapInsert);
 
-    memcpy((char *) fetched_record + SizeOfChainRecord + SizeOfHeapInsert, 
-			data + SizeOfHeapHeader, 
-			data_len - SizeOfHeapHeader);
+	/*
+	 * Copy bitmap + padding (if present) + user_data from xlog record
+	 */
+    memcpy((char *) fetched_record + SizeOfChainRecord + SizeOfHeapInsert, data, data_len);
 
-	fetched_record->main_data_len = data_len - SizeOfHeapHeader;
-	fetched_record->t_hoff = SizeOfChainRecord + SizeOfHeapInsert;
+	/*
+	 * user_data offset = size of ChainRecordData struct + size of bitmap + padding
+	 */
+	fetched_record->t_hoff = SizeOfChainRecord + SizeOfHeapInsert + (xlhdr.t_hoff - SizeofHeapTupleHeader);
 
     fetched_record->t_infomask2 = xlhdr.t_infomask2;
     fetched_record->t_infomask 	= xlhdr.t_infomask;
-	fetched_record->htup.t_xmin = record->record->header.xl_xid;
+	fetched_record->t_xmin = XLogRecGetXid(record);
 
 	Assert(!(fetched_record->t_infomask & HEAP_MOVED));
-	fetched_record->htup.t_field3.t_cid = FirstCommandId;
+	fetched_record->t_cid = FirstCommandId;
 	fetched_record->t_infomask &= ~HEAP_COMBOCID;
 
 	return fetched_record;
 }
 
-static void 
+static ChainRecord 
 fetch_update(XLogReaderState *record)
 {
 
 }
 
-static void 
+static ChainRecord
 fetch_delete(XLogReaderState *record)
 {
 
