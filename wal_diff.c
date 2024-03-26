@@ -386,12 +386,6 @@ getWalDirecotry(char *wal_directory, const char *path, const char *file)
 			errmsg("wal directory is : %s", wal_directory));
 }
 
-static uint32_t 
-wal_diff_hash_key(const void *key, size_t keysize) 
-{
-
-}
-
 /*
  * TODO:
  * 
@@ -622,7 +616,7 @@ fetch_insert(XLogReaderState *record)
 	fetched_record = (ChainRecord) palloc0((Size) (SizeOfChainRecord + 
 												   SizeOfHeapInsert + 
 												   data_len));
-	if (! fetched_record)
+	if (!fetched_record)
 	{
 		ereport(FATAL, 
 				errmsg("out of memory while allocating a WAL reading processor"));
@@ -790,7 +784,35 @@ fetch_update(XLogReaderState *record)
 static ChainRecord
 fetch_delete(XLogReaderState *record)
 {
+	// no data
+	BlockNumber 	blkno;
+	RelFileLocator 	target_locator;
+	xl_heap_delete 	*xlrec = (xl_heap_delete *) XLogRecGetData(record);
 
+	// uint8		infobits_set;	/* infomask bits */
+	// uint8		flags;
+
+	ChainRecord 	fetched_record = NULL;
+
+	XLogRecGetBlockTag(record, 0, &target_locator, NULL, &blkno);
+	ItemPointerSetBlockNumber(&(fetched_record->old_t_ctid), blkno);
+	ItemPointerSetOffsetNumber(&(fetched_record->old_t_ctid), xlrec->offnum);
+
+	fetched_record = (ChainRecord) palloc0((Size) (SizeOfChainRecord));
+	if (!fetched_record)
+	{
+		ereport(FATAL, 
+				errmsg("out of memory while allocating a WAL reading processor"));
+		return NULL;
+	}
+
+	fetched_record->chain_type = DELETE_CHAIN;
+	fetched_record->t_xmax = xlrec->xmax;
+	fetched_record->file_loc = target_locator;
+
+	memcpy((char*) fetched_record + SizeOfChainRecord, (char*) xlrec, SizeOfHeapDelete);
+
+	return fetched_record;
 }
 
 static ChainRecord 
