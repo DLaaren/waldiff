@@ -107,7 +107,7 @@ typedef struct ChainRecordData // TODO глянуть, как лучше рас�
 	uint16			t_infomask;
 
 	/*
-	 * Size of appropriate header + [bitmap] + [padding] + user_data.
+	 * Size of [bitmap] + [padding] + appropriate header + [prefix length] + [suffix length] + user_data.
 	 */
 	uint16 			data_len;
 
@@ -119,7 +119,9 @@ typedef struct ChainRecordData // TODO глянуть, как лучше рас�
 	uint8			t_hoff;
 
 	/*
-	 * Here comes appropriate header and then [bitmap] + [padding] + user_data.
+	 * Here comes [bitmap] + [padding] and then appropriate header + user_data.
+	 * In update case 'user_data' also includes prefix and suffix lengths (both of them may be = 0)
+	 * that comes right after 'xl_heap_update'
 	 */
 	bits8			t_bits[FLEXIBLE_ARRAY_MEMBER];
 } ChainRecordData;
@@ -603,6 +605,7 @@ fetch_insert(XLogReaderState *record)
     xl_heap_insert 	*xlrec;
     char* 			data;
     Size 			data_len;
+	Size 			bitmap_len;
     xl_heap_header 	xlhdr;
 
 	ChainRecord 	fetched_record = NULL;
@@ -616,7 +619,9 @@ fetch_insert(XLogReaderState *record)
 	data_len -= SizeOfHeapHeader;
 	data += SizeOfHeapHeader;
 
-	fetched_record = (ChainRecord) palloc0((Size) (SizeOfChainRecord + SizeOfHeapInsert + data_len));
+	fetched_record = (ChainRecord) palloc0((Size) (SizeOfChainRecord + 
+												   SizeOfHeapInsert + 
+												   data_len));
 	if (! fetched_record)
 	{
 		ereport(FATAL, 
@@ -638,19 +643,26 @@ fetch_insert(XLogReaderState *record)
 	fetched_record->old_t_ctid = fetched_record->current_t_ctid;
 
 	/*
+	 * Copy bitmap + padding (if present) from xlog record
+	 */
+	bitmap_len = xlhdr.t_hoff - SizeofHeapTupleHeader;
+    memcpy((char *) fetched_record + SizeOfChainRecord, data, bitmap_len);
+	data += bitmap_len;
+
+	/*
 	 * Copy xl_heap_insert to our struct
 	 */
-	memcpy((char*) fetched_record + SizeOfChainRecord, (char*) xlrec, SizeOfHeapInsert);
+	memcpy((char*) fetched_record + SizeOfChainRecord + bitmap_len, (char*) xlrec, SizeOfHeapInsert);
 
 	/*
-	 * Copy bitmap + padding (if present) + user_data from xlog record
+	 * Copy user data to our struct
 	 */
-    memcpy((char *) fetched_record + SizeOfChainRecord + SizeOfHeapInsert, data, data_len);
+	memcpy((char*) fetched_record + SizeOfChainRecord + bitmap_len + SizeOfHeapInsert, data, data_len - bitmap_len);
 
 	/*
-	 * user_data offset = size of ChainRecordData struct + size of bitmap + padding
+	 * user_data offset = size of ChainRecordData struct + size of bitmap + padding + insert_header
 	 */
-	fetched_record->t_hoff = SizeOfChainRecord + SizeOfHeapInsert + (xlhdr.t_hoff - SizeofHeapTupleHeader);
+	fetched_record->t_hoff = SizeOfChainRecord + bitmap_len + SizeOfHeapInsert;
 
     fetched_record->t_infomask2 = xlhdr.t_infomask2;
     fetched_record->t_infomask 	= xlhdr.t_infomask;
@@ -666,7 +678,113 @@ fetch_insert(XLogReaderState *record)
 static ChainRecord 
 fetch_update(XLogReaderState *record)
 {
+	RelFileLocator 	target_locator;
+    BlockNumber 	old_blknum;
+	BlockNumber 	new_blknum;
+    ForkNumber 		forknum;
+    xl_heap_update* xlrec;
+    char* 			data;
+	char*			data_end;
 
+    Size 			data_len;
+	Size			tuplen;
+	Size 			bitmap_len;
+    xl_heap_header 	xlhdr;
+
+	uint16			prefixlen = 0,
+					suffixlen = 0;
+
+	ChainRecord 	fetched_record = NULL;
+
+	XLogRecGetBlockTag(record, 0, &target_locator, &forknum, &new_blknum);
+	if (!XLogRecGetBlockTagExtended(record, 1, NULL, NULL, &old_blknum, NULL))
+		old_blknum = new_blknum;
+	
+    xlrec = (xl_heap_update *) XLogRecGetData(record);
+
+	data = XLogRecGetBlockData(record, 0, &data_len);
+	data_end = data + data_len;
+
+	if (xlrec->flags & XLH_UPDATE_PREFIX_FROM_OLD)
+	{
+		Assert(new_blknum == old_blknum);
+		memcpy(&prefixlen, data, sizeof(uint16));
+		data += sizeof(uint16);
+		data_len -= sizeof(uint16);
+	}
+	if (xlrec->flags & XLH_UPDATE_SUFFIX_FROM_OLD)
+	{
+		Assert(new_blknum == old_blknum);
+		memcpy(&suffixlen, data, sizeof(uint16));
+		data += sizeof(uint16);
+		data_len -= sizeof(uint16);
+	}
+
+	memcpy((char *) &xlhdr, data, SizeOfHeapHeader);
+	data += SizeOfHeapHeader;
+	data_len -= SizeOfHeapHeader;
+	tuplen = data_end - data;
+
+	fetched_record = (ChainRecord) palloc0((Size) (SizeOfChainRecord + 
+												   SizeOfHeapUpdate + 
+												   (sizeof(uint16) * 2) +
+												   data_len));
+	if (! fetched_record)
+	{
+		ereport(FATAL, 
+				errmsg("out of memory while allocating a WAL reading processor"));
+		return NULL;
+	}
+
+	fetched_record->chain_type = UPDATE_CHAIN;
+	fetched_record->file_loc = target_locator;
+	fetched_record->forknum = forknum;
+
+	fetched_record->t_infomask2 = xlhdr.t_infomask2;
+    fetched_record->t_infomask 	= xlhdr.t_infomask;
+	fetched_record->t_xmin = XLogRecGetXid(record);
+	fetched_record->t_xmax = xlrec->new_xmax;
+
+	/*
+	 * Copy ItemPointerData of inserted and deleted tuple, because
+	 * we need both to find in hashmap
+	 */
+	ItemPointerSetBlockNumber(&(fetched_record->current_t_ctid), new_blknum);
+    ItemPointerSetOffsetNumber(&(fetched_record->current_t_ctid), xlrec->new_offnum);
+	ItemPointerSetBlockNumber(&(fetched_record->old_t_ctid), old_blknum);
+    ItemPointerSetOffsetNumber(&(fetched_record->old_t_ctid), xlrec->old_offnum);
+
+	Assert(!(fetched_record->t_infomask & HEAP_MOVED));
+	fetched_record->t_cid = FirstCommandId;
+	fetched_record->t_infomask &= ~HEAP_COMBOCID;
+
+	/*
+	 * Copy bitmap + padding (if present) from xlog record
+	 */
+	bitmap_len = xlhdr.t_hoff - SizeofHeapTupleHeader;
+    memcpy((char *) fetched_record + SizeOfChainRecord, data, bitmap_len);
+	data += bitmap_len;
+
+	/*
+	 * Copy xl_heap_update to our struct
+	 */
+	memcpy((char*) fetched_record + SizeOfChainRecord + bitmap_len, (char*) xlrec, SizeOfHeapUpdate);
+
+	/*
+	 * Copy prefix and suffix length 
+	 */
+	memcpy((char*) fetched_record + SizeOfChainRecord + bitmap_len + SizeOfHeapUpdate, (void*) &prefixlen, sizeof(uint16));
+	memcpy((char*) fetched_record + SizeOfChainRecord + bitmap_len + SizeOfHeapUpdate + sizeof(uint16), (void*) &suffixlen, sizeof(uint16));
+
+	/*
+	 * Copy changed part of old
+	 */
+	memcpy((char*) fetched_record + SizeOfChainRecord + bitmap_len + SizeOfHeapUpdate + (sizeof(uint16) * 2), data, tuplen - bitmap_len);
+
+	fetched_record->data_len = SizeOfHeapUpdate + (sizeof(uint16) * 2) + tuplen;
+	fetched_record->t_hoff = SizeOfChainRecord + bitmap_len + SizeOfHeapUpdate + (sizeof(uint16) * 2);
+
+	return fetched_record;
 }
 
 static ChainRecord
