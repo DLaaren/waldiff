@@ -38,7 +38,7 @@ my ($walfile_name, $blocksize) = split '\|' => $node->safe_psql('postgres',
 
 ok("Switched wal");
 
-# sleep(1);
+sleep(1);
 
 my $wal_file = $node->data_dir . '/pg_wal/' . $walfile_name;
 

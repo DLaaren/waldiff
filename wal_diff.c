@@ -496,8 +496,7 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 		ereport(LOG, 
 				errmsg("skipping over %u bytes", (uint32) (first_record - private.startptr)));
 
-	//здесь segfault вылетает
-	// continuous_reading_wal_file(xlogreader_state, &private);
+	continuous_reading_wal_file(xlogreader_state, &private);
 
 	// а потом жоско скрафтим wal_diff
 
@@ -542,6 +541,9 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *
 
 		if (XLogRecGetRmid(xlogreader_state) == RM_HEAP_ID)
 		{
+			if (XLogRecHasBlockImage(xlogreader_state, 0))
+				continue;
+
 			info_bits = XLogRecGetInfo(xlogreader_state) & ~XLR_INFO_MASK;
 
 			switch (info_bits & XLOG_HEAP_OPMASK)
@@ -691,6 +693,10 @@ fetch_update(XLogReaderState *record)
 					suffixlen = 0;
 
 	ChainRecord 	fetched_record = NULL;
+
+	// ereport(LOG, errmsg("Main data len : %d", record->record->main_data_len));
+	// ereport(LOG, errmsg("Max block id : %d", record->record->max_block_id));
+	// ereport(LOG, errmsg("Is fpw : %d", record->record->blocks[0].has_image));
 
 	XLogRecGetBlockTag(record, 0, &target_locator, &forknum, &new_blknum);
 	if (!XLogRecGetBlockTagExtended(record, 1, NULL, NULL, &old_blknum, NULL))
@@ -990,7 +996,18 @@ static void
 wall_diff_shutdown(ArchiveModuleState *state)
 {
 	ArchiveData *data = (ArchiveData *) state->private_data;
+	if (data == NULL)
+		return;
 	hash_destroy(hash_table);
+
 	MemoryContextSwitchTo(data->oldcontext);
 	MemoryContextReset(data->context);
+
+	Assert(CurrentMemoryContext != data->context);
+	if (MemoryContextIsValid(data->context))
+		MemoryContextDelete(data->context);
+	data->context = NULL;
+
+	pfree(data);
+	state->private_data = NULL;
 }
