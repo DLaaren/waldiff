@@ -775,17 +775,24 @@ fetch_update(XLogReaderState *record)
 static ChainRecord
 fetch_delete(XLogReaderState *record)
 {
-	// no data
 	RelFileLocator 	target_locator;
+	BlockNumber 	blknum;
+    ForkNumber 		forknum;
 	xl_heap_delete 	*xlrec = (xl_heap_delete *) XLogRecGetData(record);
 
 	ChainRecord 	fetched_record = NULL;
 
 	fetched_record = (ChainRecord) palloc0((Size) (SizeOfChainRecord));
 
+	XLogRecGetBlockTag(record, 0, &target_locator, &forknum, &blknum);
+
 	fetched_record->chain_type = DELETE_CHAIN;
 	fetched_record->t_xmax = xlrec->xmax;
 	fetched_record->file_loc = target_locator;
+	fetched_record->forknum = forknum;
+
+	ItemPointerSetBlockNumber(&(fetched_record->old_t_ctid), blknum);
+    ItemPointerSetOffsetNumber(&(fetched_record->old_t_ctid), xlrec->offnum);
 
 	memcpy((char*) fetched_record + SizeOfChainRecord, (char*) xlrec, SizeOfHeapDelete);
 
