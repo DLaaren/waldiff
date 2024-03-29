@@ -174,7 +174,7 @@ static ChainRecord fetch_insert(XLogReaderState *record);
 static ChainRecord fetch_update(XLogReaderState *record);
 static ChainRecord fetch_delete(XLogReaderState *record);
 
-static ChainRecord overlay_update(ChainRecord old_tup, ChainRecord new_tup);
+static void overlay_update(ChainRecord old_tup, ChainRecord new_tup);
 static void XLogDisplayRecord(XLogReaderState *record);
 
 // static uint32_t wal_diff_hash_key(const void *key, size_t keysize);
@@ -620,12 +620,6 @@ fetch_insert(XLogReaderState *record)
 	fetched_record = (ChainRecord) palloc0((Size) (SizeOfChainRecord + 
 												   SizeOfHeapInsert + 
 												   data_len));
-	if (!fetched_record)
-	{
-		ereport(FATAL, 
-				errmsg("out of memory while allocating a WAL reading processor"));
-		return NULL;
-	}
 	fetched_record->chain_type = INSERT_CHAIN;
 	fetched_record->file_loc = target_locator;
 	fetched_record->forknum = forknum;
@@ -694,10 +688,6 @@ fetch_update(XLogReaderState *record)
 
 	ChainRecord 	fetched_record = NULL;
 
-	// ereport(LOG, errmsg("Main data len : %d", record->record->main_data_len));
-	// ereport(LOG, errmsg("Max block id : %d", record->record->max_block_id));
-	// ereport(LOG, errmsg("Is fpw : %d", record->record->blocks[0].has_image));
-
 	XLogRecGetBlockTag(record, 0, &target_locator, &forknum, &new_blknum);
 	if (!XLogRecGetBlockTagExtended(record, 1, NULL, NULL, &old_blknum, NULL))
 		old_blknum = new_blknum;
@@ -731,13 +721,6 @@ fetch_update(XLogReaderState *record)
 												   SizeOfHeapUpdate + 
 												   (sizeof(uint16) * 2) +
 												   data_len));
-	if (! fetched_record)
-	{
-		ereport(FATAL, 
-				errmsg("out of memory while allocating a WAL reading processor"));
-		return NULL;
-	}
-
 	fetched_record->chain_type = UPDATE_CHAIN;
 	fetched_record->file_loc = target_locator;
 	fetched_record->forknum = forknum;
@@ -799,12 +782,6 @@ fetch_delete(XLogReaderState *record)
 	ChainRecord 	fetched_record = NULL;
 
 	fetched_record = (ChainRecord) palloc0((Size) (SizeOfChainRecord));
-	if (!fetched_record)
-	{
-		ereport(FATAL, 
-				errmsg("out of memory while allocating a WAL reading processor"));
-		return NULL;
-	}
 
 	fetched_record->chain_type = DELETE_CHAIN;
 	fetched_record->t_xmax = xlrec->xmax;
@@ -815,10 +792,97 @@ fetch_delete(XLogReaderState *record)
 	return fetched_record;
 }
 
-static ChainRecord 
+/*
+ * Data from old_tup will overlay data from new_tup, if necessary.
+ * After this call, you can deallocate old_tup
+ */
+static void 
 overlay_update(ChainRecord old_tup, ChainRecord new_tup)
 {
+	uint16 old_prefix_len,
+		   old_suffix_len,
+		   new_prefix_len,
+		   new_suffix_len,
+		   old_offset,
+		   new_offset;
 
+	uint16 prefix_diff_len = 0;
+	uint16 suffix_diff_len = 0;
+	
+	char*  prefix_diff = NULL;
+	char*  suffix_diff = NULL;
+	char*  tup_cpy;
+
+	Size   tuplen,
+	   	   old_tuplen;
+	
+	Assert(old_tup->chain_type == UPDATE_CHAIN &&
+		   new_tup->chain_type == UPDATE_CHAIN);
+
+	new_tup->old_t_ctid = old_tup->old_t_ctid;
+
+	old_offset = old_tup->t_hoff - (sizeof(uint16) * 2);
+	new_offset = new_tup->t_hoff - (sizeof(uint16) * 2);
+
+	memcpy((void*) &old_prefix_len, (char*) old_tup + old_offset, sizeof(uint16));
+	old_offset += sizeof(uint16);
+	memcpy((void*) &new_prefix_len, (char*) new_tup + new_offset, sizeof(uint16));
+	new_offset += sizeof(uint16);
+
+	memcpy((void*) &old_suffix_len, (char*) old_tup + old_offset, sizeof(uint16));
+	memcpy((void*) &new_suffix_len, (char*) new_tup + new_offset, sizeof(uint16));
+
+	if (new_prefix_len > old_prefix_len)
+	{
+		prefix_diff_len = new_prefix_len - old_prefix_len;
+		prefix_diff = palloc0((Size) prefix_diff_len);
+
+		memcpy(prefix_diff, (char*) old_tup + old_tup->t_hoff, prefix_diff_len);
+	}
+
+	if (new_suffix_len > old_suffix_len)
+	{
+		suffix_diff_len = new_suffix_len - old_suffix_len;
+		suffix_diff = palloc0((Size) suffix_diff_len);
+
+		memcpy(suffix_diff, (char*) old_tup + SizeOfChainRecord + old_tup->data_len - suffix_diff_len, suffix_diff_len);
+	}
+
+	// TODO надеемся, что repalloc просто добавит памяти в конце
+	if (suffix_diff_len + prefix_diff_len > 0)
+	{
+		tuplen = new_tup->data_len - (new_tup->t_hoff - SizeOfChainRecord);
+		old_tuplen = new_tup->data_len;
+		tup_cpy = palloc0(tuplen);
+
+		memcpy(tup_cpy, (char*) new_tup + new_tup->t_hoff, tuplen);
+
+		new_tup->data_len += suffix_diff_len;
+		new_tup->data_len += prefix_diff_len;
+		new_tup = (ChainRecord) repalloc((void*) new_tup, (Size) (SizeOfChainRecord + 
+												   				  SizeOfHeapUpdate + 
+												   				  new_tup->data_len));
+	}
+		
+
+	if (prefix_diff_len != 0)
+	{
+		memcpy((char*) new_tup + new_tup->t_hoff, prefix_diff, prefix_diff_len);
+		memcpy((char*) new_tup + new_tup->t_hoff + prefix_diff_len, tup_cpy, tuplen);
+		pfree(prefix_diff);
+		pfree(tup_cpy);
+	}
+	else
+	{
+		memcpy((char*) new_tup + new_tup->t_hoff, tup_cpy, tuplen);
+		pfree(tup_cpy);
+	}
+
+	if (suffix_diff_len != 0)
+	{
+		memcpy((char*) new_tup + SizeOfChainRecord + old_tuplen + prefix_diff_len, suffix_diff, suffix_diff_len);
+		pfree(suffix_diff);
+	}
 }
 
 // pring record to stdout
