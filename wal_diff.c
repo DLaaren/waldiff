@@ -13,10 +13,10 @@
 #include "access/xlog_internal.h"
 #include "archive/archive_module.h"
 #include "common/int.h"
-#include "miscadmin.h"
-#include "lib/stringinfo.h"
 #include "common/logging.h"
 #include "common/hashfn.h"
+#include "miscadmin.h"
+#include "lib/stringinfo.h"
 #include "storage/copydir.h"
 #include "storage/fd.h"
 #include "utils/guc.h"
@@ -172,9 +172,11 @@ static void continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogD
  */
 static ChainRecord fetch_insert(XLogReaderState *record);
 static ChainRecord fetch_update(XLogReaderState *record);
+static ChainRecord fetch_hot_update(XLogReaderState *record);
 static ChainRecord fetch_delete(XLogReaderState *record);
 
 static void overlay_update(ChainRecord old_tup, ChainRecord new_tup);
+static void overlay_hot_update(ChainRecord old_tup, ChainRecord new_tup);
 static void XLogDisplayRecord(XLogReaderState *record);
 
 // static uint32_t wal_diff_hash_key(const void *key, size_t keysize);
@@ -557,28 +559,84 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *
 					hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
 					if (is_found)
 					{
-						entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, &is_found);
+						entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
 						if (entry)
 							pfree(entry->data);
 					}
 
-					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, &is_found);
+					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
 					entry->data = chain_record;
+					continue;
 
-					break;
 				case XLOG_HEAP_UPDATE:
-					fetch_update(xlogreader_state);
-					break;
+					chain_record = fetch_update(xlogreader_state);
+					if (!chain_record)
+						continue;
+
+					hash_key = GetHashKeyOfPrevChainRecord(chain_record);
+					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
+					if (is_found)
+					{
+						overlay_update(entry->data, chain_record);
+
+						entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
+						if (entry)
+							pfree(entry->data);
+					}
+
+					hash_key = GetHashKeyFromChainRecord(chain_record);
+					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
+					entry->data = chain_record;
+					continue;
+
 				case XLOG_HEAP_HOT_UPDATE:
-					// TODO
-					break;
+					chain_record = fetch_hot_update(xlogreader_state);
+					if (!chain_record)
+						continue;
+
+					hash_key = GetHashKeyOfPrevChainRecord(chain_record);
+					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
+					if (is_found)
+					{
+						overlay_hot_update(entry->data, chain_record);
+
+						entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
+						if (entry)
+							pfree(entry->data);
+					}
+
+					hash_key = GetHashKeyFromChainRecord(chain_record);
+					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
+					entry->data = chain_record;
+					continue;
+
 				case XLOG_HEAP_DELETE:
-					fetch_delete(xlogreader_state);
-					break;
+					chain_record = fetch_delete(xlogreader_state);
+					if (!chain_record)
+						continue;
+
+					hash_key = GetHashKeyOfPrevChainRecord(chain_record);
+					entry = hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
+
+					if (is_found)
+					{
+						// if chain_record is not in hash map then it is not in wal diff file
+						entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
+						if (entry)
+							pfree(entry->data);
+					}
+					// insert/update is in another wal file
+					else 
+					{
+						entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
+						entry->data = chain_record;
+					}
+
+					continue;
 				default:
 					ereport(LOG, 
 							errmsg("unknown op code %u", info_bits));
-					break;
+					continue;
 			}
 		}
 		// лол сделали второй RMGR только потому что закончились op коды
