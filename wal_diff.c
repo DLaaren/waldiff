@@ -960,8 +960,8 @@ overlay_update(ChainRecord old_tup, ChainRecord new_tup)
 
 		tuplen = new_tup->data_len - (new_tup->t_hoff - SizeOfChainRecord);
 
-		memcpy((void*) old_tup + old_tup->t_hoff + new_prefix_len,
-			   (void*) new_tup + new_tup->t_hoff, 
+		memcpy((char*) old_tup + old_tup->t_hoff + new_prefix_len,
+			   (char*) new_tup + new_tup->t_hoff, 
 			   tuplen);		
 	}
 	
