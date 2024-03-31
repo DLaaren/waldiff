@@ -560,8 +560,6 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *
 					if (is_found)
 					{
 						entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
-						if (entry)
-							pfree(entry->data);
 					}
 
 					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
@@ -580,8 +578,6 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *
 						overlay_update(entry->data, chain_record);
 
 						entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
-						if (entry)
-							pfree(entry->data);
 					}
 
 					hash_key = GetHashKeyFromChainRecord(chain_record);
@@ -622,8 +618,6 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *
 					{
 						// if chain_record is not in hash map then it is not in wal diff file
 						entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
-						if (entry)
-							pfree(entry->data);
 					}
 					// insert/update is in another wal file
 					else 
@@ -936,19 +930,15 @@ overlay_update(ChainRecord old_tup, ChainRecord new_tup)
 		{
 			memcpy((char*) new_tup + new_tup->t_hoff, prefix_diff, prefix_diff_len);
 			memcpy((char*) new_tup + new_tup->t_hoff + prefix_diff_len, tup_cpy, tuplen);
-			pfree(prefix_diff);
-			pfree(tup_cpy);
 		}
 		else if (suffix_diff_len != 0)
 		{
 			memcpy((char*) new_tup + new_tup->t_hoff, tup_cpy, tuplen);
-			pfree(tup_cpy);
 		}
 
 		if (suffix_diff_len != 0)
 		{
 			memcpy((char*) new_tup + SizeOfChainRecord + old_tuplen + prefix_diff_len, suffix_diff, suffix_diff_len);
-			pfree(suffix_diff);
 		}
 	}
 	else 
@@ -1001,7 +991,6 @@ XLogDisplayRecord(XLogReaderState *record)
 	resetStringInfo(&s);
 	XLogRecGetBlockRefInfo(record, true, true, &s, NULL);
 	ereport(LOG, errmsg("%s", s.data));
-	pfree(s.data);
 }
 
 
@@ -1154,6 +1143,5 @@ wall_diff_shutdown(ArchiveModuleState *state)
 		MemoryContextDelete(data->context);
 	data->context = NULL;
 
-	pfree(data);
 	state->private_data = NULL;
 }
