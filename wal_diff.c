@@ -176,7 +176,7 @@ static ChainRecord fetch_hot_update(XLogReaderState *record);
 static ChainRecord fetch_delete(XLogReaderState *record);
 
 static void overlay_update(ChainRecord old_tup, ChainRecord new_tup);
-static void overlay_hot_update(ChainRecord old_tup, ChainRecord new_tup);
+// static void overlay_hot_update(ChainRecord old_tup, ChainRecord new_tup);
 static void XLogDisplayRecord(XLogReaderState *record);
 
 // static uint32_t wal_diff_hash_key(const void *key, size_t keysize);
@@ -590,24 +590,24 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *
 					continue;
 
 				case XLOG_HEAP_HOT_UPDATE:
-					chain_record = fetch_hot_update(xlogreader_state);
-					if (!chain_record)
-						continue;
+					// chain_record = fetch_hot_update(xlogreader_state);
+					// if (!chain_record)
+					// 	continue;
 
-					hash_key = GetHashKeyOfPrevChainRecord(chain_record);
-					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
-					if (is_found)
-					{
-						overlay_hot_update(entry->data, chain_record);
+					// hash_key = GetHashKeyOfPrevChainRecord(chain_record);
+					// entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
+					// if (is_found)
+					// {
+					// 	overlay_hot_update(entry->data, chain_record);
 
-						entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
-						if (entry)
-							pfree(entry->data);
-					}
+					// 	entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
+					// 	if (entry)
+					// 		pfree(entry->data);
+					// }
 
-					hash_key = GetHashKeyFromChainRecord(chain_record);
-					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
-					entry->data = chain_record;
+					// hash_key = GetHashKeyFromChainRecord(chain_record);
+					// entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
+					// entry->data = chain_record;
 					continue;
 
 				case XLOG_HEAP_DELETE:
@@ -881,73 +881,90 @@ overlay_update(ChainRecord old_tup, ChainRecord new_tup)
 	Size   tuplen,
 	   	   old_tuplen;
 	
-	Assert(old_tup->chain_type == UPDATE_CHAIN &&
-		   new_tup->chain_type == UPDATE_CHAIN);
+	Assert((old_tup->chain_type == UPDATE_CHAIN && new_tup->chain_type == UPDATE_CHAIN) ||
+			(old_tup->chain_type == INSERT_CHAIN && new_tup->chain_type == UPDATE_CHAIN));
 
 	new_tup->old_t_ctid = old_tup->old_t_ctid;
 
 	old_offset = old_tup->t_hoff - (sizeof(uint16) * 2);
 	new_offset = new_tup->t_hoff - (sizeof(uint16) * 2);
 
-	memcpy((void*) &old_prefix_len, (char*) old_tup + old_offset, sizeof(uint16));
-	old_offset += sizeof(uint16);
-	memcpy((void*) &new_prefix_len, (char*) new_tup + new_offset, sizeof(uint16));
-	new_offset += sizeof(uint16);
-
-	memcpy((void*) &old_suffix_len, (char*) old_tup + old_offset, sizeof(uint16));
-	memcpy((void*) &new_suffix_len, (char*) new_tup + new_offset, sizeof(uint16));
-
-	if (new_prefix_len > old_prefix_len)
+	if (old_tup->chain_type == UPDATE_CHAIN) 
 	{
-		prefix_diff_len = new_prefix_len - old_prefix_len;
-		prefix_diff = palloc0((Size) prefix_diff_len);
+		memcpy((void*) &old_prefix_len, (char*) old_tup + old_offset, sizeof(uint16));
+		old_offset += sizeof(uint16);
+		memcpy((void*) &new_prefix_len, (char*) new_tup + new_offset, sizeof(uint16));
+		new_offset += sizeof(uint16);
 
-		memcpy(prefix_diff, (char*) old_tup + old_tup->t_hoff, prefix_diff_len);
+		memcpy((void*) &old_suffix_len, (char*) old_tup + old_offset, sizeof(uint16));
+		memcpy((void*) &new_suffix_len, (char*) new_tup + new_offset, sizeof(uint16));
+
+		if (new_prefix_len > old_prefix_len)
+		{
+			prefix_diff_len = new_prefix_len - old_prefix_len;
+			prefix_diff = palloc0((Size) prefix_diff_len);
+
+			memcpy(prefix_diff, (char*) old_tup + old_tup->t_hoff, prefix_diff_len);
+		}
+
+		if (new_suffix_len > old_suffix_len)
+		{
+			suffix_diff_len = new_suffix_len - old_suffix_len;
+			suffix_diff = palloc0((Size) suffix_diff_len);
+
+			memcpy(suffix_diff, (char*) old_tup + SizeOfChainRecord + old_tup->data_len - suffix_diff_len, suffix_diff_len);
+		}
+
+		// TODO надеемся, что repalloc просто добавит памяти в конце
+		if (suffix_diff_len + prefix_diff_len > 0)
+		{
+			tuplen = new_tup->data_len - (new_tup->t_hoff - SizeOfChainRecord);
+			old_tuplen = new_tup->data_len;
+			tup_cpy = palloc0(tuplen);
+
+			memcpy(tup_cpy, (char*) new_tup + new_tup->t_hoff, tuplen);
+
+			new_tup->data_len += suffix_diff_len;
+			new_tup->data_len += prefix_diff_len;
+			new_tup = (ChainRecord) repalloc((void*) new_tup, (Size) (SizeOfChainRecord + 
+																	SizeOfHeapUpdate + 
+																	new_tup->data_len));
+		}
+			
+
+		if (prefix_diff_len != 0)
+		{
+			memcpy((char*) new_tup + new_tup->t_hoff, prefix_diff, prefix_diff_len);
+			memcpy((char*) new_tup + new_tup->t_hoff + prefix_diff_len, tup_cpy, tuplen);
+			pfree(prefix_diff);
+			pfree(tup_cpy);
+		}
+		else if (suffix_diff_len != 0)
+		{
+			memcpy((char*) new_tup + new_tup->t_hoff, tup_cpy, tuplen);
+			pfree(tup_cpy);
+		}
+
+		if (suffix_diff_len != 0)
+		{
+			memcpy((char*) new_tup + SizeOfChainRecord + old_tuplen + prefix_diff_len, suffix_diff, suffix_diff_len);
+			pfree(suffix_diff);
+		}
 	}
-
-	if (new_suffix_len > old_suffix_len)
+	else 
 	{
-		suffix_diff_len = new_suffix_len - old_suffix_len;
-		suffix_diff = palloc0((Size) suffix_diff_len);
+		memcpy((void*) &new_prefix_len, (char*) new_tup + new_offset, sizeof(uint16));
+		new_offset += sizeof(uint16);
 
-		memcpy(suffix_diff, (char*) old_tup + SizeOfChainRecord + old_tup->data_len - suffix_diff_len, suffix_diff_len);
-	}
+		memcpy((void*) &new_suffix_len, (char*) new_tup + new_offset, sizeof(uint16));
 
-	// TODO надеемся, что repalloc просто добавит памяти в конце
-	if (suffix_diff_len + prefix_diff_len > 0)
-	{
 		tuplen = new_tup->data_len - (new_tup->t_hoff - SizeOfChainRecord);
-		old_tuplen = new_tup->data_len;
-		tup_cpy = palloc0(tuplen);
 
-		memcpy(tup_cpy, (char*) new_tup + new_tup->t_hoff, tuplen);
-
-		new_tup->data_len += suffix_diff_len;
-		new_tup->data_len += prefix_diff_len;
-		new_tup = (ChainRecord) repalloc((void*) new_tup, (Size) (SizeOfChainRecord + 
-												   				  SizeOfHeapUpdate + 
-												   				  new_tup->data_len));
+		memcpy((void*) old_tup + old_tup->t_hoff + new_prefix_len,
+			   (void*) new_tup + new_tup->t_hoff, 
+			   tuplen);		
 	}
-		
-
-	if (prefix_diff_len != 0)
-	{
-		memcpy((char*) new_tup + new_tup->t_hoff, prefix_diff, prefix_diff_len);
-		memcpy((char*) new_tup + new_tup->t_hoff + prefix_diff_len, tup_cpy, tuplen);
-		pfree(prefix_diff);
-		pfree(tup_cpy);
-	}
-	else
-	{
-		memcpy((char*) new_tup + new_tup->t_hoff, tup_cpy, tuplen);
-		pfree(tup_cpy);
-	}
-
-	if (suffix_diff_len != 0)
-	{
-		memcpy((char*) new_tup + SizeOfChainRecord + old_tuplen + prefix_diff_len, suffix_diff, suffix_diff_len);
-		pfree(suffix_diff);
-	}
+	
 }
 
 // pring record to stdout
