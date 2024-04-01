@@ -176,7 +176,6 @@ static ChainRecord fetch_hot_update(XLogReaderState *record);
 static ChainRecord fetch_delete(XLogReaderState *record);
 
 static void overlay_update(ChainRecord old_tup, ChainRecord new_tup);
-// static void overlay_hot_update(ChainRecord old_tup, ChainRecord new_tup);
 static void XLogDisplayRecord(XLogReaderState *record);
 
 // static uint32_t wal_diff_hash_key(const void *key, size_t keysize);
@@ -575,35 +574,32 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *
 					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
 					if (is_found)
 					{
+						bool is_insert_chain = (entry->data->chain_type == INSERT_CHAIN);
 						overlay_update(entry->data, chain_record);
 
-						entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
+						if (!is_insert_chain) 
+						{
+							entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
+							hash_key = GetHashKeyFromChainRecord(chain_record);
+							entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
+							entry->data = chain_record;
+						}
+					}
+					else 
+					{
+						hash_key = GetHashKeyFromChainRecord(chain_record);
+						entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
+						entry->data = chain_record;	
 					}
 
-					hash_key = GetHashKeyFromChainRecord(chain_record);
-					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
-					entry->data = chain_record;
 					continue;
 
 				case XLOG_HEAP_HOT_UPDATE:
-					// chain_record = fetch_hot_update(xlogreader_state);
-					// if (!chain_record)
-					// 	continue;
-
-					// hash_key = GetHashKeyOfPrevChainRecord(chain_record);
-					// entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
-					// if (is_found)
-					// {
-					// 	overlay_hot_update(entry->data, chain_record);
-
-					// 	entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
-					// 	if (entry)
-					// 		pfree(entry->data);
-					// }
-
-					// hash_key = GetHashKeyFromChainRecord(chain_record);
-					// entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
-					// entry->data = chain_record;
+					/*
+					 * We don't need to deal with hot update, because even if there is hot-update chain in
+					 * WAL file, we will compress it to one update/insert record. So we just want index to refer
+					 * to our "super update[insert]"
+					 */
 					continue;
 
 				case XLOG_HEAP_DELETE:
