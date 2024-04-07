@@ -22,6 +22,7 @@
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/hsearch.h"
+#include "utils/wait_event.h"
 
 #define INSERT_CHAIN 1
 #define UPDATE_CHAIN 2
@@ -163,7 +164,11 @@ typedef struct ChainRecordHashEntry
 			   (record)->old_t_ctid.ip_posid) \
 )
 
-static void continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *private);
+static void continuous_reading_wal_file(XLogReaderState *xlogreader_state, 
+										XLogDumpPrivate *private, 
+										const char* orig_wal_file_name, 
+										const char* wal_diff_file_name,
+										XLogRecPtr initial_file_offset);
 
 /*
  * This three fuctions returns palloced struct
@@ -172,13 +177,31 @@ static void continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogD
  */
 static ChainRecord fetch_insert(XLogReaderState *record);
 static ChainRecord fetch_update(XLogReaderState *record);
-static ChainRecord fetch_hot_update(XLogReaderState *record);
 static ChainRecord fetch_delete(XLogReaderState *record);
 
 static void overlay_update(ChainRecord old_tup, ChainRecord new_tup);
 static void XLogDisplayRecord(XLogReaderState *record);
 
-// static uint32_t wal_diff_hash_key(const void *key, size_t keysize);
+/*
+ * Copy 'size' bytes from src to dest
+ */
+static void 		copy_file_part(const char* src, int dstfd, uint64 size, uint64 src_offset, char* tmp_buffer, char* xlog_rec_buffer);
+static int			read_one_xlog_rec(int src_fd, const char* src_file_name, char* xlog_rec_buffer, char* tmp_buff);
+static int			write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer, uint64* file_offset);
+static inline int 	read_file2buff(int fd, char* buffer, uint64 size, uint64 buff_offset, const char* file_name);
+static inline int 	write_buff2file(int fd, char* buffer, uint64 size, uint64 buff_offset);
+
+#define XlogRecHdrFitsOnPage(in_page_offset) \
+( \
+	(in_page_offset) + SizeOfXLogRecord < \
+	BLCKSZ * (1 + (in_page_offset) / BLCKSZ) \
+)
+
+#define XlogRecFitsOnPage(in_page_offset, rec_len) \
+( \
+	(in_page_offset) + (rec_len) < \
+	BLCKSZ * (1 + (in_page_offset) / BLCKSZ) \
+)
 
 /*
  * _PG_init
@@ -388,6 +411,203 @@ getWalDirecotry(char *wal_directory, const char *path, const char *file)
 }
 
 /*
+ * Writes 'size' bytes from (char*)(buffer + buff_offset) to file
+ */
+static inline int
+write_buff2file(int fd, char* buffer, uint64 size, uint64 buff_offset)
+{
+	int nbytes;
+
+	pgstat_report_wait_start(WAIT_EVENT_COPY_FILE_WRITE);
+
+	nbytes = write(fd, (char*) (buffer + buff_offset), size);
+	if (nbytes != size)
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			errmsg("could not write to file \"%d\": %m", fd)));
+
+	pgstat_report_wait_end();
+
+	return nbytes;
+}
+
+/*
+ * Reads 'size' bytes from file to (char*)(buffer + buff_offset)
+ */
+static inline int
+read_file2buff(int fd, char* buffer, uint64 size, uint64 buff_offset, const char* file_name)
+{
+	int nbytes;
+
+	pgstat_report_wait_start(WAIT_EVENT_COPY_FILE_READ);
+	nbytes = read(fd, (char*) (buffer + buff_offset), size);
+	if (nbytes < 0)
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			errmsg("could not read file \"%s\": %m", file_name)));
+	pgstat_report_wait_end();
+	
+	return nbytes;
+}
+
+static int
+read_one_xlog_rec(int src_fd, const char* src_file_name, char* xlog_rec_buffer, char* tmp_buff)
+{
+	uint64 current_file_pos = lseek(src_fd, 0, SEEK_CUR);
+	XLogRecord* record;
+	uint64 read_in_total = 0;
+	uint64 xlog_rec_buff_offset = 0;
+	bool is_first_page = true;
+
+	int nbytes;
+	if (current_file_pos < 0)
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			errmsg("could not navigate in file \"%s\": %m", src_file_name)));
+
+	while (true)
+	{
+		if ((current_file_pos + read_in_total) % BLCKSZ == 0)
+		{
+			XLogPageHeader hdr;
+			nbytes = read_file2buff(src_fd, tmp_buff, SizeOfXLogShortPHD, 0, src_file_name);
+			if (nbytes == 0)
+				return read_in_total;
+			
+			read_in_total += nbytes;
+
+			hdr = (XLogPageHeader) tmp_buff;
+			if (XLogPageHeaderSize(hdr) > SizeOfXLogShortPHD)
+			{
+				nbytes = read_file2buff(src_fd, tmp_buff, SizeOfXLogLongPHD - SizeOfXLogShortPHD, read_in_total, src_file_name);
+				if (nbytes == 0)
+					return read_in_total;
+				
+				read_in_total += nbytes;
+			}
+
+			if (hdr->xlp_rem_len > 0)
+			{
+				uint64 data_len = 0;
+
+				if (is_first_page)
+					ereport(ERROR,
+						errmsg("previous record was was not fully read in addr : %X/%X", LSN_FORMAT_ARGS(hdr->xlp_pageaddr)));
+				is_first_page = false;
+
+				if (! XlogRecFitsOnPage(current_file_pos + read_in_total, MAXALIGN(hdr->xlp_rem_len)))
+					data_len = BLCKSZ * (1 + (current_file_pos + read_in_total) / BLCKSZ) - current_file_pos - read_in_total;
+				else
+					data_len = MAXALIGN(hdr->xlp_rem_len);
+				
+				nbytes = read_file2buff(src_fd, xlog_rec_buffer, data_len, xlog_rec_buff_offset, src_file_name);
+				if (nbytes == 0)
+					return read_in_total;
+				
+				read_in_total += nbytes;
+				xlog_rec_buff_offset += nbytes;
+
+				if (data_len == MAXALIGN(hdr->xlp_rem_len))
+					return read_in_total;
+				else
+					continue;
+			}
+		}
+
+		if (! XlogRecHdrFitsOnPage(current_file_pos + read_in_total))
+		{
+			uint64 data_len = BLCKSZ * (1 + (current_file_pos + read_in_total) / BLCKSZ) - current_file_pos - read_in_total;
+			nbytes = read_file2buff(src_fd, xlog_rec_buffer, data_len, xlog_rec_buff_offset, src_file_name);
+			if (nbytes == 0)
+				return read_in_total;
+			
+			read_in_total += nbytes;
+			xlog_rec_buff_offset += nbytes;
+
+			is_first_page = false;
+			continue;
+		}
+		else 
+		{
+			uint64 data_len;
+			nbytes = read_file2buff(src_fd, tmp_buff, SizeOfXLogRecord, 0, src_file_name);
+			if (nbytes == 0)
+				return read_in_total;
+			
+			read_in_total += nbytes;
+
+			record = (XLogRecord*) tmp_buff;
+			memcpy((char*) xlog_rec_buffer + xlog_rec_buff_offset, tmp_buff, SizeOfXLogRecord);
+			xlog_rec_buff_offset += SizeOfXLogRecord;
+
+			if (! XlogRecFitsOnPage(current_file_pos + read_in_total, MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord))
+				data_len = BLCKSZ * (1 + (current_file_pos + read_in_total) / BLCKSZ) - current_file_pos - read_in_total;
+			else
+				data_len = MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord;
+			
+			nbytes = read_file2buff(src_fd, xlog_rec_buffer, data_len, xlog_rec_buff_offset, src_file_name);
+			if (nbytes == 0)
+				return read_in_total;
+			
+			read_in_total += nbytes;
+			xlog_rec_buff_offset += nbytes;
+
+			if (data_len == (MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord))
+				return read_in_total;
+			
+			is_first_page = false;
+			continue;
+		}
+	}
+}
+
+static void 
+copy_file_part(const char* src, int dstfd, uint64 size, uint64 src_offset, char* tmp_buffer, char* xlog_rec_buffer)
+{
+	int      	 srcfd;
+	int64 		 read_left = size;
+
+	/*
+	* Open the file
+	*/
+	srcfd = OpenTransientFile(src, O_RDONLY | PG_BINARY);
+	if (srcfd < 0)
+	ereport(ERROR,
+		(errcode_for_file_access(),
+			errmsg("could not open file \"%s\": %m", src)));
+
+	if (lseek(srcfd, src_offset, SEEK_SET) < 0)
+	ereport(ERROR,
+		(errcode_for_file_access(),
+			errmsg("could not navigate through the file \"%s\": %m", src)));
+
+	/*
+	* Do the data copying.
+	*/
+	while(true)
+	{
+		// XLogRecord* rec;
+		int read_len = read_one_xlog_rec(srcfd, src, xlog_rec_buffer, tmp_buffer);
+		ereport(LOG, errmsg("READ LEN : %d", read_len));
+		// rec = (XLogRecord*) xlog_rec_buffer;
+		// ereport(LOG, errmsg("Prev lsn : %ld\tTotal len : %d\tTotal len aligned : %ld", 
+		// 						rec->xl_prev, 
+		// 						rec->xl_tot_len, 
+		// 						MAXALIGN(rec->xl_tot_len)
+							// ));
+		read_left -= read_len;
+		ereport(LOG, errmsg("READ LEFT : %ld ", read_left));
+		if (read_left <= 0) // но будет < 0, если например останется прочитать только заголовок, а фукция умеет только заголовок + запись
+			break;
+	}
+
+	if (CloseTransientFile(srcfd) != 0)
+	ereport(ERROR,
+		(errcode_for_file_access(),
+			errmsg("could not close file \"%d\": %m", dstfd)));
+}
+
+/*
  * TODO:
  * 
  * Add funcionality for a scenario when we are recovering after crash
@@ -411,6 +631,7 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 	XLogPageHeader 		page_hdr;
 	XLogSegNo 			segno;
 	XLogRecPtr 			first_record;
+	XLogRecPtr			page_addr;
 	XLogReaderState 	*xlogreader_state;
 	char				wal_diff_file[MAXPGPATH];
 
@@ -439,6 +660,7 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
             ereport(ERROR, 
 					errmsg("Invalid wal segment size : %d\n", WalSegSz));
         }
+		page_addr = longhdr->std.xlp_pageaddr;
     }
 	else if (read_count < 0) {
 		ereport(ERROR,
@@ -497,7 +719,7 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 		ereport(LOG, 
 				errmsg("skipping over %u bytes", (uint32) (first_record - private.startptr)));
 
-	continuous_reading_wal_file(xlogreader_state, &private);
+	continuous_reading_wal_file(xlogreader_state, &private, path, wal_diff_file, page_addr);
 
 	// а потом жоско скрафтим wal_diff
 
@@ -518,7 +740,11 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 }
 
 static void 
-continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *private)
+continuous_reading_wal_file(XLogReaderState *xlogreader_state, 
+							XLogDumpPrivate *private, 
+							const char* orig_wal_file_name, 
+							const char* wal_diff_file_name,
+							XLogRecPtr initial_file_offset)
 {
 	char 			*errormsg;
 	XLogRecord 		*record;
@@ -527,7 +753,28 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *
 	bool 			is_found;
 	uint32_t 		hash_key;
 
+	XLogRecPtr 		seg_start;
+	XLogRecPtr		seg_end;
+
+	XLogRecPtr		last_read_rec = 0;
+	Size			last_read_rec_len = 0;
+
+	uint64			global_offset = initial_file_offset;
+
 	ChainRecordHashEntry* entry;
+
+	int dst_fd;
+	struct stat file_stat;
+	off_t dst_file_size;
+
+	char* tmp_buffer = palloc0(BLCKSZ * 2);
+	char* xlog_rec_buffer = palloc0(XLogRecordMaxSize);
+
+	dst_fd = OpenTransientFile(wal_diff_file_name, O_RDWR | O_CREAT | PG_BINARY);
+	if (dst_fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create file \"%s\": %m", wal_diff_file_name)));
 
 	for (;;)
 	{
@@ -539,6 +786,9 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *
             ereport(ERROR, 
 					errmsg("XLogReadRecord failed to read record: %s", errormsg));
         }
+
+		last_read_rec = xlogreader_state->record->lsn;
+		last_read_rec_len = xlogreader_state->record->header.xl_tot_len;
 
 		if (XLogRecGetRmid(xlogreader_state) == RM_HEAP_ID)
 		{
@@ -563,7 +813,8 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *
 
 					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
 					entry->data = chain_record;
-					continue;
+
+					break;
 
 				case XLOG_HEAP_UPDATE:
 					chain_record = fetch_update(xlogreader_state);
@@ -592,7 +843,7 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *
 						entry->data = chain_record;	
 					}
 
-					continue;
+					break;
 
 				case XLOG_HEAP_HOT_UPDATE:
 					/*
@@ -622,24 +873,70 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state, XLogDumpPrivate *
 						entry->data = chain_record;
 					}
 
-					continue;
+					break;
+					
 				default:
 					ereport(LOG, 
 							errmsg("unknown op code %u", info_bits));
 					continue;
 			}
-		}
-		// лол сделали второй RMGR только потому что закончились op коды
-		else if (XLogRecGetRmid(xlogreader_state) == RM_HEAP2_ID) {
-			// TODO
-		}
 
-		/*
-		 * Now we deal only with HEAP and HEAP2 rmgrs 
-		 */
+			seg_start = xlogreader_state->ReadRecPtr;
+			seg_end = xlogreader_state->EndRecPtr;
+			ereport(LOG, errmsg("LSN ADDR : %X/%X\tSIZE : %ld\tOFFSET : %ld", 
+								LSN_FORMAT_ARGS(global_offset), 
+								seg_start - global_offset,
+								global_offset - initial_file_offset));
+			copy_file_part(orig_wal_file_name, 
+						   dst_fd, 
+						   seg_start - global_offset, 
+						   global_offset - initial_file_offset, 
+						   tmp_buffer, 
+						   xlog_rec_buffer);
+
+			global_offset = seg_end;
+		}
 		else
+		{
+			/*
+			* Now we deal only with HEAP and HEAP2 rmgrs 
+			*/
 			continue;
+		}
 	}
+
+	/*
+	 * Добиваем wal diff файл до 16МБ. Разумеется, позже вырежем эти rofls
+	 */
+	ereport(LOG, errmsg("FINISH : GLOBAL OFFSET = %ld\tLAST READ = %ld", global_offset, last_read_rec));
+	if (last_read_rec - global_offset > 0)
+	{
+		copy_file_part(orig_wal_file_name, 
+					   dst_fd, 
+					   last_read_rec - global_offset + last_read_rec_len, 
+					   global_offset - initial_file_offset, 
+					   tmp_buffer, xlog_rec_buffer);
+	}
+	fstat(dst_fd, &file_stat);
+
+    dst_file_size = file_stat.st_size;
+    ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("DST FILE SIZE %ld", dst_file_size)));
+
+	// copy_file_part(orig_wal_file_name, dst_fd, WalSegSz - dst_file_size, 0, 0, tmp_buffer, xlog_rec_buffer);
+
+	fstat(dst_fd, &file_stat);
+
+    dst_file_size = file_stat.st_size;
+    ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("DST FILE SIZE %ld", dst_file_size)));
+
+	// CloseTransientFile(src_fd);
+	CloseTransientFile(dst_fd);
+	pfree(tmp_buffer);
+	pfree(xlog_rec_buffer);
 }
 
 static ChainRecord 
@@ -1114,7 +1411,7 @@ compare_files(const char *file1, const char *file2)
 static bool 
 create_wal_diff(const char *src, const char *dest)
 {
-	copy_file(src, dest);
+	// copy_file(src, dest);
 	return true;
 }
 

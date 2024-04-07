@@ -48,9 +48,11 @@ ok(-f -e $wal_file, "Got a wal file");
 
 my $wal_diff_file = $node->data_dir . '/wal_diff/' . $walfile_name;
 
+sleep(3600);
+
 ok(-f -e $wal_diff_file, "Got a wal diff file");
 
 # Stop the server
-$node->stop('fast');
+$node->stop('immediate');
 
 done_testing();
