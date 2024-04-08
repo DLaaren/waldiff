@@ -25,9 +25,6 @@
 #include "utils/hsearch.h"
 #include "utils/wait_event.h"
 
-#define INSERT_CHAIN 1
-#define UPDATE_CHAIN 2
-#define DELETE_CHAIN 3
 #define INITIAL_HASHTABLE_SIZE 100 // TODO скорее всего впоследствии мы его увеличим
 
 PG_MODULE_MAGIC;
@@ -47,12 +44,11 @@ static HTAB*	hash_table = NULL;
 
 static bool check_archive_directory(char **newval, void **extra, GucSource source);
 static bool create_wal_diff(const char *src, const char *dest);
-static bool compare_files(const char *file1, const char *file2);
 static bool is_file_archived(const char *file, const char *destination, const char *archive_directory);
 static void wal_diff_startup(ArchiveModuleState *state);
 static bool wal_diff_configured(ArchiveModuleState *state);
 static bool wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path);
-static void wall_diff_shutdown(ArchiveModuleState *state);
+static void wal_diff_shutdown(ArchiveModuleState *state);
 
  /**********************************************************************
   * Information for PostgreSQL
@@ -75,7 +71,7 @@ static const ArchiveModuleCallbacks wal_diff_callbacks = {
     .startup_cb 		 = wal_diff_startup,
 	.check_configured_cb = wal_diff_configured,
 	.archive_file_cb 	 = wal_diff_archive,
-	.shutdown_cb 		 = wall_diff_shutdown
+	.shutdown_cb 		 = wal_diff_shutdown
 };
 
  /**********************************************************************
@@ -91,36 +87,36 @@ typedef struct ChainRecordData // TODO глянуть, как лучше рас�
 	 */
 	TransactionId t_xmin;
 	TransactionId t_xmax;
-	CommandId	t_cid;
+	CommandId	t_cid;			// never used
 
 	/*
 	 * Pointer to latest tuple version
 	 */
-	ItemPointerData current_t_ctid;
+	ItemPointerData current_t_ctid; 	// never used
 
 	/*
 	 * In delete/update case this is the pointer on deleted tuple version.
 	 */
-	ItemPointerData old_t_ctid;
+	ItemPointerData old_t_ctid;		// never used
 
-	ForkNumber 		forknum;
-	RelFileLocator 	file_loc;
-	uint16			t_infomask2;
-	uint16			t_infomask;
+	ForkNumber 		forknum;		// never used 
+	RelFileLocator 	file_loc;		// never used
+	uint16			t_infomask2;	// never used
+	uint16			t_infomask;		// never used 
 	uint8 			info;
 
-	/*
-	 * Size of [bitmap] + [padding] + appropriate header + [prefix length] + [suffix length] + user_data.
-	 */
-	uint16 			data_len;
-
-	uint8 			chain_type;
 	RmgrId			rm_id;
+	uint8 			xlog_type;
 
 	/*
 	 * Offset to user data.
 	 */
 	uint8			t_hoff;
+
+	/*
+	 * Size of [bitmap] + [padding] + appropriate header + [prefix length] + [suffix length] + user_data.
+	 */
+	uint16 			data_len;
 
 	/*
 	 * Here comes [bitmap] + [padding] and then appropriate header + user_data.
@@ -140,9 +136,7 @@ typedef struct ChainRecordHashEntry
 	ChainRecord data;
 } ChainRecordHashEntry;
 
-/*
- * Use this to create key for struct ChainRecord in hashmap
- */
+
 #define GetHashKeyFromChainRecord(record) \
 ( \
 	(uint32_t)((record)->file_loc.spcOid + \
@@ -153,10 +147,6 @@ typedef struct ChainRecordHashEntry
 			   (record)->current_t_ctid.ip_posid) \
 )
 
-/*
- * Use this to find previous chain record 
- * (in case of delete/udate) in hashmap
- */
 #define GetHashKeyOfPrevChainRecord(record) \
 ( \
 	(uint32_t)((record)->file_loc.spcOid + \
@@ -963,7 +953,7 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
 					if (is_found)
 					{
-						bool is_insert_chain = (entry->data->chain_type == INSERT_CHAIN);
+						bool is_insert_chain = (entry->data->xlog_type == XLOG_HEAP_INSERT);
 						overlay_update(entry->data, chain_record);
 
 						if (!is_insert_chain) 
@@ -1050,28 +1040,41 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 	hash_seq_init(&status, hash_table);
 	while (entry = (ChainRecordHashEntry *)hash_seq_search(&status) != NULL)
 	{
+		char *constructed_record;
 		XLogRecord record;
+		XLogRecordBlockHeader blkhdr; 
+		XLogRecordDataHeaderShort hdrshort;
+		size_t record_size = SizeOfXLogRecordBlockHeader + SizeOfXLogRecordDataHeaderShort + SizeOfHeapHeader + chain_record->data_len;
 		chain_record = entry->data;
 		record.xl_tot_len = SizeOfXLogRecord + chain_record->data_len;
 
-		if (chain_record->chain_type == INSERT_CHAIN)
+		if (chain_record->xlog_type == XLOG_HEAP_INSERT)
+		{
+			constructed_record = palloc0(record_size);
 			record.xl_xid = chain_record->t_xmin;
-
-		else if (chain_record->chain_type == UPDATE_CHAIN || chain_record->chain_type == DELETE_CHAIN)
+		}
+		else if (chain_record->xlog_type == XLOG_HEAP_UPDATE)
+		{
+			constructed_record = palloc0(record_size);
 			record.xl_xid = chain_record->t_xmax;
-
+		}
+		else if (chain_record->xlog_type == XLOG_HEAP_DELETE)
+		{
+			constructed_record = palloc0(record_size);
+			record.xl_xid = chain_record->t_xmax;
+		}
 		record.xl_prev = ; 						// bruh
 		record.xl_info = chain_record->info;
 		record.xl_rmid = chain_record->rm_id;
 		pg_crc32c crc = INIT_CRC32C(crc);
 		record.xl_crc = COMP_CRC32C(crc, &record + SizeOfXLogRecord, SizeOfXLogRecord - sizeof(pg_crc32c));
 
-		copy_file_part(&record, wal_diff_file_name, dst_fd, 
-					   last_read_rec - global_offset + last_read_rec_len, 
-					   global_offset - initial_file_offset, 
-					   tmp_buffer, xlog_rec_buffer,
-					   &wal_long_hdr_sys_id, &wal_page_addr, &wal_tli);
+		memcpy(constructed_record, &record, SizeOfXLogRecord);
+		memcpy(constructed_record + SizeOfXLogRecord, &blkhdr, SizeOfXLogRecordBlockHeader);
+		memcpy(constructed_record + SizeOfXLogRecord + SizeOfXLogRecordBlockHeader, &hdrshort, SizeOfXLogRecordDataHeaderShort);
+		memcpy(constructed_record + SizeOfXLogRecord + SizeOfXLogRecordBlockHeader + SizeOfXLogRecordDataHeaderShort, chain_record->t_bits, chain_record->data_len);
 
+		write_one_xlog_rec(constructed_record);
 	}
 	hash_seq_term(&status);
 
@@ -1135,9 +1138,11 @@ fetch_insert(XLogReaderState *record)
 	fetched_record = (ChainRecord) palloc0((Size) (SizeOfChainRecord + 
 												   SizeOfHeapInsert + 
 												   data_len));
-	fetched_record->chain_type = INSERT_CHAIN;
+	fetched_record->rm_id = RM_HEAP_ID;
+	fetched_record->xlog_type = XLOG_HEAP_INSERT;
 	fetched_record->file_loc = target_locator;
 	fetched_record->forknum = forknum;
+	fetched_record->info = record->record->header.xl_info;
 
 	fetched_record->data_len = data_len + SizeOfHeapInsert;
 
@@ -1170,6 +1175,7 @@ fetch_insert(XLogReaderState *record)
 	 * user_data offset = size of ChainRecordData struct + size of bitmap + padding + insert_header
 	 */
 	fetched_record->t_hoff = SizeOfChainRecord + bitmap_len + SizeOfHeapInsert;
+
 
     fetched_record->t_infomask2 = xlhdr.t_infomask2;
     fetched_record->t_infomask 	= xlhdr.t_infomask;
@@ -1236,9 +1242,11 @@ fetch_update(XLogReaderState *record)
 												   SizeOfHeapUpdate + 
 												   (sizeof(uint16) * 2) +
 												   data_len));
-	fetched_record->chain_type = UPDATE_CHAIN;
+	fetched_record->rm_id = RM_HEAP_ID;
+	fetched_record->xlog_type = XLOG_HEAP_UPDATE;
 	fetched_record->file_loc = target_locator;
 	fetched_record->forknum = forknum;
+	fetched_record->info = record->record->header.xl_info;
 
 	fetched_record->t_infomask2 = xlhdr.t_infomask2;
     fetched_record->t_infomask 	= xlhdr.t_infomask;
@@ -1301,10 +1309,12 @@ fetch_delete(XLogReaderState *record)
 
 	XLogRecGetBlockTag(record, 0, &target_locator, &forknum, &blknum);
 
-	fetched_record->chain_type = DELETE_CHAIN;
+	fetched_record->rm_id = RM_HEAP_ID;
+	fetched_record->xlog_type = XLOG_HEAP_DELETE;
 	fetched_record->t_xmax = xlrec->xmax;
 	fetched_record->file_loc = target_locator;
 	fetched_record->forknum = forknum;
+	fetched_record->info = record->record->header.xl_info;
 
 	ItemPointerSetBlockNumber(&(fetched_record->old_t_ctid), blknum);
     ItemPointerSetOffsetNumber(&(fetched_record->old_t_ctid), xlrec->offnum);
@@ -1338,15 +1348,15 @@ overlay_update(ChainRecord old_tup, ChainRecord new_tup)
 	Size   tuplen,
 	   	   old_tuplen;
 	
-	Assert((old_tup->chain_type == UPDATE_CHAIN && new_tup->chain_type == UPDATE_CHAIN) ||
-			(old_tup->chain_type == INSERT_CHAIN && new_tup->chain_type == UPDATE_CHAIN));
+	Assert((old_tup->xlog_type == XLOG_HEAP_UPDATE && new_tup->xlog_type == XLOG_HEAP_UPDATE) ||
+			(old_tup->xlog_type == XLOG_HEAP_INSERT && new_tup->xlog_type == XLOG_HEAP_UPDATE));
 
 	new_tup->old_t_ctid = old_tup->old_t_ctid;
 
 	old_offset = old_tup->t_hoff - (sizeof(uint16) * 2);
 	new_offset = new_tup->t_hoff - (sizeof(uint16) * 2);
 
-	if (old_tup->chain_type == UPDATE_CHAIN) 
+	if (old_tup->xlog_type == XLOG_HEAP_UPDATE) 
 	{
 		memcpy((void*) &old_prefix_len, (char*) old_tup + old_offset, sizeof(uint16));
 		old_offset += sizeof(uint16);
@@ -1511,7 +1521,7 @@ create_wal_diff(const char *src, const char *dest)
  * Frees our allocated state.
  */
 static void 
-wall_diff_shutdown(ArchiveModuleState *state)
+wal_diff_shutdown(ArchiveModuleState *state)
 {
 	ArchiveData *data = (ArchiveData *) state->private_data;
 	if (data == NULL)
