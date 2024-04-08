@@ -38,6 +38,15 @@ static char 	*wal_diff_directory = NULL;
 static int		WalSegSz;
 static HTAB*	hash_table = NULL;
 
+/*
+ * Some info we need to know from wal segment
+ * while constracting wal_diff segment
+ */
+static XLogRecPtr prev_record = 0;
+static uint64	  sys_id = 0;
+static XLogRecPtr page_addr = 0;
+static TimeLineID tli = 0;
+
 /**********************************************************************
   * Forward declarations
   **********************************************************************/
@@ -49,6 +58,42 @@ static void wal_diff_startup(ArchiveModuleState *state);
 static bool wal_diff_configured(ArchiveModuleState *state);
 static bool wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path);
 static void wal_diff_shutdown(ArchiveModuleState *state);
+
+
+/*
+ * All functions we need to copy records from
+ * wal segment to wal_diff segment (except those that we worked with)
+ */
+static void 		copy_file_part(const char* src, const char* dst_name, int dstfd, uint64 size, uint64 src_offset, 
+								   char* tmp_buffer, char* xlog_rec_buffer, XLogRecPtr* file_offset);
+
+static int			read_one_xlog_rec(int src_fd, const char* src_file_name, 
+									  char* xlog_rec_buffer, char* tmp_buff);
+
+static void			write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer, uint64* file_offset);
+static inline int 	read_file2buff(int fd, char* buffer, uint64 size, uint64 buff_offset, const char* file_name);
+static inline int 	write_buff2file(int fd, char* buffer, uint64 size, uint64 buff_offset);
+
+/*
+ * Whether XLogRecord fits on the page with
+ * given offset
+ */
+#define XlogRecHdrFitsOnPage(in_page_offset) \
+( \
+	(in_page_offset) + SizeOfXLogRecord < \
+	BLCKSZ * (1 + (in_page_offset) / BLCKSZ) \
+)
+
+/*
+ * Whether record with given length fits on the
+ * page with given offset
+ */
+
+#define XlogRecFitsOnPage(in_page_offset, rec_len) \
+( \
+	(in_page_offset) + (rec_len) < \
+	BLCKSZ * (1 + (in_page_offset) / BLCKSZ) \
+)
 
  /**********************************************************************
   * Information for PostgreSQL
@@ -136,7 +181,9 @@ typedef struct ChainRecordHashEntry
 	ChainRecord data;
 } ChainRecordHashEntry;
 
-
+/*
+ * Use this to create key for struct ChainRecord in hashmap
+ */
 #define GetHashKeyFromChainRecord(record) \
 ( \
 	(uint32_t)((record)->file_loc.spcOid + \
@@ -147,6 +194,10 @@ typedef struct ChainRecordHashEntry
 			   (record)->current_t_ctid.ip_posid) \
 )
 
+/*
+ * Use this to find previous chain record 
+ * (in case of delete/udate) in hashmap
+ */
 #define GetHashKeyOfPrevChainRecord(record) \
 ( \
 	(uint32_t)((record)->file_loc.spcOid + \
@@ -157,16 +208,8 @@ typedef struct ChainRecordHashEntry
 			   (record)->old_t_ctid.ip_posid) \
 )
 
-static void continuous_reading_wal_file(XLogReaderState *xlogreader_state, 
-										XLogDumpPrivate *private, 
-										const char* orig_wal_file_name, 
-										const char* wal_diff_file_name,
-										XLogRecPtr initial_file_offset);
-
 /*
  * This three fuctions returns palloced struct
- * 
- * At end of struct you can find xl_heap_insert[update][delete] and main tuple data
  */
 static ChainRecord fetch_insert(XLogReaderState *record);
 static ChainRecord fetch_update(XLogReaderState *record);
@@ -175,32 +218,11 @@ static ChainRecord fetch_delete(XLogReaderState *record);
 static void overlay_update(ChainRecord old_tup, ChainRecord new_tup);
 static void XLogDisplayRecord(XLogReaderState *record);
 
-/*
- * Copy 'size' bytes from src to dest
- */
-static void 		copy_file_part(const char* src, const char* dst_name, int dstfd, 
-								   uint64 size, uint64 src_offset, char* tmp_buffer, char* xlog_rec_buffer,
-								   uint64* sys_id_copy, XLogRecPtr*	page_addr_copy, TimeLineID* tli_copy);
-static int			read_one_xlog_rec(int src_fd, const char* src_file_name, 
-									  char* xlog_rec_buffer, char* tmp_buff, 
-									  uint64* sys_id_copy, XLogRecPtr* page_addr_copy, TimeLineID* tli_copy);
-static void			write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer, uint64* file_offset, 
-									   XLogRecPtr* prev_record, uint64 sys_id, XLogRecPtr page_addr, TimeLineID tli);
-static inline int 	read_file2buff(int fd, char* buffer, uint64 size, uint64 buff_offset, const char* file_name);
-static inline int 	write_buff2file(int fd, char* buffer, uint64 size, uint64 buff_offset);
-
-#define XlogRecHdrFitsOnPage(in_page_offset) \
-( \
-	(in_page_offset) + SizeOfXLogRecord < \
-	BLCKSZ * (1 + (in_page_offset) / BLCKSZ) \
-)
-
-#define XlogRecFitsOnPage(in_page_offset, rec_len) \
-( \
-	(in_page_offset) + (rec_len) < \
-	BLCKSZ * (1 + (in_page_offset) / BLCKSZ) \
-)
-
+static void continuous_reading_wal_file(XLogReaderState *xlogreader_state, 
+										XLogDumpPrivate *private, 
+										const char* orig_wal_file_name, 
+										const char* wal_diff_file_name,
+										XLogRecPtr initial_file_offset);
 /*
  * _PG_init
  *
@@ -423,6 +445,10 @@ write_buff2file(int fd, char* buffer, uint64 size, uint64 buff_offset)
 		ereport(ERROR,
 			(errcode_for_file_access(),
 			errmsg("could not write to file \"%d\": %m", fd)));
+	if (nbytes == 0)
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			errmsg("file descriptor closed for write \"%d\": %m", fd)));
 
 	pgstat_report_wait_end();
 
@@ -443,6 +469,10 @@ read_file2buff(int fd, char* buffer, uint64 size, uint64 buff_offset, const char
 		ereport(ERROR,
 			(errcode_for_file_access(),
 			errmsg("could not read file \"%s\": %m", file_name)));
+	if (nbytes == 0)
+		ereport(WARNING,
+			(errcode_for_file_access(),
+			errmsg("file descriptor closed for read \"%d\": %m", fd)));
 	pgstat_report_wait_end();
 	
 	return nbytes;
@@ -450,16 +480,16 @@ read_file2buff(int fd, char* buffer, uint64 size, uint64 buff_offset, const char
 
 static int
 read_one_xlog_rec(int src_fd, const char* src_file_name, 
-				  char* xlog_rec_buffer, char* tmp_buff, 
-				  uint64* sys_id_copy, XLogRecPtr* page_addr_copy, TimeLineID* tli_copy)
+				  char* xlog_rec_buffer, char* tmp_buff)
 {
-	uint64 current_file_pos = lseek(src_fd, 0, SEEK_CUR);
+	uint64 		current_file_pos = lseek(src_fd, 0, SEEK_CUR);
 	XLogRecord* record;
-	uint64 read_in_total = 0;
-	uint64 xlog_rec_buff_offset = 0;
-	bool is_first_page = true;
+	uint64 		read_in_total = 0;
+	uint64 		xlog_rec_buff_offset = 0;
+	bool 		is_first_page = true;
 
-	int nbytes;
+	int 		nbytes;
+
 	if (current_file_pos < 0)
 		ereport(ERROR,
 			(errcode_for_file_access(),
@@ -472,7 +502,7 @@ read_one_xlog_rec(int src_fd, const char* src_file_name,
 			XLogPageHeader hdr;
 			nbytes = read_file2buff(src_fd, tmp_buff, SizeOfXLogShortPHD, 0, src_file_name);
 			if (nbytes == 0)
-				return read_in_total;
+				break;
 			
 			read_in_total += nbytes;
 
@@ -482,11 +512,12 @@ read_one_xlog_rec(int src_fd, const char* src_file_name,
 				XLogLongPageHeader long_hdr;
 				nbytes = read_file2buff(src_fd, tmp_buff, SizeOfXLogLongPHD - SizeOfXLogShortPHD, read_in_total, src_file_name);
 				if (nbytes == 0)
-					return read_in_total;
-				long_hdr = (XLogLongPageHeader) tmp_buff;
-				*sys_id_copy = long_hdr->xlp_sysid;
-				*page_addr_copy = hdr->xlp_pageaddr;
-				*tli_copy = hdr->xlp_tli;
+					break;
+
+				long_hdr  = (XLogLongPageHeader) tmp_buff;
+				sys_id 	  = long_hdr->xlp_sysid;
+				page_addr = hdr->xlp_pageaddr;
+				tli 	  = hdr->xlp_tli;
 				
 				read_in_total += nbytes;
 			}
@@ -500,20 +531,25 @@ read_one_xlog_rec(int src_fd, const char* src_file_name,
 						errmsg("previous record was was not fully read in addr : %X/%X", LSN_FORMAT_ARGS(hdr->xlp_pageaddr)));
 				is_first_page = false;
 
-				if (! XlogRecFitsOnPage(current_file_pos + read_in_total, MAXALIGN(hdr->xlp_rem_len)))
+				if (! XlogRecFitsOnPage(current_file_pos + read_in_total, hdr->xlp_rem_len))
 					data_len = BLCKSZ * (1 + (current_file_pos + read_in_total) / BLCKSZ) - current_file_pos - read_in_total;
 				else
-					data_len = MAXALIGN(hdr->xlp_rem_len);
+					data_len = hdr->xlp_rem_len;
 				
 				nbytes = read_file2buff(src_fd, xlog_rec_buffer, data_len, xlog_rec_buff_offset, src_file_name);
 				if (nbytes == 0)
-					return read_in_total;
+					break;
 				
 				read_in_total += nbytes;
 				xlog_rec_buff_offset += nbytes;
 
-				if (data_len == MAXALIGN(hdr->xlp_rem_len))
+				if (data_len == hdr->xlp_rem_len)
+				{
+					lseek(src_fd, MAXALIGN(hdr->xlp_rem_len) - data_len, SEEK_CUR);
+					// read_in_total += MAXALIGN(hdr->xlp_rem_len) - data_len;
 					return read_in_total;
+				}
+				
 				else
 					continue;
 			}
@@ -524,7 +560,7 @@ read_one_xlog_rec(int src_fd, const char* src_file_name,
 			uint64 data_len = BLCKSZ * (1 + (current_file_pos + read_in_total) / BLCKSZ) - current_file_pos - read_in_total;
 			nbytes = read_file2buff(src_fd, xlog_rec_buffer, data_len, xlog_rec_buff_offset, src_file_name);
 			if (nbytes == 0)
-				return read_in_total;
+				break;
 			
 			read_in_total += nbytes;
 			xlog_rec_buff_offset += nbytes;
@@ -537,7 +573,7 @@ read_one_xlog_rec(int src_fd, const char* src_file_name,
 			uint64 data_len;
 			nbytes = read_file2buff(src_fd, tmp_buff, SizeOfXLogRecord, 0, src_file_name);
 			if (nbytes == 0)
-				return read_in_total;
+				break;
 			
 			read_in_total += nbytes;
 
@@ -545,36 +581,44 @@ read_one_xlog_rec(int src_fd, const char* src_file_name,
 			memcpy((char*) xlog_rec_buffer + xlog_rec_buff_offset, tmp_buff, SizeOfXLogRecord);
 			xlog_rec_buff_offset += SizeOfXLogRecord;
 
-			if (! XlogRecFitsOnPage(current_file_pos + read_in_total, MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord))
+			if (! XlogRecFitsOnPage(current_file_pos + read_in_total, record->xl_tot_len - SizeOfXLogRecord))
 				data_len = BLCKSZ * (1 + (current_file_pos + read_in_total) / BLCKSZ) - current_file_pos - read_in_total;
 			else
-				data_len = MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord;
+				data_len = record->xl_tot_len - SizeOfXLogRecord;
 			
 			nbytes = read_file2buff(src_fd, xlog_rec_buffer, data_len, xlog_rec_buff_offset, src_file_name);
 			if (nbytes == 0)
-				return read_in_total;
+				break;
 			
 			read_in_total += nbytes;
 			xlog_rec_buff_offset += nbytes;
 
-			if (data_len == (MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord))
+			if (data_len == (record->xl_tot_len - SizeOfXLogRecord))
+			{
+				lseek(src_fd, MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord - data_len, SEEK_CUR);
+				// read_in_total += MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord - data_len;
 				return read_in_total;
+			}
 			
 			is_first_page = false;
 			continue;
 		}
 	}
+	return -1;
 }
 
 static void
-write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer, uint64* file_offset, 
-				   XLogRecPtr* prev_record, uint64 sys_id, XLogRecPtr page_addr, TimeLineID tli)
+write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer, uint64* file_offset)
 {
-	int nbytes;
-	uint64 rem_data_len = 0;
+	int 		nbytes;
+	uint64 		rem_data_len = 0;
 	XLogRecord* record;
 	pg_crc32c	crc;
-	uint64 already_read = 0;
+	uint64 		already_read = 0;
+
+	/* Use it when we need to put padding into file */
+	char 		null_buff[1024];
+	memset(null_buff, 0, 1024);
 
 	while (true) 
 	{
@@ -584,37 +628,37 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 			{
 				XLogLongPageHeaderData long_hdr;
 
-				long_hdr.xlp_sysid = sys_id;
-				long_hdr.xlp_seg_size = WalSegSz;
-				long_hdr.xlp_xlog_blcksz = XLOG_BLCKSZ;
+				long_hdr.xlp_sysid 		  = sys_id;
+				long_hdr.xlp_seg_size	  = WalSegSz;
+				long_hdr.xlp_xlog_blcksz  = XLOG_BLCKSZ;
 
-				long_hdr.std.xlp_info |= XLP_LONG_HEADER;
-				long_hdr.std.xlp_tli = tli;
-				long_hdr.std.xlp_rem_len = 0;
-				long_hdr.std.xlp_magic = XLOG_PAGE_MAGIC;
+				long_hdr.std.xlp_info 	  = 0;
+				long_hdr.std.xlp_info 	  |= XLP_LONG_HEADER;
+				long_hdr.std.xlp_tli 	  = tli;
+				long_hdr.std.xlp_rem_len  = 0;
+				long_hdr.std.xlp_magic 	  = XLOG_PAGE_MAGIC;
 				long_hdr.std.xlp_pageaddr = page_addr;
 
+				ereport(LOG, errmsg("LONG HDR. ADDR : %ld", long_hdr.std.xlp_pageaddr));
+
 				nbytes = write_buff2file(dst_fd, (char*) &long_hdr, SizeOfXLogLongPHD, 0);
-				if (nbytes == 0)
-					break;
 				*file_offset += nbytes;
 			}
 			else
 			{
 				XLogPageHeaderData hdr;
 
-				hdr.xlp_info |= XLP_BKP_REMOVABLE;
+				hdr.xlp_info 	 = 0;
+				hdr.xlp_info 	|= XLP_BKP_REMOVABLE;
 				if (rem_data_len > 0)
 					hdr.xlp_info |= XLP_FIRST_IS_CONTRECORD;
 				hdr.xlp_rem_len = rem_data_len;
 				
-				hdr.xlp_tli = tli;
-				hdr.xlp_magic = XLOG_PAGE_MAGIC;
+				hdr.xlp_tli 	 = tli;
+				hdr.xlp_magic 	 = XLOG_PAGE_MAGIC;
 				hdr.xlp_pageaddr = page_addr + *file_offset;
 
 				nbytes = write_buff2file(dst_fd, (char*) &hdr, SizeOfXLogShortPHD, 0);
-				if (nbytes == 0)
-					break;
 				*file_offset += nbytes;
 			}
 		}
@@ -625,8 +669,6 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 				uint64 data_len = BLCKSZ * (1 + (*file_offset / BLCKSZ)) - *file_offset;
 				nbytes = write_buff2file(dst_fd, xlog_rec_buffer, data_len, already_read);
 				rem_data_len = (rem_data_len - data_len);
-				if (nbytes == 0)
-					break;
 				
 				*file_offset += nbytes;
 				already_read += nbytes;
@@ -636,15 +678,20 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 			else
 			{
 				nbytes = write_buff2file(dst_fd, xlog_rec_buffer, rem_data_len, already_read);
-				if (nbytes == 0)
-					break;
-				
 				*file_offset += nbytes;
+
+				if (MAXALIGN(record->xl_tot_len) - record->xl_tot_len)
+				{
+					nbytes = write_buff2file(dst_fd, null_buff, MAXALIGN(record->xl_tot_len) - record->xl_tot_len, 0);
+					*file_offset += nbytes;
+				}
 				return;
 			}
 		}
 
 		record = (XLogRecord*) xlog_rec_buffer;
+		record->xl_prev = prev_record + page_addr;
+		prev_record = *file_offset;
 
 		INIT_CRC32C(crc);
 		COMP_CRC32C(crc, ((char *) record) + SizeOfXLogRecord, record->xl_tot_len - SizeOfXLogRecord);
@@ -652,17 +699,18 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 		FIN_CRC32C(crc);
 		record->xl_crc = crc;
 
-		record->xl_prev = *prev_record;
-		*prev_record = *file_offset;
+		/* TODO delete it later */
+		// ereport(LOG, errmsg("Prev lsn : %X/%X\tTotal len : %d\tTotal len aligned : %ld\t Current LSN : %X/%X", 
+		// 						LSN_FORMAT_ARGS(record->xl_prev), 
+		// 						record->xl_tot_len, 
+		// 						MAXALIGN(record->xl_tot_len),
+		// 						LSN_FORMAT_ARGS(*file_offset)));
 
-		if (! XlogRecFitsOnPage(*file_offset, MAXALIGN(record->xl_tot_len)))
+		if (! XlogRecFitsOnPage(*file_offset, record->xl_tot_len))
 		{
 			uint64 data_len = BLCKSZ * (1 + (*file_offset / BLCKSZ)) - *file_offset;
-			rem_data_len = MAXALIGN(record->xl_tot_len) - data_len;
-			// ereport(LOG, errmsg("Write : %ld", data_len));
+			rem_data_len = record->xl_tot_len - data_len;
 			nbytes = write_buff2file(dst_fd, xlog_rec_buffer, data_len, 0);
-			if (nbytes == 0)
-				break;
 
 			*file_offset += nbytes;
 			already_read += nbytes;
@@ -670,25 +718,25 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 		}
 		else
 		{
-			nbytes = write_buff2file(dst_fd, xlog_rec_buffer, rem_data_len, 0);
-			if (nbytes == 0)
-				break;
-			
+			nbytes = write_buff2file(dst_fd, xlog_rec_buffer, record->xl_tot_len, 0);
 			*file_offset += nbytes;
+
+			if (MAXALIGN(record->xl_tot_len) - record->xl_tot_len > 0)
+			{
+				nbytes = write_buff2file(dst_fd, null_buff, MAXALIGN(record->xl_tot_len) - record->xl_tot_len, 0);
+				*file_offset += nbytes;
+			}
 			return;
 		}
 	}
 }
 
 static void 
-copy_file_part(const char* src, const char* dst_name, int dstfd, 
-			   uint64 size, uint64 src_offset, char* tmp_buffer, char* xlog_rec_buffer,
-			   uint64* sys_id_copy, XLogRecPtr*	page_addr_copy, TimeLineID* tli_copy)
+copy_file_part(const char* src, const char* dst_name, int dstfd, uint64 size, uint64 src_offset, 
+			   char* tmp_buffer, char* xlog_rec_buffer, XLogRecPtr* file_offset)
 {
 	int      	 srcfd;
 	int64 		 read_left = size;
-	XLogRecPtr	 file_offset = 0;
-	XLogRecPtr	 prev_record = 0;
 
 	/*
 	* Open the file
@@ -709,17 +757,11 @@ copy_file_part(const char* src, const char* dst_name, int dstfd,
 	*/
 	while(true)
 	{
-		// XLogRecord* rec;
-		int read_len = read_one_xlog_rec(srcfd, src, xlog_rec_buffer, tmp_buffer, 
-										 sys_id_copy, page_addr_copy, tli_copy);
-		// rec = (XLogRecord*) xlog_rec_buffer;
-		// ereport(LOG, errmsg("Prev lsn : %ld\tTotal len : %d\tTotal len aligned : %ld", 
-		// 						rec->xl_prev, 
-		// 						rec->xl_tot_len, 
-		// 						MAXALIGN(rec->xl_tot_len)
-		// 					));
-		write_one_xlog_rec(dstfd, dst_name, xlog_rec_buffer, &file_offset, 
-						   &prev_record, *sys_id_copy, *page_addr_copy, *tli_copy);
+		int read_len = read_one_xlog_rec(srcfd, src, xlog_rec_buffer, tmp_buffer);
+		if (read_len == -1)
+			break;
+		
+		write_one_xlog_rec(dstfd, dst_name, xlog_rec_buffer, file_offset);
 		read_left -= read_len;
 		if (read_left <= 0)
 			break;
@@ -884,21 +926,16 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 	Size			last_read_rec_len = 0;
 
 	uint64			global_offset = initial_file_offset;
-
-	XLogRecPtr		wal_page_addr;
-	TimeLineID		wal_tli;
-	uint64			wal_long_hdr_sys_id;
+	XLogRecPtr		wal_diff_file_offset = 0;
 
 	ChainRecordHashEntry* entry;
 
 	int dst_fd;
-	struct stat file_stat;
-	off_t dst_file_size;
 
 	char* tmp_buffer = palloc0(BLCKSZ * 2);
 	char* xlog_rec_buffer = palloc0(XLogRecordMaxSize);
 
-	dst_fd = OpenTransientFile(wal_diff_file_name, O_RDWR | O_CREAT | PG_BINARY);
+	dst_fd = OpenTransientFile(wal_diff_file_name, O_RDWR | O_CREAT | O_APPEND | PG_BINARY);
 	if (dst_fd < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -1011,16 +1048,13 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 
 			seg_start = xlogreader_state->ReadRecPtr;
 			seg_end = xlogreader_state->EndRecPtr;
-			// ereport(LOG, errmsg("LSN ADDR : %X/%X\tSIZE : %ld\tOFFSET : %ld", 
-			// 					LSN_FORMAT_ARGS(global_offset), 
-			// 					seg_start - global_offset,
-			// 					global_offset - initial_file_offset));
+
 			copy_file_part(orig_wal_file_name, wal_diff_file_name, dst_fd, 
 						   seg_start - global_offset, 
 						   global_offset - initial_file_offset, 
 						   tmp_buffer, 
 						   xlog_rec_buffer,
-						   &wal_long_hdr_sys_id, &wal_page_addr, &wal_tli);
+						   &wal_diff_file_offset);
 
 			global_offset = seg_end;
 		}
@@ -1033,80 +1067,17 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 		}
 	}
 
-	ChainRecordHashEntry *entry;
-	ChainRecord chain_record;
-	HASH_SEQ_STATUS status;
-
-	hash_seq_init(&status, hash_table);
-	while (entry = (ChainRecordHashEntry *)hash_seq_search(&status) != NULL)
-	{
-		char *constructed_record;
-		XLogRecord record;
-		XLogRecordBlockHeader blkhdr; 
-		XLogRecordDataHeaderShort hdrshort;
-		size_t record_size = SizeOfXLogRecordBlockHeader + SizeOfXLogRecordDataHeaderShort + SizeOfHeapHeader + chain_record->data_len;
-		chain_record = entry->data;
-		record.xl_tot_len = SizeOfXLogRecord + chain_record->data_len;
-
-		if (chain_record->xlog_type == XLOG_HEAP_INSERT)
-		{
-			constructed_record = palloc0(record_size);
-			record.xl_xid = chain_record->t_xmin;
-		}
-		else if (chain_record->xlog_type == XLOG_HEAP_UPDATE)
-		{
-			constructed_record = palloc0(record_size);
-			record.xl_xid = chain_record->t_xmax;
-		}
-		else if (chain_record->xlog_type == XLOG_HEAP_DELETE)
-		{
-			constructed_record = palloc0(record_size);
-			record.xl_xid = chain_record->t_xmax;
-		}
-		record.xl_prev = ; 						// bruh
-		record.xl_info = chain_record->info;
-		record.xl_rmid = chain_record->rm_id;
-		pg_crc32c crc = INIT_CRC32C(crc);
-		record.xl_crc = COMP_CRC32C(crc, &record + SizeOfXLogRecord, SizeOfXLogRecord - sizeof(pg_crc32c));
-
-		memcpy(constructed_record, &record, SizeOfXLogRecord);
-		memcpy(constructed_record + SizeOfXLogRecord, &blkhdr, SizeOfXLogRecordBlockHeader);
-		memcpy(constructed_record + SizeOfXLogRecord + SizeOfXLogRecordBlockHeader, &hdrshort, SizeOfXLogRecordDataHeaderShort);
-		memcpy(constructed_record + SizeOfXLogRecord + SizeOfXLogRecordBlockHeader + SizeOfXLogRecordDataHeaderShort, chain_record->t_bits, chain_record->data_len);
-
-		write_one_xlog_rec(constructed_record);
-	}
-	hash_seq_term(&status);
-
-	/*
-	 * Добиваем wal diff файл до 16МБ. Разумеется, позже вырежем эти rofls
-	 */
-	ereport(LOG, errmsg("FINISH : GLOBAL OFFSET = %ld\tLAST READ = %ld", global_offset, last_read_rec));
+	// ereport(LOG, errmsg("FINISH : GLOBAL OFFSET = %ld\tLAST READ = %ld\tLAST READ LSN : %X/%X", global_offset, last_read_rec, LSN_FORMAT_ARGS(last_read_rec)));
 	if (last_read_rec - global_offset > 0)
 	{
 		copy_file_part(orig_wal_file_name, wal_diff_file_name, dst_fd, 
 					   last_read_rec - global_offset + last_read_rec_len, 
 					   global_offset - initial_file_offset, 
-					   tmp_buffer, xlog_rec_buffer,
-					   &wal_long_hdr_sys_id, &wal_page_addr, &wal_tli);
+					   tmp_buffer, 
+					   xlog_rec_buffer,
+					   &wal_diff_file_offset);
 	}
-	fstat(dst_fd, &file_stat);
 
-    dst_file_size = file_stat.st_size;
-    ereport(LOG,
-				(errcode_for_file_access(),
-				 errmsg("DST FILE SIZE %ld", dst_file_size)));
-
-	// copy_file_part(orig_wal_file_name, dst_fd, WalSegSz - dst_file_size, 0, 0, tmp_buffer, xlog_rec_buffer);
-
-	fstat(dst_fd, &file_stat);
-
-    dst_file_size = file_stat.st_size;
-    ereport(LOG,
-				(errcode_for_file_access(),
-				 errmsg("DST FILE SIZE %ld", dst_file_size)));
-
-	// CloseTransientFile(src_fd);
 	CloseTransientFile(dst_fd);
 	pfree(tmp_buffer);
 	pfree(xlog_rec_buffer);
@@ -1175,7 +1146,6 @@ fetch_insert(XLogReaderState *record)
 	 * user_data offset = size of ChainRecordData struct + size of bitmap + padding + insert_header
 	 */
 	fetched_record->t_hoff = SizeOfChainRecord + bitmap_len + SizeOfHeapInsert;
-
 
     fetched_record->t_infomask2 = xlhdr.t_infomask2;
     fetched_record->t_infomask 	= xlhdr.t_infomask;
@@ -1246,7 +1216,6 @@ fetch_update(XLogReaderState *record)
 	fetched_record->xlog_type = XLOG_HEAP_UPDATE;
 	fetched_record->file_loc = target_locator;
 	fetched_record->forknum = forknum;
-	fetched_record->info = record->record->header.xl_info;
 
 	fetched_record->t_infomask2 = xlhdr.t_infomask2;
     fetched_record->t_infomask 	= xlhdr.t_infomask;
@@ -1314,7 +1283,6 @@ fetch_delete(XLogReaderState *record)
 	fetched_record->t_xmax = xlrec->xmax;
 	fetched_record->file_loc = target_locator;
 	fetched_record->forknum = forknum;
-	fetched_record->info = record->record->header.xl_info;
 
 	ItemPointerSetBlockNumber(&(fetched_record->old_t_ctid), blknum);
     ItemPointerSetOffsetNumber(&(fetched_record->old_t_ctid), xlrec->offnum);
