@@ -4,7 +4,7 @@ MODULES = wal_diff
 PGFILEDESC = "wal_diff - archive module with compressing"
 
 NO_INSTALLCHECK = 1
-
+TAP_TESTS = 1
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
@@ -16,4 +16,3 @@ top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
-
