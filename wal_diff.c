@@ -107,6 +107,7 @@ typedef struct ChainRecordData // TODO глянуть, как лучше рас�
 	RelFileLocator 	file_loc;
 	uint16			t_infomask2;
 	uint16			t_infomask;
+	uint8 			info;
 
 	/*
 	 * Size of [bitmap] + [padding] + appropriate header + [prefix length] + [suffix length] + user_data.
@@ -114,6 +115,7 @@ typedef struct ChainRecordData // TODO глянуть, как лучше рас�
 	uint16 			data_len;
 
 	uint8 			chain_type;
+	RmgrId			rm_id;
 
 	/*
 	 * Offset to user data.
@@ -1041,6 +1043,38 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 		}
 	}
 
+	ChainRecordHashEntry *entry;
+	ChainRecord chain_record;
+	HASH_SEQ_STATUS status;
+
+	hash_seq_init(&status, hash_table);
+	while (entry = (ChainRecordHashEntry *)hash_seq_search(&status) != NULL)
+	{
+		XLogRecord record;
+		chain_record = entry->data;
+		record.xl_tot_len = SizeOfXLogRecord + chain_record->data_len;
+
+		if (chain_record->chain_type == INSERT_CHAIN)
+			record.xl_xid = chain_record->t_xmin;
+
+		else if (chain_record->chain_type == UPDATE_CHAIN || chain_record->chain_type == DELETE_CHAIN)
+			record.xl_xid = chain_record->t_xmax;
+
+		record.xl_prev = ; 						// bruh
+		record.xl_info = chain_record->info;
+		record.xl_rmid = chain_record->rm_id;
+		pg_crc32c crc = INIT_CRC32C(crc);
+		record.xl_crc = COMP_CRC32C(crc, &record + SizeOfXLogRecord, SizeOfXLogRecord - sizeof(pg_crc32c));
+
+		copy_file_part(&record, wal_diff_file_name, dst_fd, 
+					   last_read_rec - global_offset + last_read_rec_len, 
+					   global_offset - initial_file_offset, 
+					   tmp_buffer, xlog_rec_buffer,
+					   &wal_long_hdr_sys_id, &wal_page_addr, &wal_tli);
+
+	}
+	hash_seq_term(&status);
+
 	/*
 	 * Добиваем wal diff файл до 16МБ. Разумеется, позже вырежем эти rofls
 	 */
@@ -1459,87 +1493,6 @@ is_file_archived(const char *file, const char *destination, const char *archive_
 }
 
 /*
- * compare_files
- *
- * Returns whether the contents of the files are the same.
- */
-static bool
-compare_files(const char *file1, const char *file2) 
-{
-#define CMP_BUF_SIZE (4096)
-	char buf1[CMP_BUF_SIZE];
-	char buf2[CMP_BUF_SIZE];
-	int fd1;
-	int fd2;
-	bool ret = true;
-
-	fd1 = OpenTransientFile(file1, O_RDONLY | PG_BINARY);
-	if (fd1 < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open file \"%s\": %m", file1)));
-
-	fd2 = OpenTransientFile(file2, O_RDONLY | PG_BINARY);
-	if (fd2 < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open file \"%s\": %m", file2)));
-
-	for (;;)
-	{
-		int			nbytes = 0;
-		int			buf1_len = 0;
-		int			buf2_len = 0;
-
-		while (buf1_len < CMP_BUF_SIZE)
-		{
-			nbytes = read(fd1, buf1 + buf1_len, CMP_BUF_SIZE - buf1_len);
-			if (nbytes < 0)
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not read file \"%s\": %m", file1)));
-			else if (nbytes == 0)
-				break;
-
-			buf1_len += nbytes;
-		}
-
-		while (buf2_len < CMP_BUF_SIZE)
-		{
-			nbytes = read(fd2, buf2 + buf2_len, CMP_BUF_SIZE - buf2_len);
-			if (nbytes < 0)
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not read file \"%s\": %m", file2)));
-			else if (nbytes == 0)
-				break;
-
-			buf2_len += nbytes;
-		}
-
-		if (buf1_len != buf2_len || memcmp(buf1, buf2, buf1_len) != 0)
-		{
-			ret = false;
-			break;
-		}
-		else if (buf1_len == 0)
-			break;
-	}
-
-	if (CloseTransientFile(fd1) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not close file \"%s\": %m", file1)));
-
-	if (CloseTransientFile(fd2) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not close file \"%s\": %m", file2)));
-
-	return ret;
-}
-
-/*
  * create_wal_diff
  *
  * Creates one WAL-diff file.
@@ -1547,7 +1500,8 @@ compare_files(const char *file1, const char *file2)
 static bool 
 create_wal_diff(const char *src, const char *dest)
 {
-	// copy_file(src, dest);
+
+
 	return true;
 }
 
