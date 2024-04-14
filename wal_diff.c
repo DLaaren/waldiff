@@ -25,82 +25,38 @@
 #include "utils/hsearch.h"
 #include "utils/wait_event.h"
 
-#define INITIAL_HASHTABLE_SIZE 100 // TODO скорее всего впоследствии мы его увеличим
+#define INITIAL_HASHTABLE_SIZE 100 // TODO: find the optimum value
 
 PG_MODULE_MAGIC;
 
 /**********************************************************************
-  * Global data
-  **********************************************************************/
+ * Neccessary info for writing wal-diff segment
+ **********************************************************************/
+typedef struct WalDiffWriterState {
+	int src_fd;
+	int dest_fd;
+	char src_path[MAXPGPATH];
+	char src_dir[MAXPGPATH];
+	char src_fname[MAXPGPATH];
+	char dest_path[MAXPGPATH];
+	char *dest_dir;
+	char dest_fname[MAXPGPATH];
 
-static char 	wal_directory[MAXPGPATH];
-static char 	*wal_diff_directory = NULL;
-static int		WalSegSz;
-static HTAB*	hash_table = NULL;
+	int wal_segment_size;
 
-/*
- * Some info we need to know from wal segment
- * while constracting wal_diff segment
- */
-// оно и так зануляется - лежит в секции bss
-static XLogRecPtr prev_record = 0;
-static uint64	  sys_id = 0;
-static XLogRecPtr page_addr = 0;
-static TimeLineID tli = 0;
-static int dest_fd;
+	XLogRecPtr prev_record;
+
+	uint64 sys_id;
+	XLogRecPtr page_addr;
+	TimeLineID tli;
+
+	size_t curr_wal_segment_size;
+} WalDiffWriterState;
 
 
 /**********************************************************************
-  * Forward declarations
-  **********************************************************************/
-
-static bool check_archive_directory(char **newval, void **extra, GucSource source);
-static bool create_wal_diff();
-static bool is_file_archived(const char *file, const char *destination, const char *archive_directory);
-static void wal_diff_startup(ArchiveModuleState *state);
-static bool wal_diff_configured(ArchiveModuleState *state);
-static bool wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path);
-static void wal_diff_shutdown(ArchiveModuleState *state);
-
-
-/*
- * All functions we need to copy records from
- * wal segment to wal_diff segment (except those that we worked with)
- */
-static void 		copy_file_part(const char* src, const char* dst_name, int dstfd, uint64 size, uint64 src_offset, 
-								   char* tmp_buffer, char* xlog_rec_buffer, XLogRecPtr* file_offset);
-
-static int			read_one_xlog_rec(int src_fd, const char* src_file_name, 
-									  char* xlog_rec_buffer, char* tmp_buff);
-
-static void			write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer, uint64* file_offset);
-static inline int 	read_file2buff(int fd, char* buffer, uint64 size, uint64 buff_offset, const char* file_name);
-static inline int 	write_buff2file(int fd, char* buffer, uint64 size, uint64 buff_offset);
-
-/*
- * Whether XLogRecord fits on the page with
- * given offset
- */
-#define XlogRecHdrFitsOnPage(in_page_offset) \
-( \
-	(in_page_offset) + SizeOfXLogRecord < \
-	BLCKSZ * (1 + (in_page_offset) / BLCKSZ) \
-)
-
-/*
- * Whether record with given length fits on the
- * page with given offset
- */
-
-#define XlogRecFitsOnPage(in_page_offset, rec_len) \
-( \
-	(in_page_offset) + (rec_len) < \
-	BLCKSZ * (1 + (in_page_offset) / BLCKSZ) \
-)
-
- /**********************************************************************
-  * Information for PostgreSQL
-  **********************************************************************/
+ * Information for PostgreSQL
+ **********************************************************************/
 typedef struct ArchiveData
 {
 	MemoryContext oldcontext;
@@ -115,124 +71,40 @@ typedef struct XLogDumpPrivate
 	bool		endptr_reached;
 } XLogDumpPrivate;
 
-static const ArchiveModuleCallbacks wal_diff_callbacks = {
-    .startup_cb 		 = wal_diff_startup,
-	.check_configured_cb = wal_diff_configured,
-	.archive_file_cb 	 = wal_diff_archive,
-	.shutdown_cb 		 = wal_diff_shutdown
-};
 
- /**********************************************************************
-  * The information we store about processed by wal-diff records
-  **********************************************************************/
-typedef struct ChainRecordData // TODO глянуть, как лучше раскидать поля для выравнивания
+/**********************************************************************
+ * Chained wal records for constructing one wal-diff
+ **********************************************************************/
+typedef struct ChainRecordData
 {
+	// it's needed for hash_key
+	RelFileLocator file_loc;
+	ItemPointerData current_t_ctid;
+	ItemPointerData old_t_ctid;
 
-	// Мой вариант хранения chain record'а, а то, честно, я не понимаю зачем мы всё так разворачиваем, а потом думай как собирать
+	// here are rm_id and rm_identity = info & ~XLR_INFO_MASK and record_total_len
+	XLogRecord xlog_record_header;
 
-	// XLogRecord xlog_record_header;
+	HeapTuple heap_tuple;
 
-	// union xlog_record_data {
-	// 	XLogRecordDataInsert xlog_record_data_insert;
-	// 	XLogRecordDataUpdate xlog_record_data_update;
-	// 	XLogRecordDataDelete xlog_record_data_delete;
-	// };
+	char record[XLogRecordMaxSize]; // unchanged record
 
-	// typedef struct XLogRecordDataInsert {
-	// 	XLogRecordBlockHeader xlog_blk_hdr;
-	// 	XLogRecordDataHeaderShort xlog_data_hdr_short;
-	// } XLogRecordDataInsert;
-
-	// насчёт структуры Update и Delete я не уверенна, буду проверять
-
-	// typedef struct XLogRecordDataUpdate {
-	// 	XLogRecordBlockHeader xlog_blk_hdr0;
-	// 	XLogRecordBlockHeader xlog_blk_hdr1;
-	// 	XLogRecordDataHeaderShort xlog_data_hdr_short;
-	// } XLogRecordDataUpdate;
-
-	// typedef struct XLogRecordDataDelete {
-	// 	XLogRecordBlockHeader xlog_blk_hdr0;
-	// 	XLogRecordDataHeaderShort xlog_data_hdr_short;
-	// } XLogRecordDataDelete;
-
-	// union
-	// {
-	// 	HeapTupleHeaderData hdr;
-	// 	char		data[MaxHeapTupleSize];
-	// } tbuf;
-
-	// + я бы добавила глобальную структуру WalDiffWriterState {
-	// 	int src_fd;
-	// 	int dest_fd;
-	// 	int wal_seg_size;
-	// 	last_prev_record_ptr;
-	// 	curr_size
-	// 	и прочую шушеру
-	// }
-
-
-
-	/*
-	 * These 3 fields are representing HeapTupleFields struct.
-
-	 * If some of them not used in ChainRecord (for example. insert does not need t_xmax), they will be null'd 
-	 * during fetching.
-	 */
-	TransactionId t_xmin;
-	TransactionId t_xmax;
-	CommandId	t_cid;			// never used
-
-	/*
-	 * Pointer to latest tuple version
-	 */
-	ItemPointerData current_t_ctid; 	// never used
-
-	/*
-	 * In delete/update case this is the pointer on deleted tuple version.
-	 */
-	ItemPointerData old_t_ctid;		// never used
-
-	ForkNumber 		forknum;		// never used 
-	RelFileLocator 	file_loc;		// never used
-	uint16			t_infomask2;	// never used
-	uint16			t_infomask;		// never used 
-	uint8 			info;
-
-	RmgrId			rm_id;
-	uint8 			xlog_type;
-
-	/*
-	 * Offset to user data.
-	 */
-	uint8			t_hoff;
-
-	/*
-	 * Size of [bitmap] + [padding] + appropriate header + [prefix length] + [suffix length] + user_data.
-	 */
-	uint16 			data_len;
-
-	/*
-	 * Here comes [bitmap] + [padding] and then appropriate header + user_data.
-	 * In update case 'user_data' also includes prefix and suffix lengths (both of them may be = 0)
-	 * that comes right after 'xl_heap_update' 
-	 */
-	bits8			t_bits[FLEXIBLE_ARRAY_MEMBER];
 } ChainRecordData;
-
 typedef ChainRecordData* ChainRecord;
 
-#define SizeOfChainRecord offsetof(ChainRecordData, t_bits)
+#define SizeOfChainRecord (SizeOfXLogRecord + sizeof(RelFileLocator) + 2 * sizeof(ItemPointerData) + HEAPTUPLESIZE + XLogRecordMaxSize)
 
+
+/**********************************************************************
+ * Chained wal records hash entry for hash table
+ **********************************************************************/
 typedef struct ChainRecordHashEntry
 {
 	uint32_t 	hash_key;
 	ChainRecord data;
 } ChainRecordHashEntry;
 
-/*
- * Use this to create key for struct ChainRecord in hashmap
- */
+// Use this to create key for struct ChainRecord in hashmap
 #define GetHashKeyFromChainRecord(record) \
 ( \
 	(uint32_t)((record)->file_loc.spcOid + \
@@ -243,10 +115,9 @@ typedef struct ChainRecordHashEntry
 			   (record)->current_t_ctid.ip_posid) \
 )
 
-/*
- * Use this to find previous chain record 
- * (in case of delete/udate) in hashmap
- */
+
+// Use this to find previous chain record 
+// (in case of delete/udate) in hashmap
 #define GetHashKeyOfPrevChainRecord(record) \
 ( \
 	(uint32_t)((record)->file_loc.spcOid + \
@@ -257,21 +128,67 @@ typedef struct ChainRecordHashEntry
 			   (record)->old_t_ctid.ip_posid) \
 )
 
-/*
- * This three fuctions returns palloced struct
- */
-static ChainRecord fetch_insert(XLogReaderState *record);
-static ChainRecord fetch_update(XLogReaderState *record);
-static ChainRecord fetch_delete(XLogReaderState *record);
 
-static void overlay_update(ChainRecord old_tup, ChainRecord new_tup);
-static void XLogDisplayRecord(XLogReaderState *record);
+/**********************************************************************
+ * Global data
+ **********************************************************************/
+static HTAB    				*hash_table;
+static WalDiffWriterState 	wal_diff_writer_state;
 
+
+/**********************************************************************
+ * Forward declarations
+ **********************************************************************/
+static bool check_archive_directory(char **newval, void **extra, GucSource source);
 static void continuous_reading_wal_file(XLogReaderState *xlogreader_state, 
 										XLogDumpPrivate *private, 
 										const char* orig_wal_file_name, 
 										const char* wal_diff_file_name,
 										XLogRecPtr initial_file_offset);
+static bool create_wal_diff();
+static bool is_file_archived(const char *file, const char *destination, const char *archive_directory);
+static void overlay_update(ChainRecord old_tup, ChainRecord new_tup);
+static bool wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path);
+static bool wal_diff_configured(ArchiveModuleState *state);
+static void wal_diff_shutdown(ArchiveModuleState *state);
+static void wal_diff_startup(ArchiveModuleState *state);
+
+// This three fuctions returns palloced struct
+static ChainRecord fetch_insert(XLogReaderState *record);
+static ChainRecord fetch_update(XLogReaderState *record);
+static ChainRecord fetch_delete(XLogReaderState *record);
+
+// All functions we need to copy records from
+// wal segment to wal_diff segment (except those that we worked with)
+static void 		copy_file_part(const char* src, const char* dst_name, int dstfd, uint64 size, uint64 src_offset, 
+								   char* tmp_buffer, char* xlog_rec_buffer, XLogRecPtr* file_offset);
+static int			read_one_xlog_rec(int src_fd, const char* src_file_name, 
+									  char* xlog_rec_buffer, char* tmp_buff);
+static void			write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer, uint64* file_offset);
+static inline int 	read_file2buff(int fd, char* buffer, uint64 size, uint64 buff_offset, const char* file_name);
+static inline int 	write_buff2file(int fd, char* buffer, uint64 size, uint64 buff_offset);
+
+// Whether XLogRecord fits on the page with
+// given offset
+#define XlogRecHdrFitsOnPage(in_page_offset) \
+( \
+	(in_page_offset) + SizeOfXLogRecord < \
+	BLCKSZ * (1 + (in_page_offset) / BLCKSZ) \
+)
+
+// Whether record with given length fits on the
+// page with given offset
+#define XlogRecFitsOnPage(in_page_offset, rec_len) \
+( \
+	(in_page_offset) + (rec_len) < \
+	BLCKSZ * (1 + (in_page_offset) / BLCKSZ) \
+)
+
+
+/**********************************************************************
+ * Code
+ **********************************************************************/
+
 /*
  * _PG_init
  *
@@ -283,7 +200,7 @@ _PG_init(void)
 	DefineCustomStringVariable("wal_diff.wal_diff_directory",
 							   gettext_noop("Archive WAL-diff destination directory."),
 							   NULL,
-							   &wal_diff_directory,
+							   wal_diff_writer_state.dest_dir,
 							   "wal_diff_directory",
 							   PGC_SIGHUP,
 							   0,
@@ -291,6 +208,13 @@ _PG_init(void)
 
 	MarkGUCPrefixReserved("wal_diff");
 }
+
+static const ArchiveModuleCallbacks wal_diff_callbacks = {
+    .startup_cb 		 = wal_diff_startup,
+	.check_configured_cb = wal_diff_configured,
+	.archive_file_cb 	 = wal_diff_archive,
+	.shutdown_cb 		 = wal_diff_shutdown
+};
 
 /*
  * _PG_archive_module_init
@@ -303,8 +227,6 @@ _PG_archive_module_init(void)
 	return &wal_diff_callbacks;
 }
 
-// add checking if there "still temp" wal-diffs
-
 /*
  * wal_diff_startup
  *
@@ -316,8 +238,7 @@ wal_diff_startup(ArchiveModuleState *state)
 	ArchiveData *data;
 	HASHCTL hash_ctl;
 
-	data = (ArchiveData *) MemoryContextAllocZero(TopMemoryContext,
-													   sizeof(ArchiveData));
+	data = (ArchiveData *) MemoryContextAllocZero(TopMemoryContext, sizeof(ArchiveData));
 	data->context = AllocSetContextCreate(TopMemoryContext,
 										  "archive",
 										  ALLOCSET_DEFAULT_SIZES);
@@ -335,9 +256,9 @@ wal_diff_startup(ArchiveModuleState *state)
 	hash_ctl.hcxt 		= data->context;
 
 	hash_table = hash_create("ChainRecordHashTable",
-							INITIAL_HASHTABLE_SIZE,
-							&hash_ctl,
-							HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+							 INITIAL_HASHTABLE_SIZE,
+							 &hash_ctl,
+							 HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 }
 
 /*
@@ -355,24 +276,20 @@ check_archive_directory(char **newval, void **extra, GucSource source)
 		GUC_check_errmsg("Archive directory name is blank");
 		return false;
 	}
-
 	if (strlen(*newval) >= MAXPGPATH)
 	{
 		GUC_check_errmsg("Archive directory name is too long");
 		return false;
 	}	
-	
 	if (stat(*newval, &st) != 0 || !S_ISDIR(st.st_mode))
 	{
 		GUC_check_errdetail("Specified archive directory does not exist: %m");
-
 		if (pg_mkdir_p(*newval, 0700) != 0)
 		{
 			GUC_check_errmsg("Could not allocate specified directory: %m");
 			return false;
 		}
 	}
-
 	return true;
 }
 
@@ -384,13 +301,13 @@ check_archive_directory(char **newval, void **extra, GucSource source)
 static bool 
 wal_diff_configured(ArchiveModuleState *state)
 {
-    return  wal_diff_directory != NULL && 
-			wal_diff_directory[0] != '\0';
+    return  wal_diff_writer_state.dest_dir != NULL && 
+			wal_diff_writer_state.dest_dir[0] != '\0';
 }
 
 static int 
 WalReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
-				XLogRecPtr targetPtr, char *readBuff)
+			XLogRecPtr targetPtr, char *readBuff)
 {
 	XLogDumpPrivate *private = state->private_data;
 	int			count = XLOG_BLCKSZ;
@@ -436,8 +353,7 @@ WalReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 }
 
 static void 
-WalOpenSegment(XLogReaderState *state, XLogSegNo nextSegNo,
-				   TimeLineID *tli_p)
+WalOpenSegment(XLogReaderState *state, XLogSegNo nextSegNo, TimeLineID *tli_p)
 {
 	TimeLineID tli = *tli_p;
     char fname[MAXPGPATH];
@@ -464,19 +380,19 @@ WalCloseSegment(XLogReaderState *state)
 }
 
 static void
-getWalDirecotry(char *wal_directory, const char *path, const char *file)
+getWalDirecotry(const char *path, const char *file)
 {
 	if (strlen(path) > MAXPGPATH)
 		ereport(ERROR,
 				errmsg("WAL file absolute name is too long : %s", path));
 
-	if (snprintf(wal_directory, strlen(path), "%s", path) == -1)
+	if (snprintf(wal_diff_writer_state.src_dir, strlen(path), "%s", path) == -1)
 		ereport(ERROR,
 				errmsg("error during reading WAL directory path : %s", path));
 
-	MemSet(wal_directory + (strlen(path) - strlen(file) - 1), 0, strlen(file));
+	MemSet(&(wal_diff_writer_state.src_dir) + (strlen(path) - strlen(file) - 1), 0, strlen(file));
 	ereport(LOG, 
-			errmsg("wal directory is : %s", wal_directory));
+			errmsg("wal directory is : %s", wal_diff_writer_state.src_dir));
 }
 
 /*
@@ -564,9 +480,9 @@ read_one_xlog_rec(int src_fd, const char* src_file_name,
 					break;
 
 				long_hdr  = (XLogLongPageHeader) tmp_buff;
-				sys_id 	  = long_hdr->xlp_sysid;
-				page_addr = hdr->xlp_pageaddr;
-				tli 	  = hdr->xlp_tli;
+				wal_diff_writer_state.sys_id 	  = long_hdr->xlp_sysid;
+				wal_diff_writer_state.page_addr = hdr->xlp_pageaddr;
+				wal_diff_writer_state.tli 	  = hdr->xlp_tli;
 				
 				read_in_total += nbytes;
 			}
@@ -677,16 +593,16 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 			{
 				XLogLongPageHeaderData long_hdr;
 
-				long_hdr.xlp_sysid 		  = sys_id;
-				long_hdr.xlp_seg_size	  = WalSegSz;
+				long_hdr.xlp_sysid 		  = wal_diff_writer_state.sys_id;
+				long_hdr.xlp_seg_size	  = wal_diff_writer_state.wal_segment_size;
 				long_hdr.xlp_xlog_blcksz  = XLOG_BLCKSZ;
 
 				long_hdr.std.xlp_info 	  = 0;
 				long_hdr.std.xlp_info 	  |= XLP_LONG_HEADER;
-				long_hdr.std.xlp_tli 	  = tli;
+				long_hdr.std.xlp_tli 	  = wal_diff_writer_state.tli;
 				long_hdr.std.xlp_rem_len  = 0;
 				long_hdr.std.xlp_magic 	  = XLOG_PAGE_MAGIC;
-				long_hdr.std.xlp_pageaddr = page_addr;
+				long_hdr.std.xlp_pageaddr = wal_diff_writer_state.page_addr;
 
 				ereport(LOG, errmsg("LONG HDR. ADDR : %ld", long_hdr.std.xlp_pageaddr));
 
@@ -703,9 +619,9 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 					hdr.xlp_info |= XLP_FIRST_IS_CONTRECORD;
 				hdr.xlp_rem_len = rem_data_len;
 				
-				hdr.xlp_tli 	 = tli;
+				hdr.xlp_tli 	 = wal_diff_writer_state.tli;
 				hdr.xlp_magic 	 = XLOG_PAGE_MAGIC;
-				hdr.xlp_pageaddr = page_addr + *file_offset;
+				hdr.xlp_pageaddr = wal_diff_writer_state.page_addr + *file_offset;
 
 				nbytes = write_buff2file(dst_fd, (char*) &hdr, SizeOfXLogShortPHD, 0);
 				*file_offset += nbytes;
@@ -739,8 +655,8 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 		}
 
 		record = (XLogRecord*) xlog_rec_buffer;
-		record->xl_prev = prev_record + page_addr;
-		prev_record = *file_offset;
+		record->xl_prev = wal_diff_writer_state.prev_record + wal_diff_writer_state.page_addr;
+		wal_diff_writer_state.prev_record = *file_offset;
 
 		INIT_CRC32C(crc);
 		COMP_CRC32C(crc, ((char *) record) + SizeOfXLogRecord, record->xl_tot_len - SizeOfXLogRecord);
@@ -853,10 +769,10 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 	ereport(LOG, 
 			errmsg("archiving file : %s", file));
 
-	if (strlen(wal_directory) == 0)
-		getWalDirecotry(wal_directory, path, file);
+	if (strlen(wal_diff_writer_state.src_dir) == 0)
+		getWalDirecotry(path, file);
 
-	sprintf(wal_diff_file, "%s/%s", wal_diff_directory, file);
+	sprintf(wal_diff_writer_state.dest_fname, "%s/%s", wal_diff_writer_state.src_dir, file);
 
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 	if (fd < 0)
@@ -870,10 +786,10 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 
     if (read_count == XLOG_BLCKSZ) {
         XLogLongPageHeader longhdr = (XLogLongPageHeader) buff.data;
-        WalSegSz = longhdr->xlp_seg_size;
-        if (!IsValidWalSegSize(WalSegSz)) {
+        wal_diff_writer_state.wal_segment_size = longhdr->xlp_seg_size;
+        if (!IsValidWalSegSize(wal_diff_writer_state.wal_segment_size)) {
             ereport(ERROR, 
-					errmsg("Invalid wal segment size : %d\n", WalSegSz));
+					errmsg("Invalid wal segment size : %d\n", wal_diff_writer_state.wal_segment_size));
         }
 		page_addr = longhdr->std.xlp_pageaddr;
     }
@@ -892,15 +808,15 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 	private.endptr = InvalidXLogRecPtr;
 	private.endptr_reached = false;
 
-	XLogFromFileName(file, &private.timeline, &segno, WalSegSz);
-    XLogSegNoOffsetToRecPtr(segno, 0, WalSegSz, private.startptr);
-	XLogSegNoOffsetToRecPtr(segno + 1, 0, WalSegSz, private.endptr);
+	XLogFromFileName(file, &private.timeline, &segno, wal_diff_writer_state.wal_segment_size);
+    XLogSegNoOffsetToRecPtr(segno, 0, wal_diff_writer_state.wal_segment_size, private.startptr);
+	XLogSegNoOffsetToRecPtr(segno + 1, 0, wal_diff_writer_state.wal_segment_size, private.endptr);
 
 	xlogreader_state = 
-		XLogReaderAllocate(WalSegSz, wal_directory,
+		XLogReaderAllocate(wal_diff_writer_state.wal_segment_size, &(wal_diff_writer_state.src_dir),
 							XL_ROUTINE(.page_read = WalReadPage,
-										.segment_open = WalOpenSegment,
-										.segment_close = WalCloseSegment),
+									   .segment_open = WalOpenSegment,
+									   .segment_close = WalCloseSegment),
 							&private);
 
 	if (!xlogreader_state) 
@@ -930,7 +846,7 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 				errmsg("got some remaining data from a previous page : %d", page_hdr->xlp_rem_len));
 
 	if (first_record != private.startptr && 
-		XLogSegmentOffset(private.startptr, WalSegSz) != 0)
+		XLogSegmentOffset(private.startptr, wal_diff_writer_state.wal_segment_size) != 0)
 		ereport(LOG, 
 				errmsg("skipping over %u bytes", (uint32) (first_record - private.startptr)));
 
@@ -1201,6 +1117,8 @@ fetch_insert(XLogReaderState *record)
 	Assert(!(fetched_record->t_infomask & HEAP_MOVED));
 	fetched_record->t_cid = FirstCommandId;
 	fetched_record->t_infomask &= ~HEAP_COMBOCID;
+
+	
 
 	return fetched_record;
 }
@@ -1626,7 +1544,7 @@ create_wal_diff()
 
 		prev_record += record_size;
 
-		write_one_xlog_rec(dest_fd, dest_filename, constructed_record, file_offset);
+		// write_one_xlog_rec(dest_fd, dest_filename, constructed_record, file_offset);
 	}
 	hash_seq_term(&status);
 
