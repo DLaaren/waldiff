@@ -42,17 +42,20 @@ static HTAB*	hash_table = NULL;
  * Some info we need to know from wal segment
  * while constracting wal_diff segment
  */
+// оно и так зануляется - лежит в секции bss
 static XLogRecPtr prev_record = 0;
 static uint64	  sys_id = 0;
 static XLogRecPtr page_addr = 0;
 static TimeLineID tli = 0;
+static int dest_fd;
+
 
 /**********************************************************************
   * Forward declarations
   **********************************************************************/
 
 static bool check_archive_directory(char **newval, void **extra, GucSource source);
-static bool create_wal_diff(const char *src, const char *dest);
+static bool create_wal_diff();
 static bool is_file_archived(const char *file, const char *destination, const char *archive_directory);
 static void wal_diff_startup(ArchiveModuleState *state);
 static bool wal_diff_configured(ArchiveModuleState *state);
@@ -124,6 +127,52 @@ static const ArchiveModuleCallbacks wal_diff_callbacks = {
   **********************************************************************/
 typedef struct ChainRecordData // TODO глянуть, как лучше раскидать поля для выравнивания
 {
+
+	// Мой вариант хранения chain record'а, а то, честно, я не понимаю зачем мы всё так разворачиваем, а потом думай как собирать
+
+	// XLogRecord xlog_record_header;
+
+	// union xlog_record_data {
+	// 	XLogRecordDataInsert xlog_record_data_insert;
+	// 	XLogRecordDataUpdate xlog_record_data_update;
+	// 	XLogRecordDataDelete xlog_record_data_delete;
+	// };
+
+	// typedef struct XLogRecordDataInsert {
+	// 	XLogRecordBlockHeader xlog_blk_hdr;
+	// 	XLogRecordDataHeaderShort xlog_data_hdr_short;
+	// } XLogRecordDataInsert;
+
+	// насчёт структуры Update и Delete я не уверенна, буду проверять
+
+	// typedef struct XLogRecordDataUpdate {
+	// 	XLogRecordBlockHeader xlog_blk_hdr0;
+	// 	XLogRecordBlockHeader xlog_blk_hdr1;
+	// 	XLogRecordDataHeaderShort xlog_data_hdr_short;
+	// } XLogRecordDataUpdate;
+
+	// typedef struct XLogRecordDataDelete {
+	// 	XLogRecordBlockHeader xlog_blk_hdr0;
+	// 	XLogRecordDataHeaderShort xlog_data_hdr_short;
+	// } XLogRecordDataDelete;
+
+	// union
+	// {
+	// 	HeapTupleHeaderData hdr;
+	// 	char		data[MaxHeapTupleSize];
+	// } tbuf;
+
+	// + я бы добавила глобальную структуру WalDiffWriterState {
+	// 	int src_fd;
+	// 	int dest_fd;
+	// 	int wal_seg_size;
+	// 	last_prev_record_ptr;
+	// 	curr_size
+	// 	и прочую шушеру
+	// }
+
+
+
 	/*
 	 * These 3 fields are representing HeapTupleFields struct.
 
@@ -166,7 +215,7 @@ typedef struct ChainRecordData // TODO глянуть, как лучше рас�
 	/*
 	 * Here comes [bitmap] + [padding] and then appropriate header + user_data.
 	 * In update case 'user_data' also includes prefix and suffix lengths (both of them may be = 0)
-	 * that comes right after 'xl_heap_update'
+	 * that comes right after 'xl_heap_update' 
 	 */
 	bits8			t_bits[FLEXIBLE_ARRAY_MEMBER];
 } ChainRecordData;
@@ -887,19 +936,6 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 
 	continuous_reading_wal_file(xlogreader_state, &private, path, wal_diff_file, page_addr);
 
-	// а потом жоско скрафтим wal_diff
-
-	if (create_wal_diff(path, wal_diff_file))
-	{
-		ereport(LOG, errmsg("created WAL-diff for file \"%s\"", file));
-		return true;
-	} 
-	else 
-	{
-		ereport(ERROR, errmsg("error while creating WAL-diff"));
-		return false;
-	}
-
 	ereport(LOG, errmsg("Wal Diff Created"));
 
 	return true;
@@ -1065,6 +1101,17 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 			*/
 			continue;
 		}
+	}
+
+	if (create_wal_diff())
+	{
+		ereport(LOG, errmsg("created WAL-diff for file \"%s\"", orig_wal_file_name));
+		return true;
+	} 
+	else 
+	{
+		ereport(ERROR, errmsg("error while creating WAL-diff"));
+		return false;
 	}
 
 	// ereport(LOG, errmsg("FINISH : GLOBAL OFFSET = %ld\tLAST READ = %ld\tLAST READ LSN : %X/%X", global_offset, last_read_rec, LSN_FORMAT_ARGS(last_read_rec)));
@@ -1476,9 +1523,112 @@ is_file_archived(const char *file, const char *destination, const char *archive_
  * Creates one WAL-diff file.
  */
 static bool 
-create_wal_diff(const char *src, const char *dest)
+create_wal_diff()
 {
+	ChainRecordHashEntry *entry;
+	ChainRecord chain_record;
+	HASH_SEQ_STATUS status;
 
+	hash_seq_init(&status, hash_table);
+	while ((entry = (ChainRecordHashEntry *)hash_seq_search(&status)) != NULL)
+	{
+		char *constructed_record;
+		char *constructed_record_curr_size = constructed_record;
+		XLogRecord record;
+		size_t record_size;
+
+		chain_record = entry->data;
+
+		record.xl_tot_len = SizeOfXLogRecord + chain_record->data_len;
+		record.xl_prev = prev_record + page_addr;
+
+		record.xl_info = chain_record->info;
+		record.xl_rmid = chain_record->rm_id;
+
+		pg_crc32c crc = INIT_CRC32C(crc);
+		record.xl_crc = COMP_CRC32C(crc, &record + SizeOfXLogRecord, SizeOfXLogRecord - sizeof(pg_crc32c));
+
+		// let it be only DataHeaderShort for now
+		if (chain_record->xlog_type == XLOG_HEAP_INSERT)
+		{
+			XLogRecordBlockHeader blkhdr; 
+			XLogRecordDataHeaderShort hdrshort;
+			xl_heap_header xl_heap_hdr;
+
+
+			record_size = SizeOfXLogRecordBlockHeader + SizeOfXLogRecordDataHeaderShort + SizeOfHeapHeader + chain_record->data_len;
+			constructed_record = palloc0(record_size);
+			record.xl_xid = chain_record->t_xmin;
+			
+			blkhdr.id = 0;
+			blkhdr.fork_flags = 0;
+			blkhdr.data_length = chain_record->data_len;
+
+			hdrshort.id = 0;
+			hdrshort.data_length = chain_record->data_len;
+
+			xl_heap_hdr.t_hoff = chain_record->t_hoff;
+			xl_heap_hdr.t_infomask2 = chain_record->t_infomask2;
+			xl_heap_hdr.t_infomask = chain_record->t_infomask;
+			
+			memcpy(constructed_record_curr_size, &record, SizeOfXLogRecord);
+			constructed_record_curr_size += SizeOfXLogRecord;
+			memcpy(constructed_record_curr_size, &blkhdr, SizeOfXLogRecordBlockHeader);
+			constructed_record_curr_size += SizeOfXLogRecordBlockHeader;
+			memcpy(constructed_record_curr_size, &hdrshort, SizeOfXLogRecordDataHeaderShort);
+			constructed_record_curr_size += SizeOfXLogRecordDataHeaderShort;
+			memcpy(constructed_record_curr_size, &xl_heap_hdr, SizeOfHeapHeader);
+			constructed_record_curr_size += SizeOfHeapHeader;
+			memcpy(constructed_record_curr_size, chain_record->t_bits, chain_record->data_len);
+		}
+		// вопрос :
+		// если у нас в цепочке нет isert'а, то мы просто обновляем поле с tuple data, а потом после вставляем один update
+		// а если у нас в начале был insert, то то накладывая update, возвращается insert или update, уже соединённый с insert'om?
+		else if (chain_record->xlog_type == XLOG_HEAP_UPDATE)
+		{
+			XLogRecordBlockHeader blkhdr; 
+			XLogRecordDataHeaderShort hdrshort0;
+			XLogRecordDataHeaderShort hdrshort1;
+
+			record_size = SizeOfXLogRecordBlockHeader + SizeOfXLogRecordDataHeaderShort + SizeOfHeapHeader + chain_record->data_len;
+			constructed_record = palloc0(record_size);
+			record.xl_xid = chain_record->t_xmax;
+
+
+		}
+		// если хранить как я предложила, то заново собирать не нужно
+		else if (chain_record->xlog_type == XLOG_HEAP_DELETE)
+		{
+			XLogRecordBlockHeader blkhdr; 
+			// XLogRecordDataHeaderShort hdrshort;
+			xl_heap_header xl_heap_hdr;
+
+			record_size = SizeOfXLogRecordBlockHeader + SizeOfHeapHeader + chain_record->data_len;
+			constructed_record = palloc0(record_size);
+			record.xl_xid = chain_record->t_xmax;
+
+			blkhdr.id = 0;
+			blkhdr.fork_flags = 0;
+			blkhdr.data_length = chain_record->data_len;
+
+			xl_heap_hdr.t_hoff = chain_record->t_hoff;
+			xl_heap_hdr.t_infomask2 = chain_record->t_infomask2;
+			xl_heap_hdr.t_infomask = chain_record->t_infomask;
+
+			memcpy(constructed_record_curr_size, &record, SizeOfXLogRecord);
+			constructed_record_curr_size += SizeOfXLogRecord;
+			memcpy(constructed_record_curr_size, &blkhdr, SizeOfXLogRecordBlockHeader);
+			constructed_record_curr_size += SizeOfXLogRecordBlockHeader;
+			memcpy(constructed_record_curr_size, &xl_heap_hdr, SizeOfHeapHeader);
+			constructed_record_curr_size += SizeOfHeapHeader;
+			memcpy(constructed_record_curr_size, chain_record->t_bits, chain_record->data_len);
+		}
+
+		prev_record += record_size;
+
+		write_one_xlog_rec(dest_fd, dest_filename, constructed_record, file_offset);
+	}
+	hash_seq_term(&status);
 
 	return true;
 }
