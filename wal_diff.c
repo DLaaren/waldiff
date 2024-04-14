@@ -445,7 +445,8 @@ read_file2buff(int fd, char* buffer, uint64 size, uint64 buff_offset, const char
 
 static int
 read_one_xlog_rec(int src_fd, const char* src_file_name, 
-				  char* xlog_rec_buffer, char* tmp_buff)
+				  char* xlog_rec_buffer, char* tmp_buff, 
+				  uint64 read_left, bool* read_only_header)
 {
 	uint64 		current_file_pos = lseek(src_fd, 0, SEEK_CUR);
 	XLogRecord* record;
@@ -487,6 +488,12 @@ read_one_xlog_rec(int src_fd, const char* src_file_name,
 				read_in_total += nbytes;
 			}
 
+			if (read_left == read_in_total)
+			{
+				*read_only_header = true;
+				break;
+			}
+
 			if (hdr->xlp_rem_len > 0)
 			{
 				uint64 data_len = 0;
@@ -511,7 +518,7 @@ read_one_xlog_rec(int src_fd, const char* src_file_name,
 				if (data_len == hdr->xlp_rem_len)
 				{
 					lseek(src_fd, MAXALIGN(hdr->xlp_rem_len) - data_len, SEEK_CUR);
-					// read_in_total += MAXALIGN(hdr->xlp_rem_len) - data_len;
+					read_in_total += MAXALIGN(hdr->xlp_rem_len) - data_len;
 					return read_in_total;
 				}
 				
@@ -561,7 +568,7 @@ read_one_xlog_rec(int src_fd, const char* src_file_name,
 			if (data_len == (record->xl_tot_len - SizeOfXLogRecord))
 			{
 				lseek(src_fd, MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord - data_len, SEEK_CUR);
-				// read_in_total += MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord - data_len;
+				read_in_total += MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord - data_len;
 				return read_in_total;
 			}
 			
@@ -702,6 +709,7 @@ copy_file_part(const char* src, const char* dst_name, int dstfd, uint64 size, ui
 {
 	int      	 srcfd;
 	int64 		 read_left = size;
+	bool		 read_only_header = false;
 
 	/*
 	* Open the file
@@ -722,8 +730,8 @@ copy_file_part(const char* src, const char* dst_name, int dstfd, uint64 size, ui
 	*/
 	while(true)
 	{
-		int read_len = read_one_xlog_rec(srcfd, src, xlog_rec_buffer, tmp_buffer);
-		if (read_len == -1)
+		int read_len = read_one_xlog_rec(srcfd, src, xlog_rec_buffer, tmp_buffer, read_left, &read_only_header);
+		if (read_len == -1 || read_only_header)
 			break;
 		
 		write_one_xlog_rec(dstfd, dst_name, xlog_rec_buffer, file_offset);
@@ -1001,12 +1009,16 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 			seg_start = xlogreader_state->ReadRecPtr;
 			seg_end = xlogreader_state->EndRecPtr;
 
-			copy_file_part(orig_wal_file_name, wal_diff_file_name, dst_fd, 
-						   seg_start - global_offset, 
-						   global_offset - initial_file_offset, 
-						   tmp_buffer, 
-						   xlog_rec_buffer,
-						   &wal_diff_file_offset);
+			if ((seg_start - global_offset) > 0) 
+			{
+				// ereport(LOG, errmsg("START : %ld\tEND : %ld, REC_LEN : %ld\tSIZE : %ld", global_offset, seg_start, MAXALIGN(xlogreader_state->record->header.xl_tot_len), seg_start - global_offset));
+				copy_file_part(orig_wal_file_name, wal_diff_file_name, dst_fd, 
+							seg_start - global_offset, 
+							global_offset - initial_file_offset, 
+							tmp_buffer, 
+							xlog_rec_buffer,
+							&wal_diff_file_offset);
+			}
 
 			global_offset = seg_end;
 		}
