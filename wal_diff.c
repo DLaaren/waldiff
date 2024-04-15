@@ -52,8 +52,6 @@ typedef struct ChainRecordData
 	RelFileLocator file_loc;
 	ItemPointerData current_t_ctid;
 	ItemPointerData old_t_ctid;
-
-	char *unchanged_record;
 	
 	// here is all-all data about a record
 	XLogRecord xlog_record_header;
@@ -889,6 +887,8 @@ overlay_update(ChainRecord old_tup, ChainRecord new_tup)
 	
 }
 
+
+
 /*
  * create_wal_diff
  *
@@ -904,101 +904,53 @@ create_wal_diff()
 	hash_seq_init(&status, hash_table);
 	while ((entry = (ChainRecordHashEntry *)hash_seq_search(&status)) != NULL)
 	{
-		char *constructed_record;
-		char *constructed_record_curr_size = constructed_record;
-		XLogRecord record;
-		size_t record_size;
+		ChainRecord chain_record = entry->data;
+		// looks like wal insert function counts it by itself
+		// pg_crc32c crc;
 
-		chain_record = entry->data;
+		// INIT_CRC32C(crc);
+		// COMP_CRC32C(crc, &(chain_record->xlog_record_header) + SizeOfXLogRecord, SizeOfXLogRecord - sizeof(pg_crc32c));
+		// FIN_CRC32C(crc);
 
-		record.xl_tot_len = SizeOfXLogRecord + chain_record->data_len;
-		record.xl_prev = prev_record + page_addr;
 
-		record.xl_info = chain_record->info;
-		record.xl_rmid = chain_record->rm_id;
 
-		pg_crc32c crc = INIT_CRC32C(crc);
-		record.xl_crc = COMP_CRC32C(crc, &record + SizeOfXLogRecord, SizeOfXLogRecord - sizeof(pg_crc32c));
-
-		// let it be only DataHeaderShort for now
-		if (chain_record->xlog_type == XLOG_HEAP_INSERT)
+		switch (getRmIdentity(chain_record))
 		{
-			XLogRecordBlockHeader blkhdr; 
-			XLogRecordDataHeaderShort hdrshort;
-			xl_heap_header xl_heap_hdr;
+			case XLOG_HEAP_INSERT:
+				xl_heap_insert xlrec;
+				xl_heap_header xlhdr;
+				XLogRecPtr	recptr;
+				// Page		page = BufferGetPage(buffer);
+				uint8		info = XLOG_HEAP_INSERT;
+				// int			bufflags = 0;
+				HeapTuple heaptup = chain_record->heap_tuple;
+				XLogRecPtr EndPos;
+
+				xlrec.offnum = ItemPointerGetOffsetNumber(&heaptup->t_self);
+				xlrec.flags = ; // here probaly we should add xl_heap_insert and others into chain_record type
+
+				xlhdr.t_infomask2 = heaptup->t_data->t_infomask2;
+				xlhdr.t_infomask = heaptup->t_data->t_infomask;
+				xlhdr.t_hoff = heaptup->t_data->t_hoff;
 
 
-			record_size = SizeOfXLogRecordBlockHeader + SizeOfXLogRecordDataHeaderShort + SizeOfHeapHeader + chain_record->data_len;
-			constructed_record = palloc0(record_size);
-			record.xl_xid = chain_record->t_xmin;
-			
-			blkhdr.id = 0;
-			blkhdr.fork_flags = 0;
-			blkhdr.data_length = chain_record->data_len;
+				break;
+		
+			case XLOG_HEAP_UPDATE:
 
-			hdrshort.id = 0;
-			hdrshort.data_length = chain_record->data_len;
+				break;
 
-			xl_heap_hdr.t_hoff = chain_record->t_hoff;
-			xl_heap_hdr.t_infomask2 = chain_record->t_infomask2;
-			xl_heap_hdr.t_infomask = chain_record->t_infomask;
-			
-			memcpy(constructed_record_curr_size, &record, SizeOfXLogRecord);
-			constructed_record_curr_size += SizeOfXLogRecord;
-			memcpy(constructed_record_curr_size, &blkhdr, SizeOfXLogRecordBlockHeader);
-			constructed_record_curr_size += SizeOfXLogRecordBlockHeader;
-			memcpy(constructed_record_curr_size, &hdrshort, SizeOfXLogRecordDataHeaderShort);
-			constructed_record_curr_size += SizeOfXLogRecordDataHeaderShort;
-			memcpy(constructed_record_curr_size, &xl_heap_hdr, SizeOfHeapHeader);
-			constructed_record_curr_size += SizeOfHeapHeader;
-			memcpy(constructed_record_curr_size, chain_record->t_bits, chain_record->data_len);
-		}
-		// вопрос :
-		// если у нас в цепочке нет isert'а, то мы просто обновляем поле с tuple data, а потом после вставляем один update
-		// а если у нас в начале был insert, то то накладывая update, возвращается insert или update, уже соединённый с insert'om?
-		else if (chain_record->xlog_type == XLOG_HEAP_UPDATE)
-		{
-			XLogRecordBlockHeader blkhdr; 
-			XLogRecordDataHeaderShort hdrshort0;
-			XLogRecordDataHeaderShort hdrshort1;
+			case XLOG_HEAP_DELETE:
 
-			record_size = SizeOfXLogRecordBlockHeader + SizeOfXLogRecordDataHeaderShort + SizeOfHeapHeader + chain_record->data_len;
-			constructed_record = palloc0(record_size);
-			record.xl_xid = chain_record->t_xmax;
+				break;
 
-
-		}
-		// если хранить как я предложила, то заново собирать не нужно
-		else if (chain_record->xlog_type == XLOG_HEAP_DELETE)
-		{
-			XLogRecordBlockHeader blkhdr; 
-			// XLogRecordDataHeaderShort hdrshort;
-			xl_heap_header xl_heap_hdr;
-
-			record_size = SizeOfXLogRecordBlockHeader + SizeOfHeapHeader + chain_record->data_len;
-			constructed_record = palloc0(record_size);
-			record.xl_xid = chain_record->t_xmax;
-
-			blkhdr.id = 0;
-			blkhdr.fork_flags = 0;
-			blkhdr.data_length = chain_record->data_len;
-
-			xl_heap_hdr.t_hoff = chain_record->t_hoff;
-			xl_heap_hdr.t_infomask2 = chain_record->t_infomask2;
-			xl_heap_hdr.t_infomask = chain_record->t_infomask;
-
-			memcpy(constructed_record_curr_size, &record, SizeOfXLogRecord);
-			constructed_record_curr_size += SizeOfXLogRecord;
-			memcpy(constructed_record_curr_size, &blkhdr, SizeOfXLogRecordBlockHeader);
-			constructed_record_curr_size += SizeOfXLogRecordBlockHeader;
-			memcpy(constructed_record_curr_size, &xl_heap_hdr, SizeOfHeapHeader);
-			constructed_record_curr_size += SizeOfHeapHeader;
-			memcpy(constructed_record_curr_size, chain_record->t_bits, chain_record->data_len);
+			default:
+				ereport(LOG, 
+						errmsg("unknown op code %u", getRmIdentity(chain_record)));
+				break;
+				
 		}
 
-		prev_record += record_size;
-
-		// write_one_xlog_rec(dest_fd, dest_filename, constructed_record, file_offset);
 	}
 	hash_seq_term(&status);
 
