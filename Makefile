@@ -1,6 +1,10 @@
 # contrib/wal_diff/Makefile
 
-MODULES = wal_diff
+MODULE_big = wal_diff
+OBJS = \
+	wal_diff.o \
+	wal_diff_func.o
+
 PGFILEDESC = "wal_diff - archive module with compressing"
 
 NO_INSTALLCHECK = 1

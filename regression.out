@@ -1,0 +1,2 @@
+# using temp instance on port 61698 with PID 14636
+# diff command failed with status 512: diff  "/home/danissimo/Downloads/postgresql-16.2/contrib/wal_diff/expected/wal_diff.out" "/home/danissimo/Downloads/postgresql-16.2/contrib/wal_diff/results/wal_diff.out" > "/home/danissimo/Downloads/postgresql-16.2/contrib/wal_diff/results/wal_diff.out.diff"Bail out!

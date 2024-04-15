@@ -48,36 +48,57 @@ typedef struct ArchiveData
 
 typedef struct ChainRecordData
 {
-	// it's needed for hash_key
-	RelFileLocator file_loc;
-	ItemPointerData current_t_ctid;
-	ItemPointerData old_t_ctid;
-	
-	// here is all-all data about a record
-	XLogRecord xlog_record_header;
+	/*
+	 * These 3 fields are representing HeapTupleFields struct.
 
-	// contains t_bits
-	HeapTuple heap_tuple;
+	 * If some of them not used in ChainRecord (for example. insert does not need t_xmax), they will be null'd 
+	 * during fetching.
+	 */
+	TransactionId t_xmin;
+	TransactionId t_xmax;
+	CommandId	t_cid;			// never used
+
+	/*
+	 * Pointer to latest tuple version
+	 */
+	ItemPointerData current_t_ctid; 	// never used
+
+	/*
+	 * In delete/update case this is the pointer on deleted tuple version.
+	 */
+	ItemPointerData old_t_ctid;		// never used
+
+	ForkNumber 		forknum;		// never used 
+	RelFileLocator 	file_loc;		// never used
+	uint16			t_infomask2;	// never used
+	uint16			t_infomask;		// never used 
+	uint8 			info;
+
+	RmgrId			rm_id;
+	uint8 			xlog_type;
+
+	/*
+	 * Offset to user data.
+	 */
+	uint8			t_hoff;
+
+	/*
+	 * Size of [bitmap] + [padding] + appropriate header + [prefix length] + [suffix length] + user_data.
+	 */
+	uint16 			data_len;
+
+	/*
+	 * Here comes [bitmap] + [padding] and then appropriate header + user_data.
+	 * In update case 'user_data' also includes prefix and suffix lengths (both of them may be = 0)
+	 * that comes right after 'xl_heap_update'
+	 */
+	bits8			t_bits[FLEXIBLE_ARRAY_MEMBER];
 } ChainRecordData;
 // t_bits follows
 
 typedef ChainRecordData* ChainRecord;
 
-#define SizeOfChainRecord offsetof(ChainRecordData, unchanged_record)
-
-#define getRmId(chain_record) ( (uint8)(chain_record)->xlog_record_header.xl_rmid )
-#define getRmIdentity(chain_record) ( (uint8)(chain_record)->xlog_record_header.xl_info & XLR_RMGR_INFO_MASK & XLOG_HEAP_OPMASK)
-#define getRecordTotalLen(chain_record) ( (uint32)(chain_record)->xlog_record_header.xl_tot_len )
-
-#define setRmId(chain_record, rm_id) ( (chain_record)->xlog_record_header.xl_rmid = rm_id)
-// XLOG_HEAP_OPMASK = 01110000   
-// зануляем биты отведенные на identity -> ~XLOG_HEAP_OPMASK = 10001111
-#define setRmIdentity(chain_record, rm_identity) \
-( \
-	(chain_record)->xlog_record_header.xl_info = \
-	(chain_record)->xlog_record_header.xl_info & \
-	XLR_RMGR_INFO_MASK & ~XLOG_HEAP_OPMASK | rm_identity \
-)
+#define SizeOfChainRecord offsetof(ChainRecordData, t_bits)
 
 /**********************************************************************
  * Chained wal records hash entry for hash table
@@ -116,8 +137,13 @@ typedef struct ChainRecordHashEntry
  * Global data
  **********************************************************************/
 static HTAB    				*hash_table;
-static WalDiffWriterState 	writer_state;
-
+WalDiffWriterState 			writer_state =
+{
+	.src_dir 	= NULL,
+	.dest_path 	= NULL,
+	.dest_dir 	= NULL,
+	.last_read_rec = 0
+};
 
 /**********************************************************************
  * Forward declarations
@@ -125,7 +151,6 @@ static WalDiffWriterState 	writer_state;
 static bool check_archive_directory(char **newval, void **extra, GucSource source);
 static void continuous_reading_wal_file(XLogReaderState *reader_state, 
 										XLogDumpPrivate *private);
-static bool create_wal_diff();
 static void overlay_update(ChainRecord old_tup, ChainRecord new_tup);
 static bool wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path);
 static bool wal_diff_configured(ArchiveModuleState *state);
@@ -153,7 +178,7 @@ _PG_init(void)
 	DefineCustomStringVariable("wal_diff.wal_diff_directory",
 							   gettext_noop("Archive WAL-diff destination directory."),
 							   NULL,
-							   writer_state.dest_dir,
+							   &(writer_state.dest_dir),
 							   "wal_diff_directory",
 							   PGC_SIGHUP,
 							   0,
@@ -287,7 +312,7 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 			errmsg("archiving file : %s", file));
 	
 	// probably there is better way than constantly checking if we know wal directory
-	if (strlen(writer_state.src_dir) == 0)
+	if (writer_state.src_dir == NULL || strlen(writer_state.src_dir) == 0)
 		getWalDirecotry(path, file);
 
 	writer_state.src_path = path;
@@ -344,7 +369,7 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 	XLogSegNoOffsetToRecPtr(segno + 1, 0, writer_state.wal_segment_size, private.endptr);
 
 	reader_state = 
-		XLogReaderAllocate(writer_state.wal_segment_size, &(writer_state.src_dir),
+		XLogReaderAllocate(writer_state.wal_segment_size, writer_state.src_dir,
 						   XL_ROUTINE(.page_read = WalReadPage,
 									  .segment_open = WalOpenSegment,
 									  .segment_close = WalCloseSegment),
@@ -399,15 +424,16 @@ continuous_reading_wal_file(XLogReaderState *reader_state,
 
 	XLogRecPtr 		seg_start;
 	XLogRecPtr		seg_end;
+	XLogRecPtr		last_read_rec = 0;
 
 	ChainRecordHashEntry* entry;
+
+	char* tmp_buffer = palloc0(BLCKSZ * 2);
+	char* xlog_rec_buffer = palloc0(XLogRecordMaxSize);
 
 	writer_state.src_curr_offset = writer_state.page_addr;
 	seg_start = reader_state->ReadRecPtr;
 	seg_end = reader_state->EndRecPtr;
-
-	char* tmp_buffer = palloc0(BLCKSZ * 2);
-	char* xlog_rec_buffer = palloc0(XLogRecordMaxSize);
 
 	for (;;)
 	{
@@ -420,7 +446,8 @@ continuous_reading_wal_file(XLogReaderState *reader_state,
 					errmsg("XLogReadRecord failed to read record: %s", errormsg));
         }
 
-		writer_state.last_read_rec = reader_state->record->lsn;
+		last_read_rec = reader_state->record->lsn;
+
 		writer_state.last_read_rec_len = reader_state->record->header.xl_tot_len;
 
 		if (XLogRecGetRmid(reader_state) == RM_HEAP_ID)
@@ -447,7 +474,7 @@ continuous_reading_wal_file(XLogReaderState *reader_state,
 					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
 					entry->data = chain_record;
 
-					continue;
+					break;
 
 				case XLOG_HEAP_UPDATE:
 					chain_record = fetch_update(reader_state);
@@ -458,7 +485,7 @@ continuous_reading_wal_file(XLogReaderState *reader_state,
 					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
 					if (is_found)
 					{
-						bool is_insert_chain = (getRmIdentity(entry->data) == XLOG_HEAP_INSERT);
+						bool is_insert_chain = ((entry->data->xlog_type) == XLOG_HEAP_INSERT);
 						overlay_update(entry->data, chain_record);
 
 						if (!is_insert_chain) 
@@ -476,7 +503,7 @@ continuous_reading_wal_file(XLogReaderState *reader_state,
 						entry->data = chain_record;	
 					}
 
-					continue;
+					break;
 
 				case XLOG_HEAP_HOT_UPDATE:
 					/*
@@ -506,7 +533,7 @@ continuous_reading_wal_file(XLogReaderState *reader_state,
 						entry->data = chain_record;
 					}
 
-					continue;
+					break;
 					
 				default:
 					ereport(LOG, 
@@ -514,10 +541,11 @@ continuous_reading_wal_file(XLogReaderState *reader_state,
 					continue;
 			}
 
-			// pls change to something like "copy_record_src2dest"
+			seg_start = reader_state->ReadRecPtr;
+			seg_end = reader_state->EndRecPtr;
 			if ((seg_start - writer_state.src_curr_offset) > 0) 
 			{
-				// ereport(LOG, errmsg("START : %ld\tEND : %ld, REC_LEN : %ld\tSIZE : %ld", global_offset, seg_start, MAXALIGN(reader_state->record->header.xl_tot_len), seg_start - global_offset));
+				ereport(LOG, errmsg("START : %ld\tEND : %ld, REC_LEN : %ld\tSIZE : %ld", writer_state.src_curr_offset, seg_start, MAXALIGN(reader_state->record->header.xl_tot_len), seg_start - writer_state.src_curr_offset));
 				copy_file_part(writer_state.src_path,
 								writer_state.dest_path,
 								writer_state.dest_fd,
@@ -528,8 +556,6 @@ continuous_reading_wal_file(XLogReaderState *reader_state,
 							   	&(writer_state.dest_curr_offset));
 			}
 
-			// it looks strange
-			// like you copy the rest whole wal file instead of the only one record
 			writer_state.src_curr_offset = seg_end;
 		}
 		else
@@ -541,25 +567,13 @@ continuous_reading_wal_file(XLogReaderState *reader_state,
 		}
 	}
 
-	if (create_wal_diff())
-	{
-		ereport(LOG, errmsg("created WAL-diff for file \"%s\"", writer_state.fname));
-		return true;
-	} 
-	else 
-	{
-		ereport(ERROR, errmsg("error while creating WAL-diff"));
-		return false;
-	}
-
-	// do we copy the rest of the wal or what ?
-	// ereport(LOG, errmsg("FINISH : GLOBAL OFFSET = %ld\tLAST READ = %ld\tLAST READ LSN : %X/%X", global_offset, last_read_rec, LSN_FORMAT_ARGS(last_read_rec)));
-	if (writer_state.last_read_rec - writer_state.src_curr_offset > 0)
+	ereport(LOG, errmsg("FINISH : GLOBAL OFFSET = %ld\tLAST READ = %ld\tLAST READ LSN : %X/%X", writer_state.src_curr_offset, last_read_rec, LSN_FORMAT_ARGS(last_read_rec)));
+	if (last_read_rec - writer_state.src_curr_offset > 0)
 	{
 		copy_file_part(writer_state.src_path,
 						writer_state.dest_path,
 						writer_state.dest_fd,
-						writer_state.last_read_rec - writer_state.src_curr_offset + writer_state.last_read_rec_len, 
+						last_read_rec - writer_state.src_curr_offset + writer_state.last_read_rec_len, 
 					   	writer_state.src_curr_offset - writer_state.page_addr, 
 					   	tmp_buffer, 
 					   	xlog_rec_buffer,
@@ -887,76 +901,6 @@ overlay_update(ChainRecord old_tup, ChainRecord new_tup)
 	
 }
 
-
-
-/*
- * create_wal_diff
- *
- * Creates one WAL-diff file.
- */
-static bool 
-create_wal_diff()
-{
-	ChainRecordHashEntry *entry;
-	ChainRecord chain_record;
-	HASH_SEQ_STATUS status;
-
-	hash_seq_init(&status, hash_table);
-	while ((entry = (ChainRecordHashEntry *)hash_seq_search(&status)) != NULL)
-	{
-		ChainRecord chain_record = entry->data;
-		// looks like wal insert function counts it by itself
-		// pg_crc32c crc;
-
-		// INIT_CRC32C(crc);
-		// COMP_CRC32C(crc, &(chain_record->xlog_record_header) + SizeOfXLogRecord, SizeOfXLogRecord - sizeof(pg_crc32c));
-		// FIN_CRC32C(crc);
-
-
-
-		switch (getRmIdentity(chain_record))
-		{
-			case XLOG_HEAP_INSERT:
-				xl_heap_insert xlrec;
-				xl_heap_header xlhdr;
-				XLogRecPtr	recptr;
-				// Page		page = BufferGetPage(buffer);
-				uint8		info = XLOG_HEAP_INSERT;
-				// int			bufflags = 0;
-				HeapTuple heaptup = chain_record->heap_tuple;
-				XLogRecPtr EndPos;
-
-				xlrec.offnum = ItemPointerGetOffsetNumber(&heaptup->t_self);
-				xlrec.flags = ; // here probaly we should add xl_heap_insert and others into chain_record type
-
-				xlhdr.t_infomask2 = heaptup->t_data->t_infomask2;
-				xlhdr.t_infomask = heaptup->t_data->t_infomask;
-				xlhdr.t_hoff = heaptup->t_data->t_hoff;
-
-
-				break;
-		
-			case XLOG_HEAP_UPDATE:
-
-				break;
-
-			case XLOG_HEAP_DELETE:
-
-				break;
-
-			default:
-				ereport(LOG, 
-						errmsg("unknown op code %u", getRmIdentity(chain_record)));
-				break;
-				
-		}
-
-	}
-	hash_seq_term(&status);
-
-	return true;
-}
-
 /*
  * wall_diff_shutdown
  *
@@ -965,10 +909,11 @@ create_wal_diff()
 static void 
 wal_diff_shutdown(ArchiveModuleState *state)
 {
+	ArchiveData *data = (ArchiveData *) state->private_data;
+
 	close(writer_state.src_fd);
 	close(writer_state.dest_fd);
 
-	ArchiveData *data = (ArchiveData *) state->private_data;
 	if (data == NULL)
 		return;
 	hash_destroy(hash_table);

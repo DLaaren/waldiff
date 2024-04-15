@@ -1,0 +1,11 @@
+2024-04-15 23:47:41.527 +07 postmaster[14636] LOG:  starting PostgreSQL 16.2 on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.2.0-4ubuntu3) 13.2.0, 64-bit
+2024-04-15 23:47:41.527 +07 postmaster[14636] LOG:  listening on Unix socket "/tmp/pg_regress-yVnNS9/.s.PGSQL.61698"
+2024-04-15 23:47:41.528 +07 startup[14641] LOG:  database system was shut down at 2024-04-15 23:47:41 +07
+2024-04-15 23:47:41.529 +07 postmaster[14636] LOG:  database system is ready to accept connections
+2024-04-15 23:47:42.583 +07 postmaster[14636] LOG:  received fast shutdown request
+2024-04-15 23:47:42.583 +07 postmaster[14636] LOG:  aborting any active transactions
+2024-04-15 23:47:42.584 +07 postmaster[14636] LOG:  background worker "logical replication launcher" (PID 14644) exited with exit code 1
+2024-04-15 23:47:42.584 +07 checkpointer[14639] LOG:  shutting down
+2024-04-15 23:47:42.584 +07 checkpointer[14639] LOG:  checkpoint starting: shutdown immediate
+2024-04-15 23:47:42.589 +07 checkpointer[14639] LOG:  checkpoint complete: wrote 928 buffers (5.7%); 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.001 s, total=0.006 s; sync files=0, longest=0.000 s, average=0.000 s; distance=4267 kB, estimate=4267 kB; lsn=0/1919308, redo lsn=0/1919308
+2024-04-15 23:47:42.593 +07 postmaster[14636] LOG:  database system is shut down
