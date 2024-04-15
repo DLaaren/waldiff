@@ -29,24 +29,31 @@
  * Neccessary info for writing wal-diff segment
  **********************************************************************/
 typedef struct WalDiffWriterState {
-	int src_fd;
-	int dest_fd;
-	char src_path[MAXPGPATH];
-	char src_dir[MAXPGPATH];
-	char src_fname[MAXPGPATH];
-	char dest_path[MAXPGPATH];
-	char *dest_dir;
-	char dest_fname[MAXPGPATH];
+	int 		src_fd;
+	int 		dest_fd;
 
-	int wal_segment_size;
+	// decided to store it all as pointers otherwise it requires kinda a lot of memory -> 1024*6
+	char 		*src_path;
+	char 		*src_dir;
+	char 		*dest_path;
+	char 		*dest_dir;
+	char 		*fname;
 
-	XLogRecPtr prev_record;
+	int 		wal_segment_size;
 
-	uint64 sys_id;
-	XLogRecPtr page_addr;
-	TimeLineID tli;
+	uint64 		sys_id;
+	XLogRecPtr  page_addr;
+	TimeLineID  tli;
 
-	size_t curr_wal_segment_size;
+	uint64 		src_curr_offset;
+	uint64		dest_curr_offset;
+
+	XLogRecPtr	last_read_rec;
+	Size		last_read_rec_len;
+
+	XLogRecPtr	last_written_rec;
+	Size		last_written_rec_len;
+
 } WalDiffWriterState;
 
 typedef struct XLogDumpPrivate
@@ -160,20 +167,26 @@ WalCloseSegment(XLogReaderState *state)
 	state->seg.ws_file = -1;
 }
 
+/*
+ * Extracts wal directory name from full path and stores it in writer_state
+ */
 void
 getWalDirecotry(const char *path, const char *file)
 {
+	char wal_dir[MAXPGPATH];
+
 	if (strlen(path) > MAXPGPATH)
 		ereport(ERROR,
 				errmsg("WAL file absolute name is too long : %s", path));
 
-	if (snprintf(wal_diff_writer_state.src_dir, strlen(path), "%s", path) == -1)
-		ereport(ERROR,
-				errmsg("error during reading WAL directory path : %s", path));
+	snprintf(wal_dir, "%s", path);
 
-	MemSet(&(wal_diff_writer_state.src_dir) + (strlen(path) - strlen(file) - 1), 0, strlen(file));
+	MemSet(wal_dir + (strlen(path) - strlen(file) - 1), 0, strlen(file));
 	ereport(LOG, 
-			errmsg("wal directory is : %s", wal_diff_writer_state.src_dir));
+			errmsg("wal directory is : %s", wal_dir));
+
+	writer_state.src_dir = palloc0(strlen(wal_dir) + 1);
+	snprintf(writer_state.src_dir, "%s", wal_dir);
 }
 
 /*
@@ -262,9 +275,9 @@ read_one_xlog_rec(int src_fd, const char* src_file_name,
 					break;
 
 				long_hdr  = (XLogLongPageHeader) tmp_buff;
-				wal_diff_writer_state.sys_id 	  = long_hdr->xlp_sysid;
-				wal_diff_writer_state.page_addr = hdr->xlp_pageaddr;
-				wal_diff_writer_state.tli 	  = hdr->xlp_tli;
+				writer_state.sys_id 	  = long_hdr->xlp_sysid;
+				writer_state.page_addr = hdr->xlp_pageaddr;
+				writer_state.tli 	  = hdr->xlp_tli;
 				
 				read_in_total += nbytes;
 			}
@@ -381,16 +394,16 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 			{
 				XLogLongPageHeaderData long_hdr;
 
-				long_hdr.xlp_sysid 		  = wal_diff_writer_state.sys_id;
-				long_hdr.xlp_seg_size	  = wal_diff_writer_state.wal_segment_size;
+				long_hdr.xlp_sysid 		  = writer_state.sys_id;
+				long_hdr.xlp_seg_size	  = writer_state.wal_segment_size;
 				long_hdr.xlp_xlog_blcksz  = XLOG_BLCKSZ;
 
 				long_hdr.std.xlp_info 	  = 0;
 				long_hdr.std.xlp_info 	  |= XLP_LONG_HEADER;
-				long_hdr.std.xlp_tli 	  = wal_diff_writer_state.tli;
+				long_hdr.std.xlp_tli 	  = writer_state.tli;
 				long_hdr.std.xlp_rem_len  = 0;
 				long_hdr.std.xlp_magic 	  = XLOG_PAGE_MAGIC;
-				long_hdr.std.xlp_pageaddr = wal_diff_writer_state.page_addr;
+				long_hdr.std.xlp_pageaddr = writer_state.page_addr;
 
 				ereport(LOG, errmsg("LONG HDR. ADDR : %ld", long_hdr.std.xlp_pageaddr));
 
@@ -407,9 +420,9 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 					hdr.xlp_info |= XLP_FIRST_IS_CONTRECORD;
 				hdr.xlp_rem_len = rem_data_len;
 				
-				hdr.xlp_tli 	 = wal_diff_writer_state.tli;
+				hdr.xlp_tli 	 = writer_state.tli;
 				hdr.xlp_magic 	 = XLOG_PAGE_MAGIC;
-				hdr.xlp_pageaddr = wal_diff_writer_state.page_addr + *file_offset;
+				hdr.xlp_pageaddr = writer_state.page_addr + *file_offset;
 
 				nbytes = write_buff2file(dst_fd, (char*) &hdr, SizeOfXLogShortPHD, 0);
 				*file_offset += nbytes;
@@ -443,8 +456,8 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 		}
 
 		record = (XLogRecord*) xlog_rec_buffer;
-		record->xl_prev = wal_diff_writer_state.prev_record + wal_diff_writer_state.page_addr;
-		wal_diff_writer_state.prev_record = *file_offset;
+		record->xl_prev = writer_state.last_read_rec + writer_state.page_addr;
+		writer_state.last_read_rec = *file_offset;
 
 		INIT_CRC32C(crc);
 		COMP_CRC32C(crc, ((char *) record) + SizeOfXLogRecord, record->xl_tot_len - SizeOfXLogRecord);

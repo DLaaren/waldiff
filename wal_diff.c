@@ -43,6 +43,9 @@ typedef struct ArchiveData
 /**********************************************************************
  * Chained wal records for constructing one wal-diff
  **********************************************************************/
+
+// пока, наверное, оставим так, вся инфа есть внутри heap_tuple, если нужно что-то достать
+
 typedef struct ChainRecordData
 {
 	// it's needed for hash_key
@@ -50,18 +53,32 @@ typedef struct ChainRecordData
 	ItemPointerData current_t_ctid;
 	ItemPointerData old_t_ctid;
 
-	// here are rm_id and rm_identity = info & ~XLR_INFO_MASK and record_total_len
+	// here is all-all data about a record
 	XLogRecord xlog_record_header;
 
 	HeapTuple heap_tuple;
 
-	char record[XLogRecordMaxSize]; // unchanged record
-
+	bits8 unchanged_record[FLEXIBLE_ARRAY_MEMBER];
 } ChainRecordData;
+// unchanged record data follows
+
 typedef ChainRecordData* ChainRecord;
 
-#define SizeOfChainRecord (SizeOfXLogRecord + sizeof(RelFileLocator) + 2 * sizeof(ItemPointerData) + HEAPTUPLESIZE + XLogRecordMaxSize)
+#define SizeOfChainRecord offsetof(ChainRecordData, unchanged_record)
 
+#define getRmId(chain_record) ( (uint8)(chain_record)->xlog_record_header.xl_rmid )
+#define getRmIdentity(chain_record) ( (uint8)(chain_record)->xlog_record_header.xl_info & XLR_RMGR_INFO_MASK & XLOG_HEAP_OPMASK)
+#define getRecordTotalLen(chain_record) ( (uint32)(chain_record)->xlog_record_header.xl_tot_len )
+
+#define setRmId(chain_record, rm_id) ( (chain_record)->xlog_record_header.xl_rmid = rm_id)
+// XLOG_HEAP_OPMASK = 01110000   
+// зануляем биты отведенные на identity -> ~XLOG_HEAP_OPMASK = 10001111
+#define setRmIdentity(chain_record, rm_identity) \
+( \
+	(chain_record)->xlog_record_header.xl_info = \
+	(chain_record)->xlog_record_header.xl_info & \
+	XLR_RMGR_INFO_MASK & ~XLOG_HEAP_OPMASK | rm_identity \
+)
 
 /**********************************************************************
  * Chained wal records hash entry for hash table
@@ -83,7 +100,6 @@ typedef struct ChainRecordHashEntry
 			   (record)->current_t_ctid.ip_posid) \
 )
 
-
 // Use this to find previous chain record 
 // (in case of delete/udate) in hashmap
 #define GetHashKeyOfPrevChainRecord(record) \
@@ -101,18 +117,15 @@ typedef struct ChainRecordHashEntry
  * Global data
  **********************************************************************/
 static HTAB    				*hash_table;
-static WalDiffWriterState 	wal_diff_writer_state;
+static WalDiffWriterState 	writer_state;
 
 
 /**********************************************************************
  * Forward declarations
  **********************************************************************/
 static bool check_archive_directory(char **newval, void **extra, GucSource source);
-static void continuous_reading_wal_file(XLogReaderState *xlogreader_state, 
-										XLogDumpPrivate *private, 
-										const char* orig_wal_file_name, 
-										const char* wal_diff_file_name,
-										XLogRecPtr initial_file_offset);
+static void continuous_reading_wal_file(XLogReaderState *reader_state, 
+										XLogDumpPrivate *private);
 static bool create_wal_diff();
 static void overlay_update(ChainRecord old_tup, ChainRecord new_tup);
 static bool wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path);
@@ -141,7 +154,7 @@ _PG_init(void)
 	DefineCustomStringVariable("wal_diff.wal_diff_directory",
 							   gettext_noop("Archive WAL-diff destination directory."),
 							   NULL,
-							   wal_diff_writer_state.dest_dir,
+							   writer_state.dest_dir,
 							   "wal_diff_directory",
 							   PGC_SIGHUP,
 							   0,
@@ -242,8 +255,8 @@ check_archive_directory(char **newval, void **extra, GucSource source)
 static bool 
 wal_diff_configured(ArchiveModuleState *state)
 {
-    return  wal_diff_writer_state.dest_dir != NULL && 
-			wal_diff_writer_state.dest_dir[0] != '\0';
+    return  writer_state.dest_dir != NULL && 
+			writer_state.dest_dir[0] != '\0';
 }
 
 /*
@@ -263,43 +276,54 @@ wal_diff_configured(ArchiveModuleState *state)
 static bool
 wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 {
-	int 				fd = -1;
 	PGAlignedXLogBlock 	buff; // local variable, holding a page buffer
     int 				read_count;
     XLogDumpPrivate 	private;
 	XLogPageHeader 		page_hdr;
 	XLogSegNo 			segno;
 	XLogRecPtr 			first_record;
-	XLogRecPtr			page_addr;
-	XLogReaderState 	*xlogreader_state;
-	char				wal_diff_file[MAXPGPATH];
+	XLogReaderState 	*reader_state;
 
 	ereport(LOG, 
 			errmsg("archiving file : %s", file));
-
-	if (strlen(wal_diff_writer_state.src_dir) == 0)
+	
+	// probably there is better way than constantly checking if we know wal directory
+	if (strlen(writer_state.src_dir) == 0)
 		getWalDirecotry(path, file);
 
-	sprintf(wal_diff_writer_state.dest_fname, "%s/%s", wal_diff_writer_state.src_dir, file);
+	writer_state.src_path = path;
+	writer_state.fname = file;
 
-	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
-	if (fd < 0)
+	{
+		char wal_diff_path[MAXPGPATH];
+		sprintf(wal_diff_path, "%s/%s", writer_state.dest_dir, file);
+
+		writer_state.dest_path = palloc0(strlen(wal_diff_path) + 1);
+		sprintf(writer_state.dest_path, "%s", wal_diff_path);
+	}
+
+	writer_state.dest_fd = OpenTransientFile(writer_state.dest_path, O_RDWR | O_CREAT | O_APPEND | PG_BINARY);
+	if (writer_state.dest_fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				errmsg("could not open file \"%s\": %m", writer_state.dest_path)));
+
+	writer_state.src_fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (writer_state.src_fd < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				errmsg("could not open file \"%s\": %m", path)));
 
-	read_count = read(fd, buff.data, XLOG_BLCKSZ);
-
-	CloseTransientFile(fd);
+	read_count = read(writer_state.src_fd, buff.data, XLOG_BLCKSZ);
 
     if (read_count == XLOG_BLCKSZ) {
         XLogLongPageHeader longhdr = (XLogLongPageHeader) buff.data;
-        wal_diff_writer_state.wal_segment_size = longhdr->xlp_seg_size;
-        if (!IsValidWalSegSize(wal_diff_writer_state.wal_segment_size)) {
+        writer_state.wal_segment_size = longhdr->xlp_seg_size;
+        if (!IsValidWalSegSize(writer_state.wal_segment_size)) {
             ereport(ERROR, 
-					errmsg("Invalid wal segment size : %d\n", wal_diff_writer_state.wal_segment_size));
+					errmsg("Invalid wal segment size : %d\n", writer_state.wal_segment_size));
         }
-		page_addr = longhdr->std.xlp_pageaddr;
+		writer_state.page_addr = longhdr->std.xlp_pageaddr;
     }
 	else if (read_count < 0) {
 		ereport(ERROR,
@@ -316,25 +340,25 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
 	private.endptr = InvalidXLogRecPtr;
 	private.endptr_reached = false;
 
-	XLogFromFileName(file, &private.timeline, &segno, wal_diff_writer_state.wal_segment_size);
-    XLogSegNoOffsetToRecPtr(segno, 0, wal_diff_writer_state.wal_segment_size, private.startptr);
-	XLogSegNoOffsetToRecPtr(segno + 1, 0, wal_diff_writer_state.wal_segment_size, private.endptr);
+	XLogFromFileName(file, &private.timeline, &segno, writer_state.wal_segment_size);
+    XLogSegNoOffsetToRecPtr(segno, 0, writer_state.wal_segment_size, private.startptr);
+	XLogSegNoOffsetToRecPtr(segno + 1, 0, writer_state.wal_segment_size, private.endptr);
 
-	xlogreader_state = 
-		XLogReaderAllocate(wal_diff_writer_state.wal_segment_size, &(wal_diff_writer_state.src_dir),
-							XL_ROUTINE(.page_read = WalReadPage,
-									   .segment_open = WalOpenSegment,
-									   .segment_close = WalCloseSegment),
-							&private);
+	reader_state = 
+		XLogReaderAllocate(writer_state.wal_segment_size, &(writer_state.src_dir),
+						   XL_ROUTINE(.page_read = WalReadPage,
+									  .segment_open = WalOpenSegment,
+									  .segment_close = WalCloseSegment),
+						   &private);
 
-	if (!xlogreader_state) 
+	if (!reader_state) 
 	{
 		ereport(FATAL, 
 				errmsg("out of memory while allocating a WAL reading processor"));
 		return false;
 	}
 
-	first_record = XLogFindNextRecord(xlogreader_state, private.startptr);
+	first_record = XLogFindNextRecord(reader_state, private.startptr);
 
 	if (first_record == InvalidXLogRecPtr)
 	{
@@ -344,37 +368,32 @@ wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path)
         return false;
     }
 
-	page_hdr = (XLogPageHeader) xlogreader_state->readBuf;
+	page_hdr = (XLogPageHeader) reader_state->readBuf;
 
-	/*
-	 * This cases we should consider later 
-	 */
+	// This cases we should consider later 
 	if (page_hdr->xlp_rem_len)
     	ereport(LOG, 
 				errmsg("got some remaining data from a previous page : %d", page_hdr->xlp_rem_len));
 
 	if (first_record != private.startptr && 
-		XLogSegmentOffset(private.startptr, wal_diff_writer_state.wal_segment_size) != 0)
+		XLogSegmentOffset(private.startptr, writer_state.wal_segment_size) != 0)
 		ereport(LOG, 
 				errmsg("skipping over %u bytes", (uint32) (first_record - private.startptr)));
 
-	continuous_reading_wal_file(xlogreader_state, &private, path, wal_diff_file, page_addr);
+	continuous_reading_wal_file(reader_state, &private);
 
-	ereport(LOG, errmsg("Wal Diff Created"));
+	ereport(LOG, errmsg("wal-diff created for file %s", file));
 
 	return true;
 }
 
 static void 
-continuous_reading_wal_file(XLogReaderState *xlogreader_state, 
-							XLogDumpPrivate *private, 
-							const char* orig_wal_file_name, 
-							const char* wal_diff_file_name,
-							XLogRecPtr initial_file_offset)
+continuous_reading_wal_file(XLogReaderState *reader_state, 
+							XLogDumpPrivate *private)
 {
 	char 			*errormsg;
 	XLogRecord 		*record;
-	uint8 			info_bits;
+	uint8 			rm_identity;
 	ChainRecord 	chain_record;
 	bool 			is_found;
 	uint32_t 		hash_key;
@@ -382,28 +401,18 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 	XLogRecPtr 		seg_start;
 	XLogRecPtr		seg_end;
 
-	XLogRecPtr		last_read_rec = 0;
-	Size			last_read_rec_len = 0;
-
-	uint64			global_offset = initial_file_offset;
-	XLogRecPtr		wal_diff_file_offset = 0;
-
 	ChainRecordHashEntry* entry;
 
-	int dst_fd;
+	writer_state.src_curr_offset = writer_state.page_addr;
+	seg_start = reader_state->ReadRecPtr;
+	seg_end = reader_state->EndRecPtr;
 
 	char* tmp_buffer = palloc0(BLCKSZ * 2);
 	char* xlog_rec_buffer = palloc0(XLogRecordMaxSize);
 
-	dst_fd = OpenTransientFile(wal_diff_file_name, O_RDWR | O_CREAT | O_APPEND | PG_BINARY);
-	if (dst_fd < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not create file \"%s\": %m", wal_diff_file_name)));
-
 	for (;;)
 	{
-		record = XLogReadRecord(xlogreader_state, &errormsg);
+		record = XLogReadRecord(reader_state, &errormsg);
 
 		if (record == InvalidXLogRecPtr) {
 			if (private->endptr_reached)
@@ -412,20 +421,20 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 					errmsg("XLogReadRecord failed to read record: %s", errormsg));
         }
 
-		last_read_rec = xlogreader_state->record->lsn;
-		last_read_rec_len = xlogreader_state->record->header.xl_tot_len;
+		writer_state.last_read_rec = reader_state->record->lsn;
+		writer_state.last_read_rec_len = reader_state->record->header.xl_tot_len;
 
-		if (XLogRecGetRmid(xlogreader_state) == RM_HEAP_ID)
+		if (XLogRecGetRmid(reader_state) == RM_HEAP_ID)
 		{
-			if (XLogRecHasBlockImage(xlogreader_state, 0))
+			if (XLogRecHasBlockImage(reader_state, 0))
 				continue;
 
-			info_bits = XLogRecGetInfo(xlogreader_state) & ~XLR_INFO_MASK;
+			rm_identity = XLogRecGetInfo(reader_state) & XLR_RMGR_INFO_MASK & XLOG_HEAP_OPMASK;
 
-			switch (info_bits & XLOG_HEAP_OPMASK)
+			switch (rm_identity)
 			{
 				case XLOG_HEAP_INSERT:
-					chain_record = fetch_insert(xlogreader_state);
+					chain_record = fetch_insert(reader_state);
 					if (!chain_record)
 						continue;
 
@@ -439,10 +448,10 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
 					entry->data = chain_record;
 
-					break;
+					continue;
 
 				case XLOG_HEAP_UPDATE:
-					chain_record = fetch_update(xlogreader_state);
+					chain_record = fetch_update(reader_state);
 					if (!chain_record)
 						continue;
 
@@ -450,7 +459,7 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 					entry = (ChainRecordHashEntry*) hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
 					if (is_found)
 					{
-						bool is_insert_chain = (entry->data->xlog_type == XLOG_HEAP_INSERT);
+						bool is_insert_chain = (getRmIdentity(entry->data) == XLOG_HEAP_INSERT);
 						overlay_update(entry->data, chain_record);
 
 						if (!is_insert_chain) 
@@ -468,7 +477,7 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 						entry->data = chain_record;	
 					}
 
-					break;
+					continue;
 
 				case XLOG_HEAP_HOT_UPDATE:
 					/*
@@ -479,7 +488,7 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 					continue;
 
 				case XLOG_HEAP_DELETE:
-					chain_record = fetch_delete(xlogreader_state);
+					chain_record = fetch_delete(reader_state);
 					if (!chain_record)
 						continue;
 
@@ -498,29 +507,31 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 						entry->data = chain_record;
 					}
 
-					break;
+					continue;
 					
 				default:
 					ereport(LOG, 
-							errmsg("unknown op code %u", info_bits));
+							errmsg("unknown op code %u", rm_identity));
 					continue;
 			}
 
-			seg_start = xlogreader_state->ReadRecPtr;
-			seg_end = xlogreader_state->EndRecPtr;
-
-			if ((seg_start - global_offset) > 0) 
+			// pls change to something like "copy_record_src2dest"
+			if ((seg_start - writer_state.src_curr_offset) > 0) 
 			{
-				// ereport(LOG, errmsg("START : %ld\tEND : %ld, REC_LEN : %ld\tSIZE : %ld", global_offset, seg_start, MAXALIGN(xlogreader_state->record->header.xl_tot_len), seg_start - global_offset));
-				copy_file_part(orig_wal_file_name, wal_diff_file_name, dst_fd, 
-							seg_start - global_offset, 
-							global_offset - initial_file_offset, 
-							tmp_buffer, 
-							xlog_rec_buffer,
-							&wal_diff_file_offset);
+				// ereport(LOG, errmsg("START : %ld\tEND : %ld, REC_LEN : %ld\tSIZE : %ld", global_offset, seg_start, MAXALIGN(reader_state->record->header.xl_tot_len), seg_start - global_offset));
+				copy_file_part(writer_state.src_path,
+								writer_state.dest_path,
+								writer_state.dest_fd,
+								seg_start - writer_state.src_curr_offset, 
+							   	writer_state.src_curr_offset - writer_state.page_addr, 
+							   	tmp_buffer, 
+							   	xlog_rec_buffer,
+							   	&(writer_state.dest_curr_offset));
 			}
 
-			global_offset = seg_end;
+			// it looks strange
+			// like you copy the rest whole wal file instead of the only one record
+			writer_state.src_curr_offset = seg_end;
 		}
 		else
 		{
@@ -533,7 +544,7 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 
 	if (create_wal_diff())
 	{
-		ereport(LOG, errmsg("created WAL-diff for file \"%s\"", orig_wal_file_name));
+		ereport(LOG, errmsg("created WAL-diff for file \"%s\"", writer_state.fname));
 		return true;
 	} 
 	else 
@@ -542,18 +553,20 @@ continuous_reading_wal_file(XLogReaderState *xlogreader_state,
 		return false;
 	}
 
+	// do we copy the rest of the wal or what ?
 	// ereport(LOG, errmsg("FINISH : GLOBAL OFFSET = %ld\tLAST READ = %ld\tLAST READ LSN : %X/%X", global_offset, last_read_rec, LSN_FORMAT_ARGS(last_read_rec)));
-	if (last_read_rec - global_offset > 0)
+	if (writer_state.last_read_rec - writer_state.src_curr_offset > 0)
 	{
-		copy_file_part(orig_wal_file_name, wal_diff_file_name, dst_fd, 
-					   last_read_rec - global_offset + last_read_rec_len, 
-					   global_offset - initial_file_offset, 
-					   tmp_buffer, 
-					   xlog_rec_buffer,
-					   &wal_diff_file_offset);
+		copy_file_part(writer_state.src_path,
+						writer_state.dest_path,
+						writer_state.dest_fd,
+						writer_state.last_read_rec - writer_state.src_curr_offset + writer_state.last_read_rec_len, 
+					   	writer_state.src_curr_offset - writer_state.page_addr, 
+					   	tmp_buffer, 
+					   	xlog_rec_buffer,
+					   	&(writer_state.dest_curr_offset));
 	}
 
-	CloseTransientFile(dst_fd);
 	pfree(tmp_buffer);
 	pfree(xlog_rec_buffer);
 }
@@ -999,6 +1012,9 @@ create_wal_diff()
 static void 
 wal_diff_shutdown(ArchiveModuleState *state)
 {
+	close(writer_state.src_fd);
+	close(writer_state.dest_fd);
+
 	ArchiveData *data = (ArchiveData *) state->private_data;
 	if (data == NULL)
 		return;
