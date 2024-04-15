@@ -9,8 +9,7 @@ waldiff_rmgr_redo(XLogReaderState *record)
 {
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
-	if (info != XLOG_TEST_CUSTOM_RMGRS_MESSAGE)
-		elog(PANIC, "testcustomrmgrs_redo: unknown op code %u", info);
+	XLogRecord main_data = record->record->header;
 }
 
 /*

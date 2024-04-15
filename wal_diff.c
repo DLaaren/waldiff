@@ -92,7 +92,7 @@ typedef struct ChainRecordData
 	/*
 	 * Size of [bitmap] + [padding] + appropriate header + [prefix length] + [suffix length] + user_data.
 	 */
-	uint16 			data_len;
+	uint32 			data_len;
 
 	/*
 	 * Here comes [bitmap] + [padding] and then appropriate header + user_data.
@@ -155,9 +155,9 @@ WalDiffWriterState 			writer_state = {
 /**********************************************************************
  * Forward declarations
  **********************************************************************/
+static bool create_wal_diff(char* xlog_rec_buffer);
 static bool check_archive_directory(char **newval, void **extra, GucSource source);
-static void continuous_reading_wal_file(XLogReaderState *reader_state, 
-										XLogDumpPrivate *private);
+static void continuous_reading_wal_file(XLogReaderState *reader_state, XLogDumpPrivate *private);
 static void overlay_update(ChainRecord old_tup, ChainRecord new_tup);
 static bool wal_diff_archive(ArchiveModuleState *state, const char *file, const char *path);
 static bool wal_diff_configured(ArchiveModuleState *state);
@@ -580,6 +580,10 @@ continuous_reading_wal_file(XLogReaderState *reader_state,
 					   tmp_buffer, 
 					   xlog_rec_buffer);
 	}
+	if (create_wal_diff(xlog_rec_buffer))
+		ereport(LOG, errmsg("add all chain records to wal diff file \"%s\"", writer_state.fname));
+	else 
+		ereport(ERROR, errmsg("error while creating WAL-diff"));
 
 	pfree(tmp_buffer);
 	pfree(xlog_rec_buffer);
@@ -656,8 +660,6 @@ fetch_insert(XLogReaderState *record)
 	Assert(!(fetched_record->t_infomask & HEAP_MOVED));
 	fetched_record->t_cid = FirstCommandId;
 	fetched_record->t_infomask &= ~HEAP_COMBOCID;
-
-	
 
 	return fetched_record;
 }
@@ -764,7 +766,6 @@ fetch_update(XLogReaderState *record)
 
 	fetched_record->data_len = SizeOfHeapUpdate + (sizeof(uint16) * 2) + tuplen;
 	fetched_record->t_hoff = SizeOfChainRecord + bitmap_len + SizeOfHeapUpdate + (sizeof(uint16) * 2);
-
 	return fetched_record;
 }
 
@@ -792,7 +793,6 @@ fetch_delete(XLogReaderState *record)
     ItemPointerSetOffsetNumber(&(fetched_record->old_t_ctid), xlrec->offnum);
 
 	memcpy((char*) fetched_record + SizeOfChainRecord, (char*) xlrec, SizeOfHeapDelete);
-
 	return fetched_record;
 }
 
@@ -900,6 +900,64 @@ overlay_update(ChainRecord old_tup, ChainRecord new_tup)
 			   tuplen);		
 	}
 	
+}
+
+/*
+ * create_wal_diff
+ *
+ * Creates one WAL-diff file.
+ */
+static bool 
+create_wal_diff(char* xlog_rec_buffer)
+{
+	ChainRecordHashEntry *entry;
+	HASH_SEQ_STATUS status;
+
+	hash_seq_init(&status, hash_table);
+	while ((entry = (ChainRecordHashEntry *)hash_seq_search(&status)) != NULL)
+	{
+		ChainRecord chain_record = entry->data;
+		XLogRecord record;
+		XLogRecordDataHeaderShort short_hdr;
+		XLogRecordDataHeaderLong long_hdr;
+		int offset = 0;
+
+		record.xl_tot_len = SizeOfXLogRecord + chain_record->data_len;
+		record.xl_xid = chain_record->t_xmin; // TODO что тут нужно то?
+		record.xl_rmid = RM_EXPERIMENTAL_ID;
+
+		if (chain_record->data_len < 256)
+		{
+			short_hdr.id = XLR_BLOCK_ID_DATA_SHORT;
+			short_hdr.data_length = chain_record->data_len;
+			record.xl_tot_len += SizeOfXLogRecordDataHeaderShort;
+
+			memcpy(xlog_rec_buffer, (char*) &record, SizeOfXLogRecord);
+			offset = SizeOfXLogRecord;
+
+			memcpy((char*) xlog_rec_buffer + offset, (char*) &short_hdr, SizeOfXLogRecordDataHeaderShort);
+			offset += SizeOfXLogRecordDataHeaderShort;
+		}
+		else
+		{
+			long_hdr.id = XLR_BLOCK_ID_DATA_LONG;
+			record.xl_tot_len += SizeOfXLogRecordDataHeaderLong;
+
+			memcpy(xlog_rec_buffer, (char*) &record, SizeOfXLogRecord);
+			offset = SizeOfXLogRecord;
+
+			memcpy((char*) xlog_rec_buffer + offset, (char*) &long_hdr, sizeof(uint8));
+			memcpy((char*) xlog_rec_buffer + offset + sizeof(uint8), (char*) &(chain_record->data_len), sizeof(uint32));
+			offset += SizeOfXLogRecordDataHeaderLong;
+		}
+
+		memcpy((char*) xlog_rec_buffer + offset, (char*) chain_record->t_bits, chain_record->data_len);
+
+		write_one_xlog_rec(writer_state.dest_fd, writer_state.dest_path, xlog_rec_buffer);
+	}
+	// hash_seq_term(&status);
+
+	return true;
 }
 
 /*
