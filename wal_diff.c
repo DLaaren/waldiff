@@ -53,14 +53,15 @@ typedef struct ChainRecordData
 	ItemPointerData current_t_ctid;
 	ItemPointerData old_t_ctid;
 
+	char *unchanged_record;
+	
 	// here is all-all data about a record
 	XLogRecord xlog_record_header;
 
+	// contains t_bits
 	HeapTuple heap_tuple;
-
-	bits8 unchanged_record[FLEXIBLE_ARRAY_MEMBER];
 } ChainRecordData;
-// unchanged record data follows
+// t_bits follows
 
 typedef ChainRecordData* ChainRecord;
 
