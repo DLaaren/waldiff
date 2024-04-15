@@ -26,6 +26,7 @@ $node->append_conf(
         archive_mode = 'on'
         archive_library = 'wal_diff'
         wal_diff.wal_diff_directory = 'wal_diff'
+        shared_preload_libraries = 'wal_diff'
     }
 );
 

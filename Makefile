@@ -3,7 +3,8 @@
 MODULE_big = wal_diff
 OBJS = \
 	wal_diff.o \
-	wal_diff_func.o
+	wal_diff_func.o \
+	wal_diff_rmgr.o
 
 PGFILEDESC = "wal_diff - archive module with compressing"
 

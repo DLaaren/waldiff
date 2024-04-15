@@ -24,7 +24,9 @@
 #include "utils/memutils.h"
 #include "utils/hsearch.h"
 #include "utils/wait_event.h"
+
 #include "wal_diff_func.h"
+#include "wal_diff_rmgr.h"
 
 #define INITIAL_HASHTABLE_SIZE 100 // TODO: find the optimum value
 
@@ -39,7 +41,12 @@ typedef struct ArchiveData
 	MemoryContext context;
 } ArchiveData;
 
-
+RmgrData waldiff_rmgr = {
+	.rm_name = WALDIFF_RM_NAME,
+	.rm_redo = waldiff_rmgr_redo,
+	.rm_desc = waldiff_rmgr_desc,
+	.rm_identify = waldiff_rmgr_identify
+};
 /**********************************************************************
  * Chained wal records for constructing one wal-diff
  **********************************************************************/
@@ -137,8 +144,8 @@ typedef struct ChainRecordHashEntry
  * Global data
  **********************************************************************/
 static HTAB    				*hash_table;
-WalDiffWriterState 			writer_state =
-{
+
+WalDiffWriterState 			writer_state = {
 	.src_dir 	= NULL,
 	.dest_path 	= NULL,
 	.dest_dir 	= NULL,
@@ -174,7 +181,9 @@ static ChainRecord fetch_delete(XLogReaderState *record);
  */
 void
 _PG_init(void)
-{							   
+{
+	RegisterCustomRmgr(WALDIFF_RM_ID, &waldiff_rmgr);
+	   
 	DefineCustomStringVariable("wal_diff.wal_diff_directory",
 							   gettext_noop("Archive WAL-diff destination directory."),
 							   NULL,
@@ -545,15 +554,11 @@ continuous_reading_wal_file(XLogReaderState *reader_state,
 			seg_end = reader_state->EndRecPtr;
 			if ((seg_start - writer_state.src_curr_offset) > 0) 
 			{
-				ereport(LOG, errmsg("START : %ld\tEND : %ld, REC_LEN : %ld\tSIZE : %ld", writer_state.src_curr_offset, seg_start, MAXALIGN(reader_state->record->header.xl_tot_len), seg_start - writer_state.src_curr_offset));
-				copy_file_part(writer_state.src_path,
-								writer_state.dest_path,
-								writer_state.dest_fd,
-								seg_start - writer_state.src_curr_offset, 
-							   	writer_state.src_curr_offset - writer_state.page_addr, 
-							   	tmp_buffer, 
-							   	xlog_rec_buffer,
-							   	&(writer_state.dest_curr_offset));
+				// ereport(LOG, errmsg("START : %ld\tEND : %ld, REC_LEN : %ld\tSIZE : %ld", writer_state.src_curr_offset, seg_start, MAXALIGN(reader_state->record->header.xl_tot_len), seg_start - writer_state.src_curr_offset));
+				copy_file_part(seg_start - writer_state.src_curr_offset, 
+							   writer_state.src_curr_offset - writer_state.page_addr, 
+							   tmp_buffer, 
+							   xlog_rec_buffer);
 			}
 
 			writer_state.src_curr_offset = seg_end;
@@ -567,17 +572,13 @@ continuous_reading_wal_file(XLogReaderState *reader_state,
 		}
 	}
 
-	ereport(LOG, errmsg("FINISH : GLOBAL OFFSET = %ld\tLAST READ = %ld\tLAST READ LSN : %X/%X", writer_state.src_curr_offset, last_read_rec, LSN_FORMAT_ARGS(last_read_rec)));
+	// ereport(LOG, errmsg("FINISH : GLOBAL OFFSET = %ld\tLAST READ = %ld\tLAST READ LSN : %X/%X", writer_state.src_curr_offset, last_read_rec, LSN_FORMAT_ARGS(last_read_rec)));
 	if (last_read_rec - writer_state.src_curr_offset > 0)
 	{
-		copy_file_part(writer_state.src_path,
-						writer_state.dest_path,
-						writer_state.dest_fd,
-						last_read_rec - writer_state.src_curr_offset + writer_state.last_read_rec_len, 
-					   	writer_state.src_curr_offset - writer_state.page_addr, 
-					   	tmp_buffer, 
-					   	xlog_rec_buffer,
-					   	&(writer_state.dest_curr_offset));
+		copy_file_part(last_read_rec - writer_state.src_curr_offset + writer_state.last_read_rec_len, 
+					   writer_state.src_curr_offset - writer_state.page_addr, 
+					   tmp_buffer, 
+					   xlog_rec_buffer);
 	}
 
 	pfree(tmp_buffer);

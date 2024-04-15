@@ -72,12 +72,10 @@ typedef struct XLogDumpPrivate
  * to wal_diff segment (except those that we worked with)
  **********************************************************************/
 
-extern void 		copy_file_part(const char* src, const char* dst_name, int dstfd, uint64 size, uint64 src_offset, 
-								   char* tmp_buffer, char* xlog_rec_buffer, XLogRecPtr* file_offset);
-extern int			read_one_xlog_rec(int src_fd, const char* src_file_name, 
-									  char* xlog_rec_buffer, char* tmp_buff, 
-									  uint64 read_left, bool* read_only_header);
-extern void			write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer, uint64* file_offset);
+extern void 		copy_file_part(uint64 size, uint64 src_offset, char* tmp_buffer, char* xlog_rec_buffer);
+extern int			read_one_xlog_rec(int src_fd, const char* src_file_name, char* xlog_rec_buffer, 
+									  char* tmp_buff, uint64 read_left, bool* read_only_header);
+extern void			write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer);
 extern int 			read_file2buff(int fd, char* buffer, uint64 size, uint64 buff_offset, const char* file_name);
 extern int 			write_buff2file(int fd, char* buffer, uint64 size, uint64 buff_offset);
 

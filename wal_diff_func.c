@@ -1,8 +1,8 @@
 #include "wal_diff_func.h"
 
 void 
-copy_file_part(const char* src, const char* dst_name, int dstfd, uint64 size, uint64 src_offset, 
-			   char* tmp_buffer, char* xlog_rec_buffer, XLogRecPtr* file_offset)
+copy_file_part(uint64 size, uint64 src_offset, 
+			   char* tmp_buffer, char* xlog_rec_buffer)
 {
 	int      	 srcfd;
 	int64 		 read_left = size;
@@ -11,27 +11,27 @@ copy_file_part(const char* src, const char* dst_name, int dstfd, uint64 size, ui
 	/*
 	* Open the file
 	*/
-	srcfd = OpenTransientFile(src, O_RDONLY | PG_BINARY);
+	srcfd = OpenTransientFile(writer_state.src_path, O_RDONLY | PG_BINARY);
 	if (srcfd < 0)
 	ereport(ERROR,
 		(errcode_for_file_access(),
-			errmsg("could not open file \"%s\": %m", src)));
+			errmsg("could not open file \"%s\": %m", writer_state.src_path)));
 
 	if (lseek(srcfd, src_offset, SEEK_SET) < 0)
 	ereport(ERROR,
 		(errcode_for_file_access(),
-			errmsg("could not navigate through the file \"%s\": %m", src)));
+			errmsg("could not navigate through the file \"%s\": %m", writer_state.src_path)));
 
 	/*
 	* Do the data copying.
 	*/
 	while(true)
 	{
-		int read_len = read_one_xlog_rec(srcfd, src, xlog_rec_buffer, tmp_buffer, read_left, &read_only_header);
+		int read_len = read_one_xlog_rec(srcfd, writer_state.src_path, xlog_rec_buffer, tmp_buffer, read_left, &read_only_header);
 		if (read_len == -1 || read_only_header)
 			break;
 		
-		write_one_xlog_rec(dstfd, dst_name, xlog_rec_buffer, file_offset);
+		write_one_xlog_rec(writer_state.dest_fd, writer_state.dest_path, xlog_rec_buffer);
 		read_left -= read_len;
 		if (read_left <= 0)
 			break;
@@ -40,7 +40,7 @@ copy_file_part(const char* src, const char* dst_name, int dstfd, uint64 size, ui
 	if (CloseTransientFile(srcfd) != 0)
 	ereport(ERROR,
 		(errcode_for_file_access(),
-			errmsg("could not close file \"%d\": %m", dstfd)));
+			errmsg("could not close file \"%d\": %m", writer_state.dest_fd)));
 }
 
 int
@@ -180,7 +180,7 @@ read_one_xlog_rec(int src_fd, const char* src_file_name,
 }
 
 void
-write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer, uint64* file_offset)
+write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer)
 {
 	int 		nbytes;
 	uint64 		rem_data_len = 0;
@@ -194,9 +194,9 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 
 	while (true) 
 	{
-		if (*file_offset % BLCKSZ == 0)
+		if (writer_state.dest_curr_offset % BLCKSZ == 0)
 		{
-			if (*file_offset == 0)
+			if (writer_state.dest_curr_offset == 0)
 			{
 				XLogLongPageHeaderData long_hdr;
 
@@ -214,7 +214,7 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 				ereport(LOG, errmsg("LONG HDR. ADDR : %ld", long_hdr.std.xlp_pageaddr));
 
 				nbytes = write_buff2file(dst_fd, (char*) &long_hdr, SizeOfXLogLongPHD, 0);
-				*file_offset += nbytes;
+				writer_state.dest_curr_offset += nbytes;
 			}
 			else
 			{
@@ -228,21 +228,21 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 				
 				hdr.xlp_tli 	 = writer_state.tli;
 				hdr.xlp_magic 	 = XLOG_PAGE_MAGIC;
-				hdr.xlp_pageaddr = writer_state.page_addr + *file_offset;
+				hdr.xlp_pageaddr = writer_state.page_addr + writer_state.dest_curr_offset;
 
 				nbytes = write_buff2file(dst_fd, (char*) &hdr, SizeOfXLogShortPHD, 0);
-				*file_offset += nbytes;
+				writer_state.dest_curr_offset += nbytes;
 			}
 		}
 		if (rem_data_len > 0)
 		{
-			if (! XlogRecFitsOnPage(*file_offset, rem_data_len))
+			if (! XlogRecFitsOnPage(writer_state.dest_curr_offset, rem_data_len))
 			{
-				uint64 data_len = BLCKSZ * (1 + (*file_offset / BLCKSZ)) - *file_offset;
+				uint64 data_len = BLCKSZ * (1 + (writer_state.dest_curr_offset / BLCKSZ)) - writer_state.dest_curr_offset;
 				nbytes = write_buff2file(dst_fd, xlog_rec_buffer, data_len, already_read);
 				rem_data_len = (rem_data_len - data_len);
 				
-				*file_offset += nbytes;
+				writer_state.dest_curr_offset += nbytes;
 				already_read += nbytes;
 
 				continue;
@@ -250,12 +250,12 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 			else
 			{
 				nbytes = write_buff2file(dst_fd, xlog_rec_buffer, rem_data_len, already_read);
-				*file_offset += nbytes;
+				writer_state.dest_curr_offset += nbytes;
 
 				if (MAXALIGN(record->xl_tot_len) - record->xl_tot_len)
 				{
 					nbytes = write_buff2file(dst_fd, null_buff, MAXALIGN(record->xl_tot_len) - record->xl_tot_len, 0);
-					*file_offset += nbytes;
+					writer_state.dest_curr_offset += nbytes;
 				}
 				return;
 			}
@@ -263,7 +263,7 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 
 		record = (XLogRecord*) xlog_rec_buffer;
 		record->xl_prev = writer_state.last_read_rec + writer_state.page_addr;
-		writer_state.last_read_rec = *file_offset;
+		writer_state.last_read_rec = writer_state.dest_curr_offset;
 
 		INIT_CRC32C(crc);
 		COMP_CRC32C(crc, ((char *) record) + SizeOfXLogRecord, record->xl_tot_len - SizeOfXLogRecord);
@@ -272,31 +272,31 @@ write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer,
 		record->xl_crc = crc;
 
 		/* TODO delete it later */
-		ereport(LOG, errmsg("Prev lsn : %X/%X\tTotal len : %d\tTotal len aligned : %ld\t Current LSN : %X/%X", 
-								LSN_FORMAT_ARGS(record->xl_prev), 
-								record->xl_tot_len, 
-								MAXALIGN(record->xl_tot_len),
-								LSN_FORMAT_ARGS(*file_offset)));
+		// ereport(LOG, errmsg("Prev lsn : %X/%X\tTotal len : %d\tTotal len aligned : %ld\t Current LSN : %X/%X", 
+		// 						LSN_FORMAT_ARGS(record->xl_prev), 
+		// 						record->xl_tot_len, 
+		// 						MAXALIGN(record->xl_tot_len),
+		// 						LSN_FORMAT_ARGS(writer_state.dest_curr_offset)));
 
-		if (! XlogRecFitsOnPage(*file_offset, record->xl_tot_len))
+		if (! XlogRecFitsOnPage(writer_state.dest_curr_offset, record->xl_tot_len))
 		{
-			uint64 data_len = BLCKSZ * (1 + (*file_offset / BLCKSZ)) - *file_offset;
+			uint64 data_len = BLCKSZ * (1 + (writer_state.dest_curr_offset / BLCKSZ)) - writer_state.dest_curr_offset;
 			rem_data_len = record->xl_tot_len - data_len;
 			nbytes = write_buff2file(dst_fd, xlog_rec_buffer, data_len, 0);
 
-			*file_offset += nbytes;
+			writer_state.dest_curr_offset += nbytes;
 			already_read += nbytes;
 			continue;
 		}
 		else
 		{
 			nbytes = write_buff2file(dst_fd, xlog_rec_buffer, record->xl_tot_len, 0);
-			*file_offset += nbytes;
+			writer_state.dest_curr_offset += nbytes;
 
 			if (MAXALIGN(record->xl_tot_len) - record->xl_tot_len > 0)
 			{
 				nbytes = write_buff2file(dst_fd, null_buff, MAXALIGN(record->xl_tot_len) - record->xl_tot_len, 0);
-				*file_offset += nbytes;
+				writer_state.dest_curr_offset += nbytes;
 			}
 			return;
 		}
