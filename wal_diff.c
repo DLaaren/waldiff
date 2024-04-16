@@ -111,13 +111,13 @@ typedef ChainRecordData* ChainRecord;
 #define getRmIdentity(chain_record) ( (uint8)(chain_record)->xlog_record_header.xl_info & XLR_RMGR_INFO_MASK & XLOG_HEAP_OPMASK)
 #define getRecordTotalLen(chain_record) ( (uint32)(chain_record)->xlog_record_header.xl_tot_len )
 
-#define setRmId(chain_record, rm_id) ( (chain_record)->xlog_record_header.xl_rmid = rm_id)
+#define setRmId(xlog_record_header, rm_id) ( xlog_record_header.xl_rmid = rm_id)
 // XLOG_HEAP_OPMASK = 01110000   
 // зануляем биты отведенные на identity -> ~XLOG_HEAP_OPMASK = 10001111
-#define setRmIdentity(chain_record, rm_identity) \
+#define setRmIdentity(xlog_record_header, rm_identity) \
 ( \
-	(chain_record)->xlog_record_header.xl_info = \
-	(chain_record)->xlog_record_header.xl_info & \
+	xlog_record_header.xl_info = \
+	xlog_record_header.xl_info & \
 	~XLOG_HEAP_OPMASK | rm_identity \
 )
 
@@ -927,20 +927,28 @@ create_wal_diff(char* xlog_rec_buffer)
 	hash_seq_init(&status, hash_table);
 	while ((entry = (ChainRecordHashEntry *)hash_seq_search(&status)) != NULL)
 	{
-		ChainRecord chain_record = entry->data;
-		XLogRecord record;
-		XLogRecordDataHeaderShort short_hdr;
-		XLogRecordDataHeaderLong long_hdr;
-		int offset = 0;
+		ChainRecord 				chain_record = entry->data;
+		XLogRecord 					record;
+		XLogRecordDataHeaderShort 	short_hdr;
+		XLogRecordDataHeaderLong 	long_hdr;
 
-		record.xl_tot_len = SizeOfXLogRecord + chain_record->data_len;
+		HeapTupleHeaderData 		htup;
+		HeapTupleFields 			htup_fields;
+
+		int 						offset = 0;
+		uint32 						all_data_len = chain_record->data_len + SizeofHeapTupleHeader;
+
+		record.xl_tot_len = SizeOfXLogRecord + all_data_len;
 		record.xl_xid = chain_record->t_xmin; // TODO что тут нужно то?
 		record.xl_rmid = RM_EXPERIMENTAL_ID;
+		
+		setRmId(record, WALDIFF_RM_ID);
+		setRmIdentity(record, chain_record->xlog_type);
 
-		if (chain_record->data_len < 256)
+		if (all_data_len < 256)
 		{
 			short_hdr.id = XLR_BLOCK_ID_DATA_SHORT;
-			short_hdr.data_length = chain_record->data_len;
+			short_hdr.data_length = all_data_len;
 			record.xl_tot_len += SizeOfXLogRecordDataHeaderShort;
 
 			memcpy(xlog_rec_buffer, (char*) &record, SizeOfXLogRecord);
@@ -958,9 +966,26 @@ create_wal_diff(char* xlog_rec_buffer)
 			offset = SizeOfXLogRecord;
 
 			memcpy((char*) xlog_rec_buffer + offset, (char*) &long_hdr, sizeof(uint8));
-			memcpy((char*) xlog_rec_buffer + offset + sizeof(uint8), (char*) &(chain_record->data_len), sizeof(uint32));
+			memcpy((char*) xlog_rec_buffer + offset + sizeof(uint8), (char*) &(all_data_len), sizeof(uint32));
 			offset += SizeOfXLogRecordDataHeaderLong;
 		}
+
+		htup_fields.t_xmin 		   = chain_record->t_xmin;
+		htup_fields.t_xmax 		   = chain_record->t_xmax;
+		htup_fields.t_field3.t_cid = chain_record->t_cid;
+		htup.t_choice.t_heap 	   = htup_fields;
+
+		if (chain_record->xlog_type == XLOG_HEAP_DELETE)
+			htup.t_ctid  = chain_record->old_t_ctid;
+		else
+			htup.t_ctid  = chain_record->current_t_ctid;
+
+		htup.t_hoff 	 = 0; // this value will never be in use
+		htup.t_infomask  = chain_record->t_infomask;
+		htup.t_infomask2 = chain_record->t_infomask2;
+
+		memcpy((char*) xlog_rec_buffer + offset, (char*) &htup, SizeofHeapTupleHeader);
+		offset += SizeofHeapTupleHeader;
 
 		memcpy((char*) xlog_rec_buffer + offset, (char*) chain_record->t_bits, chain_record->data_len);
 
