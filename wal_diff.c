@@ -107,6 +107,20 @@ typedef ChainRecordData* ChainRecord;
 
 #define SizeOfChainRecord offsetof(ChainRecordData, t_bits)
 
+#define getRmId(chain_record) ( (uint8)(chain_record)->xlog_record_header.xl_rmid )
+#define getRmIdentity(chain_record) ( (uint8)(chain_record)->xlog_record_header.xl_info & XLR_RMGR_INFO_MASK & XLOG_HEAP_OPMASK)
+#define getRecordTotalLen(chain_record) ( (uint32)(chain_record)->xlog_record_header.xl_tot_len )
+
+#define setRmId(chain_record, rm_id) ( (chain_record)->xlog_record_header.xl_rmid = rm_id)
+// XLOG_HEAP_OPMASK = 01110000   
+// зануляем биты отведенные на identity -> ~XLOG_HEAP_OPMASK = 10001111
+#define setRmIdentity(chain_record, rm_identity) \
+( \
+	(chain_record)->xlog_record_header.xl_info = \
+	(chain_record)->xlog_record_header.xl_info & \
+	~XLOG_HEAP_OPMASK | rm_identity \
+)
+
 /**********************************************************************
  * Chained wal records hash entry for hash table
  **********************************************************************/
