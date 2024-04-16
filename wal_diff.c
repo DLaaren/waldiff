@@ -55,6 +55,7 @@ RmgrData waldiff_rmgr = {
 
 typedef struct ChainRecordData
 {
+	XLogRecord xlog_record_header;
 	/*
 	 * These 3 fields are representing HeapTupleFields struct.
 
@@ -107,9 +108,7 @@ typedef ChainRecordData* ChainRecord;
 
 #define SizeOfChainRecord offsetof(ChainRecordData, t_bits)
 
-#define getRmId(chain_record) ( (uint8)(chain_record)->xlog_record_header.xl_rmid )
-#define getRmIdentity(chain_record) ( (uint8)(chain_record)->xlog_record_header.xl_info & XLR_RMGR_INFO_MASK & XLOG_HEAP_OPMASK)
-#define getRecordTotalLen(chain_record) ( (uint32)(chain_record)->xlog_record_header.xl_tot_len )
+#define getRmIdentity(chain_record) ( (uint8)(chain_record)->info & XLOG_HEAP_OPMASK)
 
 #define setRmId(xlog_record_header, rm_id) ( xlog_record_header.xl_rmid = rm_id)
 // XLOG_HEAP_OPMASK = 01110000   

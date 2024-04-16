@@ -3,6 +3,10 @@
 
 #include "postgres.h"
 
+#include "access/heapam_xlog.h"
+#include "access/htup_details.h"
+#include "access/visibilitymapdefs.h"
+#include "access/xlogutils.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xloginsert.h"
