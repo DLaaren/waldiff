@@ -431,20 +431,23 @@ WalCloseSegment(XLogReaderState *state)
 void
 getWalDirecotry(const char *path, const char *file)
 {
-	char wal_dir[MAXPGPATH];
+	// char wal_dir[MAXPGPATH];
 
-	if (strlen(path) > MAXPGPATH)
-		ereport(ERROR,
-				errmsg("WAL file absolute name is too long : %s", path));
+	// if (strlen(path) > MAXPGPATH)
+	// 	ereport(ERROR,
+	// 			errmsg("WAL file absolute name is too long : %s", path));
 
-	sprintf(wal_dir, "%s", path);
+	// sprintf(wal_dir, "%s", path);
 
-	MemSet(wal_dir + (strlen(path) - strlen(file) - 1), 0, strlen(file));
-	ereport(LOG, 
-			errmsg("wal directory is : %s", wal_dir));
+	// MemSet(wal_dir + (strlen(path) - strlen(file) - 1), 0, strlen(file));
+	// ereport(LOG, 
+	// 		errmsg("wal directory is : %s", wal_dir));
 
-	writer_state.src_dir = palloc0(strlen(wal_dir) + 1);
-	sprintf(writer_state.src_dir, "%s", wal_dir);
+	// writer_state.src_dir = palloc0(strlen(wal_dir) + 1);
+	// sprintf(writer_state.src_dir, "%s", wal_dir);
+
+	writer_state.src_dir = palloc0(strlen(XLOGDIR) + 1);
+	sprintf(writer_state.src_dir, "%s", XLOGDIR);
 }
 
 /*
@@ -483,4 +486,19 @@ XLogDisplayRecord(XLogReaderState *record)
 	resetStringInfo(&s);
 	XLogRecGetBlockRefInfo(record, true, true, &s, NULL);
 	ereport(LOG, errmsg("%s", s.data));
+}
+
+void 		
+finish_wal_diff_with_noops(char *xlog_rec_buffer)
+{
+	XLogRecord noop_record = {0};
+	noop_record.xl_tot_len = SizeOfXLogRecord;
+	noop_record.xl_info = XLOG_NOOP;
+	noop_record.xl_rmid = RM_XLOG_ID;
+
+	memcpy(xlog_rec_buffer, (char*) &noop_record, SizeOfXLogRecord);
+
+	while (writer_state.wal_segment_size - writer_state.dest_curr_offset > 0)
+		write_one_xlog_rec(writer_state.dest_fd, writer_state.dest_path, xlog_rec_buffer);
+
 }

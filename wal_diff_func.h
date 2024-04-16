@@ -27,6 +27,7 @@
 #include "utils/memutils.h"
 #include "utils/hsearch.h"
 #include "utils/wait_event.h"
+#include "catalog/pg_control.h"
 
 /**********************************************************************
  * Neccessary info for writing wal-diff segment
@@ -78,6 +79,7 @@ extern int			read_one_xlog_rec(int src_fd, const char* src_file_name, char* xlog
 extern void			write_one_xlog_rec(int dst_fd, const char* dst_file_name, char* xlog_rec_buffer);
 extern int 			read_file2buff(int fd, char* buffer, uint64 size, uint64 buff_offset, const char* file_name);
 extern int 			write_buff2file(int fd, char* buffer, uint64 size, uint64 buff_offset);
+extern void 		finish_wal_diff_with_noops(char *xlog_rec_buffer);
 
 /*
  * Whether XLogRecord fits on the page with given offset

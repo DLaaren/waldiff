@@ -9,7 +9,7 @@ waldiff_rmgr_redo(XLogReaderState *record)
 {
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
-	XLogRecord main_data = record->record->header;
+	XLogRecord main_data = record->record->header; 
 }
 
 /*

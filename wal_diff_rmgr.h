@@ -11,7 +11,7 @@
 #include "varatt.h"
 
 #define WALDIFF_RM_ID       RM_EXPERIMENTAL_ID
-#define WALDIFF_RM_NAME    "wal_diff_rmgr"
+#define WALDIFF_RM_NAME     "wal_diff_rmgr"
 #define XLOG_TEST_CUSTOM_RMGRS_MESSAGE	0x00
 
 extern RmgrData waldiff_rmgr;
