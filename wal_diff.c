@@ -916,15 +916,19 @@ create_wal_diff(char* xlog_rec_buffer)
 	hash_seq_init(&status, hash_table);
 	while ((entry = (ChainRecordHashEntry *)hash_seq_search(&status)) != NULL)
 	{
-		ChainRecord chain_record = entry->data;
-		XLogRecord record;
-		XLogRecordDataHeaderShort short_hdr;
-		XLogRecordDataHeaderLong long_hdr;
-		int offset = 0;
+		ChainRecord 				chain_record = entry->data;
+		XLogRecord 					record;
+		XLogRecordDataHeaderShort 	short_hdr;
+		XLogRecordDataHeaderLong 	long_hdr;
+
+		HeapTupleHeaderData 		htup;
+		HeapTupleFields 			htup_fields;
+
+		int 						offset = 0;
 
 		record.xl_tot_len = SizeOfXLogRecord + chain_record->data_len;
-		record.xl_xid = chain_record->t_xmin; // TODO что тут нужно то?
-		record.xl_rmid = RM_EXPERIMENTAL_ID;
+		record.xl_xid 	  = chain_record->t_xmin; // TODO что тут нужно то?
+		record.xl_rmid 	  = RM_EXPERIMENTAL_ID;
 
 		if (chain_record->data_len < 256)
 		{
@@ -951,11 +955,28 @@ create_wal_diff(char* xlog_rec_buffer)
 			offset += SizeOfXLogRecordDataHeaderLong;
 		}
 
+		htup_fields.t_xmin 		   = chain_record->t_xmin;
+		htup_fields.t_xmax 		   = chain_record->t_xmax;
+		htup_fields.t_field3.t_cid = chain_record->t_cid;
+
+		htup.t_choice.t_heap = htup_fields;
+
+		if (chain_record->xlog_type == XLOG_HEAP_DELETE)
+			htup.t_ctid = chain_record->old_t_ctid;
+		else
+			htup.t_ctid = chain_record->current_t_ctid;
+		
+		htup.t_hoff 	 = 0; // this value will never be in use
+		htup.t_infomask  = chain_record->t_infomask;
+		htup.t_infomask2 = chain_record->t_infomask2;
+
+		memcpy((char*) xlog_rec_buffer + offset, (char*) &htup, SizeofHeapTupleHeader);
+		offset += SizeofHeapTupleHeader;
+
 		memcpy((char*) xlog_rec_buffer + offset, (char*) chain_record->t_bits, chain_record->data_len);
 
 		write_one_xlog_rec(writer_state.dest_fd, writer_state.dest_path, xlog_rec_buffer);
 	}
-	// hash_seq_term(&status);
 
 	return true;
 }
