@@ -11,6 +11,7 @@
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xloginsert.h"
+#include "storage/freespace.h"
 #include "fmgr.h"
 #include "utils/pg_lsn.h"
 #include "varatt.h"

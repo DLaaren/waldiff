@@ -78,7 +78,8 @@ typedef struct ChainRecordData
 	ItemPointerData old_t_ctid;	
 
 	ForkNumber 		forknum;	
-	RelFileLocator 	file_loc;	
+	RelFileLocator 	file_loc;
+	BlockNumber		blck_num;
 	uint16			t_infomask2;	
 	uint16			t_infomask;	
 	uint8 			info;
@@ -618,6 +619,7 @@ fetch_insert(XLogReaderState *record)
 	fetched_record->xlog_type = XLOG_HEAP_INSERT;
 	fetched_record->file_loc = target_locator;
 	fetched_record->forknum = forknum;
+	fetched_record->blck_num = blknum;
 	fetched_record->info = record->record->header.xl_info;
 
 	fetched_record->data_len = data_len + SizeOfHeapInsert;
@@ -918,23 +920,25 @@ create_wal_diff(char* xlog_rec_buffer)
 		ChainRecord 				chain_record = entry->data;
 		XLogRecord 					record;
 		XLogRecordBlockHeader		block_hdr;
-		XLogRecordDataHeaderShort 	short_hdr;
-		XLogRecordDataHeaderLong 	long_hdr;
 
 		HeapTupleHeaderData 		htup;
 		HeapTupleFields 			htup_fields;
-		RelFileLocator				locator = chain_record->file_loc;
 
 		int 						offset = 0;
 		int							bitmap_len = chain_record->t_hoff - SizeOfChainRecord;
 		uint32 						all_data_len = chain_record->data_len + 
 													SizeofHeapTupleHeader +
-													sizeof(RelFileLocator);
+													SizeOfXLogRecordBlockHeader +
+													sizeof(RelFileLocator) +
+													sizeof(BlockNumber);
 		
 		record.xl_tot_len = SizeOfXLogRecord + all_data_len;
 		record.xl_xid = chain_record->t_xmin; // TODO что тут нужно то?
 		record.xl_rmid = RM_EXPERIMENTAL_ID;
 		record.xl_info = chain_record->info;
+
+		memcpy(xlog_rec_buffer, (char*) &record, SizeOfXLogRecord);
+		offset = SizeOfXLogRecord;
 		
 		setRmId(record, WALDIFF_RM_ID);
 		setRmIdentity(record, chain_record->xlog_type);
@@ -942,35 +946,18 @@ create_wal_diff(char* xlog_rec_buffer)
 		block_hdr.fork_flags = REGBUF_STANDARD;
 		if (chain_record->info & XLOG_HEAP_INIT_PAGE)
 			block_hdr.fork_flags |= REGBUF_WILL_INIT;
-		
+		block_hdr.fork_flags |= BKPBLOCK_HAS_DATA;
+		block_hdr.id = 0;
+		block_hdr.data_length = chain_record->data_len + SizeofHeapTupleHeader;
 
-		if (all_data_len < 256)
-		{
-			short_hdr.id = XLR_BLOCK_ID_DATA_SHORT;
-			short_hdr.data_length = all_data_len;
-			record.xl_tot_len += SizeOfXLogRecordDataHeaderShort;
+		memcpy((char*) xlog_rec_buffer + offset, (char*) &(block_hdr), SizeOfXLogRecordBlockHeader);
+		offset += SizeOfXLogRecordBlockHeader;
 
-			memcpy(xlog_rec_buffer, (char*) &record, SizeOfXLogRecord);
-			offset = SizeOfXLogRecord;
-
-			memcpy((char*) xlog_rec_buffer + offset, (char*) &short_hdr, SizeOfXLogRecordDataHeaderShort);
-			offset += SizeOfXLogRecordDataHeaderShort;
-		}
-		else
-		{
-			long_hdr.id = XLR_BLOCK_ID_DATA_LONG;
-			record.xl_tot_len += SizeOfXLogRecordDataHeaderLong;
-
-			memcpy(xlog_rec_buffer, (char*) &record, SizeOfXLogRecord);
-			offset = SizeOfXLogRecord;
-
-			memcpy((char*) xlog_rec_buffer + offset, (char*) &long_hdr, sizeof(uint8));
-			memcpy((char*) xlog_rec_buffer + offset + sizeof(uint8), (char*) &(all_data_len), sizeof(uint32));
-			offset += SizeOfXLogRecordDataHeaderLong;
-		}
-
-		memcpy((char*) xlog_rec_buffer + offset, (char*) &locator, sizeof(RelFileLocator));
+		memcpy((char*) xlog_rec_buffer + offset, (char*) &(chain_record->file_loc), sizeof(RelFileLocator));
 		offset += sizeof(RelFileLocator);
+
+		memcpy((char*) xlog_rec_buffer + offset, (char*) &(chain_record->blck_num), sizeof(BlockNumber));
+		offset += sizeof(BlockNumber);
 
 		htup_fields.t_xmin 		   = chain_record->t_xmin;
 		htup_fields.t_xmax 		   = chain_record->t_xmax;
@@ -993,7 +980,6 @@ create_wal_diff(char* xlog_rec_buffer)
 
 		write_one_xlog_rec(writer_state.dest_fd, writer_state.dest_path, xlog_rec_buffer);
 	}
-	// hash_seq_term(&status);
 
 	return true;
 }
