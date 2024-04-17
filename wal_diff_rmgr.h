@@ -6,6 +6,7 @@
 #include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/visibilitymapdefs.h"
+#include "access/visibilitymap.h"
 #include "access/xlogutils.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
@@ -23,5 +24,18 @@ extern RmgrData waldiff_rmgr;
 extern void 		waldiff_rmgr_redo(XLogReaderState *record);
 extern void 		waldiff_rmgr_desc(StringInfo buf, XLogReaderState *record);
 extern const char* 	waldiff_rmgr_identify(uint8 info);
+
+#define getRmIdentity(xlog_record_header) ( (xlog_record_header.xl_info & ~XLR_INFO_MASK) & \
+                                             XLOG_HEAP_OPMASK)
+
+#define setRmId(xlog_record_header, rm_id) ( xlog_record_header.xl_rmid = rm_id)
+// XLOG_HEAP_OPMASK = 01110000   
+// зануляем биты отведенные на identity -> ~XLOG_HEAP_OPMASK = 10001111
+#define setRmIdentity(xlog_record_header, rm_identity) \
+( \
+	xlog_record_header.xl_info = \
+	xlog_record_header.xl_info & \
+	~XLOG_HEAP_OPMASK | rm_identity \
+)
 
 #endif

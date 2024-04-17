@@ -12,6 +12,7 @@
 #include "access/xlogstats.h"
 #include "access/xlog_internal.h"
 #include "access/xlogdefs.h"
+#include "access/xlogutils.h"
 #include "archive/archive_module.h"
 #include "common/int.h"
 #include "common/logging.h"
@@ -107,18 +108,6 @@ typedef struct ChainRecordData
 typedef ChainRecordData* ChainRecord;
 
 #define SizeOfChainRecord offsetof(ChainRecordData, t_bits)
-
-#define getRmIdentity(chain_record) ( (uint8)(chain_record)->info & XLOG_HEAP_OPMASK)
-
-#define setRmId(xlog_record_header, rm_id) ( xlog_record_header.xl_rmid = rm_id)
-// XLOG_HEAP_OPMASK = 01110000   
-// зануляем биты отведенные на identity -> ~XLOG_HEAP_OPMASK = 10001111
-#define setRmIdentity(xlog_record_header, rm_identity) \
-( \
-	xlog_record_header.xl_info = \
-	xlog_record_header.xl_info & \
-	~XLOG_HEAP_OPMASK | rm_identity \
-)
 
 /**********************************************************************
  * Chained wal records hash entry for hash table
@@ -928,21 +917,32 @@ create_wal_diff(char* xlog_rec_buffer)
 	{
 		ChainRecord 				chain_record = entry->data;
 		XLogRecord 					record;
+		XLogRecordBlockHeader		block_hdr;
 		XLogRecordDataHeaderShort 	short_hdr;
 		XLogRecordDataHeaderLong 	long_hdr;
 
 		HeapTupleHeaderData 		htup;
 		HeapTupleFields 			htup_fields;
+		RelFileLocator				locator = chain_record->file_loc;
 
 		int 						offset = 0;
-		uint32 						all_data_len = chain_record->data_len + SizeofHeapTupleHeader;
-
+		int							bitmap_len = chain_record->t_hoff - SizeOfChainRecord;
+		uint32 						all_data_len = chain_record->data_len + 
+													SizeofHeapTupleHeader +
+													sizeof(RelFileLocator);
+		
 		record.xl_tot_len = SizeOfXLogRecord + all_data_len;
 		record.xl_xid = chain_record->t_xmin; // TODO что тут нужно то?
 		record.xl_rmid = RM_EXPERIMENTAL_ID;
+		record.xl_info = chain_record->info;
 		
 		setRmId(record, WALDIFF_RM_ID);
 		setRmIdentity(record, chain_record->xlog_type);
+
+		block_hdr.fork_flags = REGBUF_STANDARD;
+		if (chain_record->info & XLOG_HEAP_INIT_PAGE)
+			block_hdr.fork_flags |= REGBUF_WILL_INIT;
+		
 
 		if (all_data_len < 256)
 		{
@@ -969,6 +969,9 @@ create_wal_diff(char* xlog_rec_buffer)
 			offset += SizeOfXLogRecordDataHeaderLong;
 		}
 
+		memcpy((char*) xlog_rec_buffer + offset, (char*) &locator, sizeof(RelFileLocator));
+		offset += sizeof(RelFileLocator);
+
 		htup_fields.t_xmin 		   = chain_record->t_xmin;
 		htup_fields.t_xmax 		   = chain_record->t_xmax;
 		htup_fields.t_field3.t_cid = chain_record->t_cid;
@@ -979,7 +982,7 @@ create_wal_diff(char* xlog_rec_buffer)
 		else
 			htup.t_ctid  = chain_record->current_t_ctid;
 
-		htup.t_hoff 	 = 0; // this value will never be in use
+		htup.t_hoff 	 = SizeofHeapTupleHeader + bitmap_len;
 		htup.t_infomask  = chain_record->t_infomask;
 		htup.t_infomask2 = chain_record->t_infomask2;
 
