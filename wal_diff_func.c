@@ -488,17 +488,25 @@ XLogDisplayRecord(XLogReaderState *record)
 	ereport(LOG, errmsg("%s", s.data));
 }
 
+// don't need crc, 'cause it includes only the data, but switch record contains only the header
 void 		
-finish_wal_diff_with_noops(char *xlog_rec_buffer)
+finish_wal_diff(char *xlog_rec_buffer)
 {
-	XLogRecord noop_record = {0};
-	noop_record.xl_tot_len = SizeOfXLogRecord;
-	noop_record.xl_info = XLOG_NOOP;
-	noop_record.xl_rmid = RM_XLOG_ID;
+	XLogRecord switch_record = {0};
 
-	memcpy(xlog_rec_buffer, (char*) &noop_record, SizeOfXLogRecord);
+	switch_record.xl_tot_len = SizeOfXLogRecord;
+	switch_record.xl_info = XLOG_SWITCH;
+	switch_record.xl_rmid = RM_XLOG_ID;
 
-	while (writer_state.wal_segment_size - writer_state.dest_curr_offset > 0)
+	memcpy(xlog_rec_buffer, (char*) &switch_record, SizeOfXLogRecord);
+
+	if (writer_state.wal_segment_size - writer_state.dest_curr_offset >= SizeOfXLogRecord) 
+	{
 		write_one_xlog_rec(writer_state.dest_fd, writer_state.dest_path, xlog_rec_buffer);
+		ereport(LOG, errmsg("writer_state.dest_curr_offset: %lu", writer_state.dest_curr_offset));
+		ereport(LOG, errmsg("Added SWITCH record"));
+	}
+	
+	ereport(LOG, errmsg("Finished the wal file"));
 
 }

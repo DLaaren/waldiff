@@ -39,7 +39,7 @@ my ($walfile_name, $blocksize) = split '\|' => $node->safe_psql('postgres',
 
 ok("Switched wal");
 
-sleep(1);
+sleep(2);
 
 my $wal_file = $node->data_dir . '/pg_wal/' . $walfile_name;
 
@@ -49,9 +49,12 @@ ok(-f -e $wal_file, "Got a wal file");
 
 my $wal_diff_file = $node->data_dir . '/wal_diff/' . $walfile_name;
 
-# sleep(3600);
+sleep(2);
 
 ok(-f -e $wal_diff_file, "Got a wal diff file");
+
+
+# sleep(3600);
 
 # Stop the server
 $node->stop('immediate');

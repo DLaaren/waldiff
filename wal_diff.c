@@ -543,8 +543,8 @@ continuous_reading_wal_file(XLogReaderState *reader_state,
 					break;
 					
 				default:
-					ereport(LOG, 
-							errmsg("unknown op code %u", rm_identity));
+					// ereport(LOG, 
+							// errmsg("unknown op code %u", rm_identity));
 					continue;
 			}
 
@@ -583,7 +583,7 @@ continuous_reading_wal_file(XLogReaderState *reader_state,
 	else 
 		ereport(ERROR, errmsg("error while creating WAL-diff"));
 
-	finish_wal_diff_with_noops(xlog_rec_buffer);
+	finish_wal_diff(xlog_rec_buffer);
 
 	pfree(tmp_buffer);
 	pfree(xlog_rec_buffer);

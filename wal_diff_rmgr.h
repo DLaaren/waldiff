@@ -35,8 +35,8 @@ extern const char* 	waldiff_rmgr_identify(uint8 info);
 #define setRmIdentity(xlog_record_header, rm_identity) \
 ( \
 	xlog_record_header.xl_info = \
-	xlog_record_header.xl_info & \
-	~XLOG_HEAP_OPMASK | rm_identity \
+	(xlog_record_header.xl_info & \
+	~XLOG_HEAP_OPMASK) | rm_identity \
 )
 
 #endif
