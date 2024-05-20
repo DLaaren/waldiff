@@ -1,26 +1,28 @@
-wal_diff_sources = files(
-  'wal_diff.c',
+waldiff_sources = files(
+  'waldiff.c',
+  /* here */
 )
 
 if host_system == 'windows'
   wal_diff_sources += rc_lib_gen.process(win32ver_rc, extra_args: [
-    '--NAME', 'wal_diff',
-    '--FILEDESC', 'wal_diff - archive module with compressing',])
+    '--NAME', 'waldiff',
+    '--FILEDESC', 'waldiff - archive module with compressing',])
 endif
 
-wal_diff = shared_module('wal_diff',
-  wal_diff_sources,
+wal_diff = shared_module('waldiff',
+  waldiff_sources,
   kwargs: contrib_mod_args, 
 )
-contrib_targets += wal_diff
+contrib_targets += waldiff
 
 tests += {
-  'name': 'wal_diff',
+  'name': 'waldiff',
   'sd': meson.current_source_dir(),
   'bd': meson.current_build_dir(),
   'tap': {
     'tests': [
       't/001_switch_wal.pl',
+      't/002_check_waldiff.pl',
     ],
   },
 }

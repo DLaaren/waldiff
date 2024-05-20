@@ -1,33 +1,7 @@
-#include "postgres.h"
-
-/* system stuff */
-#include <assert.h>
-#include <sys/stat.h>
-#include <sys/time.h>
-#include <unistd.h>
-
-/* postgreSQL stuff */
-#include "access/heapam_xlog.h"
-#include "access/xlogreader.h"
-#include "access/xlogstats.h"
-#include "access/xlog_internal.h"
-#include "access/xlogdefs.h"
-#include "access/xlogutils.h"
-#include "archive/archive_module.h"
-#include "common/int.h"
-#include "common/logging.h"
-#include "common/hashfn.h"
-#include "miscadmin.h"
-#include "lib/stringinfo.h"
-#include "storage/copydir.h"
-#include "storage/fd.h"
-#include "utils/guc.h"
-#include "utils/memutils.h"
-#include "utils/hsearch.h"
-#include "utils/wait_event.h"
-
+#include "wal_diff.h"
 #include "wal_diff_func.h"
 #include "wal_diff_rmgr.h"
+#include "wal_diff_test_func.h"
 
 #define INITIAL_HASHTABLE_SIZE 100 // TODO: find the optimum value
 
@@ -36,11 +10,6 @@ PG_MODULE_MAGIC;
 /**********************************************************************
  * Information for PostgreSQL
  **********************************************************************/
-typedef struct ArchiveData
-{
-	MemoryContext oldcontext;
-	MemoryContext context;
-} ArchiveData;
 
 RmgrData waldiff_rmgr = {
 	.rm_name = WALDIFF_RM_NAME,
@@ -220,10 +189,10 @@ _PG_archive_module_init(void)
 void 
 wal_diff_startup(ArchiveModuleState *state)
 {
-	ArchiveData *data;
+	ContextStorage *data;
 	HASHCTL hash_ctl;
 
-	data = (ArchiveData *) MemoryContextAllocZero(TopMemoryContext, sizeof(ArchiveData));
+	data = (ContextStorage *) MemoryContextAllocZero(TopMemoryContext, sizeof(ContextStorage));
 	data->context = AllocSetContextCreate(TopMemoryContext,
 										  "archive",
 										  ALLOCSET_DEFAULT_SIZES);
@@ -992,7 +961,7 @@ create_wal_diff(char* xlog_rec_buffer)
 static void 
 wal_diff_shutdown(ArchiveModuleState *state)
 {
-	ArchiveData *data = (ArchiveData *) state->private_data;
+	ContextStorage *data = (ContextStorage *) state->private_data;
 
 	close(writer_state.src_fd);
 	close(writer_state.dest_fd);

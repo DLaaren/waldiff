@@ -1,12 +1,10 @@
-# contrib/wal_diff/Makefile
+# contrib/waldiff/Makefile
 
-MODULE_big = wal_diff
+MODULE_big = waldiff
 OBJS = \
-	wal_diff.o \
-	wal_diff_func.o \
-	wal_diff_rmgr.o
-
-PGFILEDESC = "wal_diff - archive module with compressing"
+	waldiff.o \
+	/* here */
+PGFILEDESC = "waldiff - archive module with compressing"
 
 NO_INSTALLCHECK = 1
 TAP_TESTS = 1
@@ -16,7 +14,7 @@ PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 else
-subdir = contrib/wal_diff
+subdir = contrib/waldiff
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
