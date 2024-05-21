@@ -1,6 +1,4 @@
-update file list in meson.build
-update file list in Makefile
 continue refactoring
 write WALDIFFReader
 add test functions
-find the optimum hashtable size
+check memory leaks

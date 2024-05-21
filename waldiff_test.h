@@ -10,6 +10,9 @@
 
 #include "waldiff.h"
 
+
+extern void testWALDIFFArchiveModule();
+
 /*
  * Add function for testing
  *  read and write process 

@@ -5,26 +5,40 @@
 
 PG_MODULE_MAGIC;
 
-#define DEFAULT_ARCHIVE_DIRECTORY "waldiff_dir"
-#define INITIAL_HASHTABLE_SIZE 100
+/* The value hould be a power of 2 */
+#define INITIAL_HASHTABLE_SIZE 128
+/* GUC value's store */
+static char *waldiff_dir;
 
 /* Global data */
 static MemoryContextStorage *memory_context_storage;
 static WALDIFFWriterState *writer_state;
 static WALDIFFReaderState *reader_state;
 static HTAB *hash_table;
+
 typedef struct HTABElem
 {
 	uint32_t 	  key;
 	WALDIFFRecord data;
 } HTABElem;
 
-
 /* Forward declaration */
 static void waldiff_startup(ArchiveModuleState *state);
 static bool waldiff_configured(ArchiveModuleState *state);
 static bool waldiff_archive(ArchiveModuleState *state, const char *file, const char *path);
 static void waldiff_shutdown(ArchiveModuleState *state);
+void WALDIFFOpenSegment(WALDIFFSegmentContext segcxt, WALDIFFSegment *seg);
+void WALDIFFCloseSegment(WALDIFFSegment *seg);
+WALDIFFRecordReadResult WALDIFFReadRecord(WALDIFFReaderState *waldiff_reader,
+										  XLogRecPtr targetPagePtr,
+										  XLogRecPtr targetRecPtr,
+										  char *readBuf,
+										  int reqLen);
+WALDIFFRecordWriteResult WALDIFFWriteRecords(WALDIFFWriterState *waldiff_writer,
+											 XLogRecPtr targetPagePtr,
+											 XLogRecPtr targetRecPtr,
+											 char *writeBuf,
+											 int reqLen);
 
 /*
  * _PG_init
@@ -38,11 +52,11 @@ _PG_init(void)
 	DefineCustomStringVariable("waldiff.waldiff_dir",
 							   "WALDIFF destination directory.",
 							   NULL,
-							   &(writer_state->segcxt.wds_dir),
+							   &waldiff_dir,
 							   NULL,
 							   PGC_SIGHUP,
 							   0,
-							   check_archive_directory, NULL, NULL);
+							   NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("waldiff");
 }
@@ -71,13 +85,15 @@ _PG_archive_module_init(void)
  *
  * Creates the module's memory context, WALDIFFWriter and WALDIFFReader.
  */
-static void waldiff_startup(ArchiveModuleState *state)
+void 
+waldiff_startup(ArchiveModuleState *state)
 {
-    HASHCTL hash_ctl = {0};
+    HASHCTL hash_ctl;
 
     /* First, allocating the archive module's memory context */
-    memory_context_storage = (MemoryContextStorage *) MemoryContextAllocZero(TopMemoryContext, 
-                                                                             sizeof(MemoryContextStorage));
+	if (memory_context_storage == NULL)
+		memory_context_storage = (MemoryContextStorage *) MemoryContextAllocZero(TopMemoryContext, 
+																				sizeof(MemoryContextStorage));
     memory_context_storage->current = AllocSetContextCreate(TopMemoryContext,
 										                    "waldiff",
 										                    ALLOCSET_DEFAULT_SIZES);
@@ -87,7 +103,11 @@ static void waldiff_startup(ArchiveModuleState *state)
     hash_ctl.keysize    = sizeof(uint32_t);
 	hash_ctl.entrysize 	= sizeof(HTABElem);
 	hash_ctl.hash 		= &tag_hash;
-	hash_ctl.hcxt 		= memory_context_storage->current;                         
+	/* It is said hash table must have its own memory context */
+	// hash_ctl.hcxt 		= tmemory_conext_storage->current;      
+	hash_ctl.hcxt = AllocSetContextCreate(memory_context_storage->current,
+										  "WALDIFF_HTAB",
+										  ALLOCSET_DEFAULT_SIZES);                   
     hash_table = hash_create("WALDIFFHashTable", INITIAL_HASHTABLE_SIZE,
                              &hash_ctl, HASH_ELEM | HASH_CONTEXT | HASH_FUNCTION);
 }
@@ -95,46 +115,29 @@ static void waldiff_startup(ArchiveModuleState *state)
 /*
  * waldiff_configured
  *
- * Checks if waldiff_dir is not blank and exists
- */
-static bool waldiff_configured(ArchiveModuleState *state)
-{
-    struct stat st = {0};
-    return  writer_state->segcxt.wds_dir != NULL && 
-			writer_state->segcxt.wds_dir[0] != '\0' &&
-            stat(writer_state->segcxt.wds_dir, &st) != 0 && 
-            !S_ISDIR(st.st_mode);
-}
-
-/*
- * check_archive_directory
- *
  * Checks that the provided archive directory exists. If it does not, then
  * use default archive directory name.
  */
-static bool 
-check_archive_directory(char **newval, void **extra, GucSource source)
+bool 
+waldiff_configured(ArchiveModuleState *state)
 {
-    struct stat st = {0};
+    struct stat st;
 
-	if (*newval == NULL || *newval[0] == '\0')
+	if (waldiff_dir == NULL || waldiff_dir[0] == '\0')
 	{
-		GUC_check_errmsg("WALDIFF archive directory name is blank");
-        GUC_check_errmsg("Using default WALDIFF directory name: %s", DEFAULT_ARCHIVE_DIRECTORY);
-        writer_state->segcxt.wds_dir = palloc(sizeof(DEFAULT_ARCHIVE_DIRECTORY));
-        sprintf(writer_state->segcxt.wds_dir, "%s", DEFAULT_ARCHIVE_DIRECTORY);
-		return true;
+		GUC_check_errmsg("WALDIFF archive directory name is not set or blank");
+		return false;
 	}
-	if (strlen(*newval) >= MAXPGPATH)
+	if (strlen(waldiff_dir) >= MAXPGPATH)
 	{
 		GUC_check_errmsg("WALDIFF archive directory name is too long");
 		return false;
 	}	
-	if (stat(*newval, &st) != 0 || !S_ISDIR(st.st_mode))
+	if (stat(waldiff_dir, &st) != 0 || !S_ISDIR(st.st_mode))
 	{
 		GUC_check_errmsg("Specified WALDIFF archive directory does not exist: %m");
         GUC_check_errmsg("Creating WALDIFF archive directory");
-		if (pg_mkdir_p(*newval, 0700) != 0)
+		if (pg_mkdir_p(waldiff_dir, 0700) != 0)
 		{
 			GUC_check_errmsg("Could not allocate specified WALDIFF directory: %m");
 			return false;
@@ -148,12 +151,33 @@ check_archive_directory(char **newval, void **extra, GucSource source)
  *
  * Creates and archives one WALDIFF segment.
  * 
- * file -- just name of the WAL file 
- * path -- the full path including the WAL file name
+ * file - just name of the WAL file 
+ * path - the full path including the WAL file name
+ * 
  */
-static bool waldiff_archive(ArchiveModuleState *state, const char *file, const char *path)
+bool 
+waldiff_archive(ArchiveModuleState *state, const char *file, const char *path)
 {
-    // stopped here
+
+	/* Preparations */
+
+    if (writer_state == NULL)
+		writer_state = WALDIFFWriterAllocate(XLOG_BLCKSZ, XLOGDIR, 
+											 WALDIFFWRITER_ROUTINE(.write_records = WALDIFFWriteRecords,
+									  							   .segment_open = WALDIFFOpenSegment,
+									  							   .segment_close = WALDIFFCloseSegment));
+
+	if (reader_state == NULL)
+		reader_state = WALDIFFReaderAllocate(XLOG_BLCKSZ, waldiff_dir,
+											 WALDIFFREADER_ROUTINE(.read_record = WALDIFFReadRecord,
+																   .segment_open = WALDIFFOpenSegment,
+																   .segment_close = WALDIFFCloseSegment));
+
+
+	/* Main work */
+	
+
+	return true;
 }
 
 /*
@@ -161,14 +185,54 @@ static bool waldiff_archive(ArchiveModuleState *state, const char *file, const c
  *
  * Frees all allocated reaources.
  */
-static void waldiff_shutdown(ArchiveModuleState *state)
+void 
+waldiff_shutdown(ArchiveModuleState *state)
 {
-	close(reader_state->seg.ws_fd);
-	close(writer_state->seg.wds_fd);
+	close(reader_state->seg.fd);
+	close(writer_state->seg.fd);
 
 	hash_destroy(hash_table);
 
 	MemoryContextSwitchTo(memory_context_storage->old);
-	MemoryContextDelete(memory_context_storage->current);
 	Assert(CurrentMemoryContext != memory_context_storage->current);
+	MemoryContextDelete(memory_context_storage->current);
+}
+
+void 
+WALDIFFOpenSegment(WALDIFFSegmentContext segcxt, WALDIFFSegment *seg)
+{
+
+
+}
+
+void 
+WALDIFFCloseSegment(WALDIFFSegment *seg)
+{
+	close(seg->fd);
+	seg->fd = -1;
+	seg->segno = 0;
+	seg->tli = 0;
+}
+
+
+/* Read WAL record. Returns NULL on end-of-WAL or failure */
+WALDIFFRecordReadResult 
+WALDIFFReadRecord(WALDIFFReaderState *waldiff_reader,
+				  XLogRecPtr targetPagePtr,
+				  XLogRecPtr targetRecPtr,
+				  char *readBuf,
+				  int reqLen)
+{
+
+}
+
+/* Write WALDIFF record. Returns NULL on end-of-WALDIFF or failure */
+WALDIFFRecordWriteResult 
+WALDIFFWriteRecords(WALDIFFWriterState *waldiff_writer,
+					XLogRecPtr targetPagePtr,
+					XLogRecPtr targetRecPtr,
+					char *writeBuf,
+					int reqLen)
+{
+
 }

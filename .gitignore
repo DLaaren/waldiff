@@ -2,4 +2,4 @@
 .deps/
 *.o
 *.so
-tmp_check
+tmp_check/

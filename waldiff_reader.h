@@ -13,16 +13,23 @@
 
 typedef struct WALDIFFReaderState WALDIFFReaderState;
 
-/* Function type definitions for various WALDIFFWriter interactions */
-typedef int (*WALDIFFRecordReadCB) (WALDIFFReaderState *waldiff_reader,
+/* Return values from WALDIFFRecordReadCB. */
+typedef enum WALDIFFRecordReadResult
+{
+	WALDIFFREAD_SUCCESS = 0,		/* record is successfully read */
+	WALDIFFREAD_FAIL = -1,			/* failed during reading a record */
+} WALDIFFRecordReadResult;
+
+/* Function type definitions for various WALDIFFReader interactions */
+typedef WALDIFFRecordReadResult (*WALDIFFRecordReadCB) (
+									WALDIFFReaderState *waldiff_reader,
 							        XLogRecPtr targetPagePtr,
-							        int recordLen,
 									XLogRecPtr targetRecPtr,
-							        char *readBuf);
-typedef void (*WALDIFFReaderSegmentOpenCB) (WALDIFFReaderState *waldiff_reader,
-								      	XLogSegNo nextSegNo,
-								      	TimeLineID *tli_p);
-typedef void (*WALDIFFReaderSegmentCloseCB) (WALDIFFReaderState *waldiff_reader);
+							        char *readBuf,
+									int reqLen);
+typedef void (*WALDIFFReaderSegmentOpenCB) (WALDIFFSegmentContext *segcxt,
+											WALDIFFSegment *seg);
+typedef void (*WALDIFFReaderSegmentCloseCB) (WALDIFFSegment *seg);
 
 typedef struct WALDIFFReaderRoutine
 {
@@ -37,10 +44,10 @@ typedef struct WALDIFFReaderRoutine
 	 * The callback shall set ->seg.ws_tli to the TLI of the file the page was
 	 * read from.
 	 */
-    WALDIFFRecordReadCB record_read;
+    WALDIFFRecordReadCB read_record;
 
     /*
-	 * Callback to open the specified WALDIFF segment for writing.  
+	 * Callback to open the specified WALDIFF segment for reading.  
      * ->seg.wds_fd shall be set to the file descriptor of the opened segment.  
      * In case of failure, an error shall be raised by the callback and it 
      * shall not return.
@@ -53,7 +60,7 @@ typedef struct WALDIFFReaderRoutine
 	 * WALDIFF segment close callback.  ->seg.ws_fd shall be set to a negative
 	 * number.
 	 */
-    WALDIFFReaderSegmentCloseCB    segment_close;
+    WALDIFFReaderSegmentCloseCB segment_close;
 
 } WALDIFFReaderRoutine;
 
@@ -73,14 +80,14 @@ struct WALDIFFReaderState
      * Segment context
      */
     WALDIFFSegmentContext segcxt;
-	WALDIFFOpenSegment seg;
-	uint32		segoff;
+	WALDIFFSegment    	  seg;
+	uint32		          segoff;
 
 	/*
-	 * System identifier of the waldiff files we're about to write.  
+	 * System identifier of the waldiff files we're about to read.  
      * Set to zero (the default value) if unknown or unimportant.
 	 */
-	uint64		system_identifier;
+	uint64 system_identifier;
 
     /*
 	 * Start and end point of last record read.  
@@ -91,42 +98,33 @@ struct WALDIFFReaderState
 	 * Start and end point of last record returned by WALDIFFReadRecord().
      * These are also available as record->lsn and record->next_lsn.
 	 */
-	XLogRecPtr	StartRecPtr;	/* start of last record written */
-	XLogRecPtr	EndRecPtr;		/* end+1 of last record written */
+	XLogRecPtr	StartRecPtr;	/* start of last record read */
+	XLogRecPtr	EndRecPtr;		/* end+1 of last record read */
 
     /*
 	 * Buffer for reading WAL record
 	 */
-	char	   *readRecordBuf;
-	uint32		readRecordBufSize;
+	char	   *readBuf;
+	uint32		readBufSize;
 
 	/* Buffer to hold error message */
 	char	   *errormsg_buf;
 	bool		errormsg_deferred;
 };
 
-/* Get a new WALDIFFWriter */
+/* Get a new WALDIFFReader */
 extern WALDIFFReaderState *WALDIFFReaderAllocate(int wal_segment_size,
-										      	 const char *waldir,
+										      	 const char *wal_dir,
 										      	 WALDIFFReaderRoutine *routine);
 
-/* Free a WALDIFFWriter */
-extern void WALDIFFReaderFree(WALDIFFReaderRoutine *state);
+/* Free a WALDIFFWReader */
+extern void WALDIFFReaderFree(WALDIFFReaderState *state);
 
-/* Position the XLogReader to the beginning */
-extern void WALDIFFBeginRead(WALDIFFReaderRoutine *state, 
-                             XLogRecPtr RecPtr);
-
-/* Return values from WALDIFFRecordWriteCB. */
-typedef enum WALDIFFRecordReadResult
-{
-	WALDIFFREAD_SUCCESS = 0,		/* record is successfully read */
-	WALDIFFREAD_FAIL = -1,			/* failed during reading a record */
-} WALDIFFRecordReadResult;
-
-/* Write WALDIFF record. Returns NULL on end-of-WALDIFF or failure */
-extern void WALDIFFReadRecord(WALDIFFReaderRoutine *state,
-						      char **errormsg);
+/* Position the WALDIFFWReader to the beginning */
+extern void WALDIFFBeginRead(WALDIFFReaderState *state, 
+							 XLogRecPtr RecPtr, 
+							 XLogSegNo segNo, 
+							 TimeLineID tli);
 
 
 #endif /* _WALDIFF_READER_H_ */

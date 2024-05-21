@@ -1,26 +1,79 @@
 #include "waldiff_reader.h"
 
-WALDIFFReaderState *WALDIFFReaderAllocate(int wal_segment_size,
-										  const char *waldir,
-										  WALDIFFReaderRoutine *routine)
+WALDIFFReaderState *
+WALDIFFReaderAllocate(int wal_segment_size,
+					  const char *wal_dir,
+					  WALDIFFReaderRoutine *routine)
 {
+	WALDIFFReaderState *state;
+	state = (WALDIFFReaderState *)
+		palloc_extended(sizeof(WALDIFFReaderState),
+						MCXT_ALLOC_NO_OOM | MCXT_ALLOC_ZERO);
+	if (!state)
+		return NULL;
 
+	state->routine = *routine;
+
+	state->readBuf =(char *) palloc_extended(XLOG_BLCKSZ,
+											  MCXT_ALLOC_NO_OOM);
+	if (!state->readBuf)
+	{
+		pfree(state);
+		return NULL;
+	}					
+
+	state->seg.fd = -1;
+	state->seg.segno = 0;
+	state->seg.tli = 0;
+
+	state->segcxt.segsize = wal_segment_size;
+	if (wal_dir)
+		state->segcxt.dir = wal_dir;
+
+	/* ReadRecPtr, EndRecPtr and readLen initialized to zeroes above */
+	state->errormsg_buf = palloc_extended(MAX_ERRORMSG_LEN + 1,
+										  MCXT_ALLOC_NO_OOM);
+	if (!state->errormsg_buf)
+	{
+		pfree(state->readBuf);
+		pfree(state);
+		return NULL;
+	}
+	state->errormsg_buf[0] = '\0';
+
+	if (state->readBuf)
+		pfree(state->readBuf);
+	state->readBuf = (char *) palloc(BLCKSZ);
+	state->readBuf[0] = '\0';
+	state->readBufSize = 0;
+
+	return state;	
 }                                          
 
-void WALDIFFReaderFree(WALDIFFReaderRoutine *state)
+void
+WALDIFFReaderFree(WALDIFFReaderState *state)
 {
+	if (state->seg.fd != -1)
+		state->routine.segment_close(&(state->seg));
 
+	pfree(state->errormsg_buf);
+	pfree(state->readBuf);
+	pfree(state);
 }
 
-/* Position the XLogReader to the beginning */
-void WALDIFFBeginRead(WALDIFFReaderRoutine *state, 
-                      XLogRecPtr RecPtr)
+void 
+WALDIFFBeginRead(WALDIFFReaderState *state, 
+				 XLogRecPtr RecPtr, 
+				 XLogSegNo segNo, 
+				 TimeLineID tli)
 {
+	Assert(!XLogRecPtrIsInvalid(RecPtr));
+	
+	state->EndRecPtr = RecPtr;
+	state->StartRecPtr = InvalidXLogRecPtr;
 
-}
+	state->seg.segno = segNo;
+	state->seg.tli = tli;
 
-void WALDIFFReadRecord(WALDIFFReaderRoutine *state,
-					   char **errormsg)
-{
-
-}                              
+	state->routine.segment_open(&(state->seg), &(state->segcxt));
+}                         

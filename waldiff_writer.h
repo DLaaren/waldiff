@@ -12,16 +12,23 @@
 
 typedef struct WALDIFFWriterState WALDIFFWriterState;
 
+/* Return values from WALDIFFRecordWriteCB. */
+typedef enum WALDIFFRecordWriteResult
+{
+	WALDIFFWRITE_SUCCESS = 0,		/* record is successfully written */
+	WALDIFFWRITE_FAIL = -1,			/* failed during writing a record */
+} WALDIFFRecordWriteResult;
+
 /* Function type definitions for various WALDIFFWriter interactions */
-typedef int (*WALDIFFRecordWriteCB) (WALDIFFWriterState *waldiff_writer,
-							         XLogRecPtr targetPagePtr,
-							         int recordLen,
-									 XLogRecPtr targetRecPtr,
-							         char *writeBuf);
-typedef void (*WALDIFFWriterSegmentOpenCB) (WALDIFFWriterState *waldiff_writer,
-								      		XLogSegNo nextSegNo,
-								      		TimeLineID *tli_p);
-typedef void (*WALDIFFWriterSegmentCloseCB) (WALDIFFWriterState *waldiff_writer);
+typedef WALDIFFRecordWriteResult (*WALDIFFRecordWriteCB) (
+									WALDIFFWriterState *waldiff_writer,
+							        XLogRecPtr targetPagePtr,
+									XLogRecPtr targetRecPtr,
+							        char *writeBuf,
+									int reqLen);
+typedef void (*WALDIFFWriterSegmentOpenCB) (WALDIFFSegment *seg,
+											WALDIFFSegmentContext *segcxt);
+typedef void (*WALDIFFWriterSegmentCloseCB) (WALDIFFSegment *seg);
 
 typedef struct WALDIFFWriterRoutine
 {
@@ -36,7 +43,7 @@ typedef struct WALDIFFWriterRoutine
 	 * The callback shall set ->seg.wds_tli to the TLI of the file the page was
 	 * written to.
 	 */
-    WALDIFFRecordWriteCB record_write;
+    WALDIFFRecordWriteCB write_records;
 
     /*
 	 * Callback to open the specified WALDIFF segment for writing.  
@@ -52,7 +59,7 @@ typedef struct WALDIFFWriterRoutine
 	 * WALDIFF segment close callback.  ->seg.ws_fd shall be set to a negative
 	 * number.
 	 */
-    WALDIFFWriterSegmentCloseCB    segment_close;
+    WALDIFFWriterSegmentCloseCB segment_close;
 
 } WALDIFFWriterRoutine;
 
@@ -69,14 +76,14 @@ struct WALDIFFWriterState
      * Segment context
      */
     WALDIFFSegmentContext segcxt;
-	WALDIFFOpenSegment seg;
-	uint32		segoff;
+	WALDIFFSegment 	  	  seg;
+	uint32			      segoff;
 
 	/*
 	 * System identifier of the waldiff files we're about to write.  
      * Set to zero (the default value) if unknown or unimportant.
 	 */
-	uint64		system_identifier;
+	uint64 system_identifier;
 
     /*
 	 * Start and end point of last record written.  
@@ -91,10 +98,11 @@ struct WALDIFFWriterState
 	XLogRecPtr	EndRecPtr;		/* end+1 of last record written */
 
     /*
-	 * Buffer with current WALDIFF record to write
+	 * Buffer with current WALDIFF records to write
+	 * Max size of the buffer = BLCKSZ
 	 */
-	char	   *writeRecordBuf;
-	uint32		writeRecordBufSize;
+	char	   *writeBuf;
+	uint32		writeBufSize;
 
 	/* Buffer to hold error message */
 	char	   *errormsg_buf;
@@ -107,22 +115,13 @@ extern WALDIFFWriterState *WALDIFFWriterAllocate(int wal_segment_size,
 										      WALDIFFWriterRoutine *routine);
 
 /* Free a WALDIFFWriter */
-extern void WALDIFFWriterFree(WALDIFFWriterRoutine *state);
+extern void WALDIFFWriterFree(WALDIFFWriterState *state);
 
-/* Position the XLogReader to the beginning */
-extern void WALDIFFBeginWrite(WALDIFFWriterRoutine *state, 
-                              XLogRecPtr RecPtr);
-
-/* Return values from WALDIFFRecordWriteCB. */
-typedef enum WALDIFFRecordWriteResult
-{
-	WALDIFFWRITE_SUCCESS = 0,		/* record is successfully written */
-	WALDIFFWRITE_FAIL = -1,			/* failed during writing a record */
-} WALDIFFRecordWriteResult;
-
-/* Write WALDIFF record. Returns NULL on end-of-WALDIFF or failure */
-extern void WALDIFFWriteRecord(WALDIFFWriterState *state,
-						       char **errormsg);
+/* Position the WALDIFFWriter to the beginning */
+extern void WALDIFFBeginWrite(WALDIFFWriterState *state, 
+                              XLogRecPtr RecPtr,
+							  XLogSegNo segNo, 
+							  TimeLineID tli);
 
 
 #endif /* _WALDIFF_WRITER_H_ */

@@ -5,7 +5,6 @@
 
 #define INITIAL_HASHTABLE_SIZE 100 // TODO: find the optimum value
 
-PG_MODULE_MAGIC;
 
 /**********************************************************************
  * Information for PostgreSQL

@@ -5,12 +5,10 @@ use PostgreSQL::Test::RecursiveCopy;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-# test plans:
-# 1 check wal file saving 
-# 2 check insert detection
-# 3 check update detection
-# 4 check hot update detection
-# 5 check delete detection
+#
+# Checking if the archive modules creates waldiff direcorty
+# and WALDIFF with the same name in than directory
+#
 
 # start up a node
 # my = local variable 
@@ -22,11 +20,10 @@ $node->init;
 $node->append_conf(
     'postgresql.conf', 
     q{
-        wal_level = 'replica'
-        archive_mode = 'on'
-        archive_library = 'wal_diff'
-        wal_diff.wal_diff_directory = 'wal_diff'
-        shared_preload_libraries = 'wal_diff'
+        wal_level = replica
+        archive_mode = on
+        archive_library = 'waldiff'
+        waldiff.waldiff_dir = 'waldiff'
     }
 );
 
@@ -47,14 +44,14 @@ my $wal_file = $node->data_dir . '/pg_wal/' . $walfile_name;
 # -e = exists
 ok(-f -e $wal_file, "Got a wal file");
 
-my $wal_diff_file = $node->data_dir . '/wal_diff/' . $walfile_name;
+my $waldiff_file = $node->data_dir . '/waldiff/' . $walfile_name;
 
 sleep(2);
 
-ok(-f -e $wal_diff_file, "Got a wal diff file");
+ok(-f -e $waldiff_file, "Got a wal diff file");
 
 
-# sleep(3600);
+sleep(2);
 
 # Stop the server
 $node->stop('immediate');

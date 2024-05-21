@@ -36,26 +36,29 @@
 #include "utils/hsearch.h"
 #include "utils/wait_event.h"
 
+
+#define MAX_ERRORMSG_LEN 1024
+
 /* Structure with old and new contexts */
 typedef struct MemoryContextStorage
 {
-	MemoryContext *old;
-	MemoryContext *current;
+	MemoryContext old;
+	MemoryContext current;
 } MemoryContextStorage;
 
 /* WALDIFFSegment represents a WALDIFF segment being written */
-typedef struct WALDIFFOpenSegment
+typedef struct WALDIFFSegment
 {
-	int			wds_fd; 		/* segment file descriptor */
-	XLogSegNo	wds_segno;		/* segment number */
-	TimeLineID	wds_tli;		/* timeline ID of the currently open file */
-} WALDIFFOpenSegment;
+	int			fd; 		/* segment file descriptor */
+	XLogSegNo	segno;		/* segment number */
+	TimeLineID	tli;		/* timeline ID of the currently open file */
+} WALDIFFSegment;
 
 /* WALDIFFSegmentContext carries context information about WALDIFF segments */
 typedef struct WALDIFFSegmentContext
 {
-	char		*wds_dir;
-	int			wds_segsize;
+	char		*dir;
+	int			segsize;
 } WALDIFFSegmentContext;
 
 /* Structure representing folded WAL records */

@@ -6,12 +6,10 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use File::Copy;
 
-# test plans:
-# 1 check wal file saving 
-# 2 check insert detection
-# 3 check update detection
-# 4 check hot update detection
-# 5 check delete detection
+#
+# Checking if a databse can be recovered from WALDIFF
+# If it does, then WALDIFF can be written and read corecctly
+#
 
 # start up a node
 # my = local variable 
@@ -25,9 +23,8 @@ $node->append_conf(
     q{
         wal_level = 'replica'
         archive_mode = 'on'
-        archive_library = 'wal_diff'
-        wal_diff.wal_diff_directory = 'wal_diff'
-        shared_preload_libraries = 'wal_diff'
+        archive_library = 'waldiff'
+        waldiff.waldiff_dir = 'waldiff'
         max_wal_senders = 2
     }
 );
@@ -44,15 +41,15 @@ my ($walfile_name, $blocksize) = split '\|' => $node->safe_psql('postgres',
 sleep(10);
 
 
-# copy($node->data_dir . '/pg_wal/' . $walfile_name, $node->data_dir . '/wal_diff_directory/' . $walfile_name);
+# copy($node->data_dir . '/pg_wal/' . $walfile_name, $node->data_dir . '/waldiff_directory/' . $walfile_name);
 # delete wal file with our insert
 unlink($node->data_dir . '/pg_wal/' . $walfile_name);
 
 # Stop the server
 $node->stop('immediate');
 
-# copy($node->data_dir . '/wal_diff_directory/' . $walfile_name, $node->data_dir . '/pg_wal/' . $walfile_name);
-copy($node->data_dir . '/wal_diff/' . $walfile_name, $node->data_dir . '/pg_wal/' . $walfile_name);
+# copy($node->data_dir . '/waldiff_directory/' . $walfile_name, $node->data_dir . '/pg_wal/' . $walfile_name);
+copy($node->data_dir . '/waldiff/' . $walfile_name, $node->data_dir . '/pg_wal/' . $walfile_name);
 
 # Start the PostgreSQL server
 $node->start();
