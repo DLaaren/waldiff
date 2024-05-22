@@ -17,16 +17,12 @@ typedef struct WALDIFFReaderState WALDIFFReaderState;
 typedef enum WALDIFFRecordReadResult
 {
 	WALDIFFREAD_SUCCESS = 0,		/* record is successfully read */
+	WALDIFFREAD_EOF = 1,
 	WALDIFFREAD_FAIL = -1,			/* failed during reading a record */
 } WALDIFFRecordReadResult;
 
 /* Function type definitions for various WALDIFFReader interactions */
-typedef WALDIFFRecordReadResult (*WALDIFFRecordReadCB) (
-									WALDIFFReaderState *waldiff_reader,
-							        XLogRecPtr targetPagePtr,
-									XLogRecPtr targetRecPtr,
-							        char *readBuf,
-									int reqLen);
+typedef WALDIFFRecordReadResult (*WALDIFFRecordReadCB) (WALDIFFReaderState *waldiff_reader);
 typedef void (*WALDIFFReaderSegmentOpenCB) (WALDIFFSegmentContext *segcxt,
 											WALDIFFSegment *seg);
 typedef void (*WALDIFFReaderSegmentCloseCB) (WALDIFFSegment *seg);
@@ -102,15 +98,25 @@ struct WALDIFFReaderState
 	XLogRecPtr	EndRecPtr;		/* end+1 of last record read */
 
     /*
-	 * Buffer for reading WAL record
+	 * Recently read WAL record
 	 */
-	char	   *readBuf;
-	uint32		readBufSize;
+	XLogRecord	*record;
 
 	/* Buffer to hold error message */
 	char	   *errormsg_buf;
 	bool		errormsg_deferred;
 };
+
+/*
+ * Macros that provide access to parts of the record most recently returned by
+ * WALDIFF read function.
+ */
+#define WALGetRec(reader) ((reader)->record->xl_xid)
+#define WALRecGetTotalLen(reader) ((reader)->record->xl_tot_len)
+#define WALRecGetPrev(reader) ((reader)->record->xl_prev)
+#define WALRecGetInfo(reader) ((reader)->record->xl_info)
+#define WALRecGetRmid(reader) ((reader)->record->xl_rmid)
+#define WALRecGetXid(reader) ((reader)->record->xl_xid)
 
 /* Get a new WALDIFFReader */
 extern WALDIFFReaderState *WALDIFFReaderAllocate(int wal_segment_size,

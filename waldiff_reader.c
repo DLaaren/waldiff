@@ -14,9 +14,9 @@ WALDIFFReaderAllocate(int wal_segment_size,
 
 	state->routine = *routine;
 
-	state->readBuf =(char *) palloc_extended(XLOG_BLCKSZ,
+	state->record =(char *) palloc_extended(XLOG_BLCKSZ,
 											  MCXT_ALLOC_NO_OOM);
-	if (!state->readBuf)
+	if (!state->record)
 	{
 		pfree(state);
 		return NULL;
@@ -35,17 +35,15 @@ WALDIFFReaderAllocate(int wal_segment_size,
 										  MCXT_ALLOC_NO_OOM);
 	if (!state->errormsg_buf)
 	{
-		pfree(state->readBuf);
+		pfree(state->record);
 		pfree(state);
 		return NULL;
 	}
 	state->errormsg_buf[0] = '\0';
 
-	if (state->readBuf)
-		pfree(state->readBuf);
-	state->readBuf = (char *) palloc(BLCKSZ);
-	state->readBuf[0] = '\0';
-	state->readBufSize = 0;
+	if (state->record)
+		pfree(state->record);
+	state->record = (char *) palloc0(XLogRecordMaxSize);
 
 	return state;	
 }                                          
@@ -57,7 +55,7 @@ WALDIFFReaderFree(WALDIFFReaderState *state)
 		state->routine.segment_close(&(state->seg));
 
 	pfree(state->errormsg_buf);
-	pfree(state->readBuf);
+	pfree(state->record);
 	pfree(state);
 }
 

@@ -10,6 +10,7 @@
 
 #include "waldiff.h"
 
+
 typedef struct WALDIFFWriterState WALDIFFWriterState;
 
 /* Return values from WALDIFFRecordWriteCB. */
@@ -20,14 +21,9 @@ typedef enum WALDIFFRecordWriteResult
 } WALDIFFRecordWriteResult;
 
 /* Function type definitions for various WALDIFFWriter interactions */
-typedef WALDIFFRecordWriteResult (*WALDIFFRecordWriteCB) (
-									WALDIFFWriterState *waldiff_writer,
-							        XLogRecPtr targetPagePtr,
-									XLogRecPtr targetRecPtr,
-							        char *writeBuf,
-									int reqLen);
-typedef void (*WALDIFFWriterSegmentOpenCB) (WALDIFFSegment *seg,
-											WALDIFFSegmentContext *segcxt);
+typedef WALDIFFRecordWriteResult (*WALDIFFRecordWriteCB) (WALDIFFWriterState *waldiff_writer);
+typedef void (*WALDIFFWriterSegmentOpenCB) (WALDIFFSegmentContext *segcxt,
+											WALDIFFSegment *seg);
 typedef void (*WALDIFFWriterSegmentCloseCB) (WALDIFFSegment *seg);
 
 typedef struct WALDIFFWriterRoutine

@@ -29,17 +29,31 @@ static bool waldiff_archive(ArchiveModuleState *state, const char *file, const c
 static void waldiff_shutdown(ArchiveModuleState *state);
 void WALDIFFOpenSegment(WALDIFFSegmentContext *segcxt, WALDIFFSegment *seg);
 void WALDIFFCloseSegment(WALDIFFSegment *seg);
-WALDIFFRecordReadResult WALDIFFReadRecord(WALDIFFReaderState *waldiff_reader,
-										  XLogRecPtr targetPagePtr,
-										  XLogRecPtr targetRecPtr,
-										  char *readBuf,
-										  int reqLen);
-WALDIFFRecordWriteResult WALDIFFWriteRecords(WALDIFFWriterState *waldiff_writer,
-											 XLogRecPtr targetPagePtr,
-											 XLogRecPtr targetRecPtr,
-											 char *writeBuf,
-											 int reqLen);
+WALDIFFRecordReadResult WALDIFFReadRecord(WALDIFFReaderState *waldiff_reader);
+WALDIFFRecordWriteResult WALDIFFWriteRecords(WALDIFFWriterState *waldiff_writer);
 static int getWALsegsize(const char *WALpath);											 
+static void constructWALDIFFs();
+static void finishWALDIFFSegment();
+
+#define GetHashKeyOfWALDIFFRecord(record) \
+( \
+	(uint32_t)((record)->file_loc.spcOid + \
+			   (record)->file_loc.dbOid + \
+			   (record)->file_loc.relNumber + \
+			   (record)->current_t_ctid.ip_blkid.bi_hi + \
+			   (record)->current_t_ctid.ip_blkid.bi_lo + \
+			   (record)->current_t_ctid.ip_posid) \
+)
+
+#define GetHashKeyOfPrevWALDIFFRecord(record) \
+( \
+	(uint32_t)((record)->file_loc.spcOid + \
+			   (record)->file_loc.dbOid + \
+			   (record)->file_loc.relNumber + \
+			   (record)->prev_t_ctid.ip_blkid.bi_hi + \
+			   (record)->prev_t_ctid.ip_blkid.bi_lo + \
+			   (record)->prev_t_ctid.ip_posid) \
+)
 
 /*
  * _PG_init
@@ -207,13 +221,129 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
 		WALDIFFBeginWrite(writer_state, startPtr, segNo, tli);
 	}
 
-	/* Main reading&writing loop */
+	/* Main reading & constructing & writing loop */
 	for (;;)
 	{
+		WALDIFFRecord WDRec;
+		XLogRecord *readRec;
+
+		WALDIFFRecordReadResult res = WALDIFFReadRecord(reader_state);
+		if (res == WALDIFFREAD_FAIL)
+			ereport(ERROR,
+				errmsg("error during reading WAL record"));
+			
+		if (res == WALDIFFREAD_EOF)
+			break;
+
+		readRec = WALGetRec(reader_state);
+
+		/* Now we're processing only several HEAP type WAL records*/
+		if (WALRecGetRmid(reader_state) == RM_HEAP_ID)
+		{
+			uint32_t prev_hash_key;
+			uint32_t hash_key;
+			HTABElem *entry;
+			bool is_found;
+
+			switch(WALRecGetInfo(reader_state) & XLR_RMGR_INFO_MASK & XLOG_HEAP_OPMASK)
+			{
+				case XLOG_HEAP_INSERT:
+					WDRec = fetch_insert(readRec);
+					if (WDRec == NULL)
+						goto write_record;
+
+					hash_key = GetHashKeyOfWALDIFFRecord(WDRec);
+					hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
+					if (is_found)
+						entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
+
+					entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
+					entry->data = WDRec;
+					Assert(entry->key == hash_key);
+					
+					continue;
+
+				case XLOG_HEAP_UPDATE:
+					WDRec = fetch_update(readRec);
+					if (WDRec == NULL)
+						goto write_record;
+
+					prev_hash_key = GetHashKeyOfPrevWALDIFFRecord(WDRec);
+					hash_key = GetHashKeyOfWALDIFFRecord(WDRec);
+
+					entry = (HTABElem *) hash_search(hash_table, (void*) &prev_hash_key, HASH_FIND, &is_found);
+					if (is_found)
+					{
+						bool is_insert_WDrec = ((entry->data->xlog_type) == XLOG_HEAP_INSERT);
+						overlay_update(entry->data, WDRec);
+
+						if (!is_insert_WDrec) 
+						{
+							entry = (HTABElem *) hash_search(hash_table, (void*) &prev_hash_key, HASH_REMOVE, NULL);
+							entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
+							entry->data = WDRec;
+							Assert(entry->key == hash_key);
+						}
+					}
+					else 
+					{
+						entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
+						entry->data = WDRec;
+						Assert(entry->key == hash_key);
+					}
+
+					continue;
+
+				case XLOG_HEAP_DELETE:
+					WDRec = fetch_delete(readRec);
+					if (WDRec == NULL)
+						goto write_record;
+
+					prev_hash_key = GetHashKeyOfPrevWALDIFFRecord(WDRec);
+					hash_key = GetHashKeyOfWALDIFFRecord(WDRec);
+
+					entry = hash_search(hash_table, (void*) &prev_hash_key, HASH_FIND, &is_found);
+					if (is_found)
+					{
+						/* if prev WDRec is not presented in the HTAB then it's not in WALDIFF segment */
+						entry = (HTABElem *) hash_search(hash_table, (void*) &prev_hash_key, HASH_REMOVE, NULL);
+						Assert(entry == NULL);
+					}
+
+					/* insert/update (the prev record) is in another WAL segment */
+					else 
+					{
+						entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
+						entry->data = WDRec;
+						Assert(entry->key == hash_key);
+					}
+
+					continue;
+
+				/* unprocessed record type */
+				default:
+					goto write_record;
+			}
+		} 
 		
+		/* Storing records to write them all at once */
+		else 
+		{
+write_record:
+			// append to write buf
+			// when full then write
+		}
+
 	}
 
+	Assert(((writer_state->seg.segno + 1) * writer_state->segcxt.segsize) - 
+			writer_state->segoff > 0);
 
+	/* Constructing and writing WALDIFFs to WALDIFF segment */
+	constructWALDIFFs();
+
+	/* End the segment with SWITCH record */
+	finishWALDIFFSegment();
 
 	return true;
 }
@@ -267,24 +397,16 @@ WALDIFFCloseSegment(WALDIFFSegment *seg)
 }
 
 
-/* Read WAL record. Returns NULL on end-of-WAL or failure */
+/* Read WAL record */
 WALDIFFRecordReadResult 
-WALDIFFReadRecord(WALDIFFReaderState *waldiff_reader,
-				  XLogRecPtr targetPagePtr,
-				  XLogRecPtr targetRecPtr,
-				  char *readBuf,
-				  int reqLen)
+WALDIFFReadRecord(WALDIFFReaderState *waldiff_reader)
 {
 
 }
 
-/* Write WALDIFF record. Returns NULL on end-of-WALDIFF or failure */
+/* Write WALDIFF records */
 WALDIFFRecordWriteResult 
-WALDIFFWriteRecords(WALDIFFWriterState *waldiff_writer,
-					XLogRecPtr targetPagePtr,
-					XLogRecPtr targetRecPtr,
-					char *writeBuf,
-					int reqLen)
+WALDIFFWriteRecords(WALDIFFWriterState *waldiff_writer)
 {
 
 }
