@@ -27,7 +27,7 @@ static void waldiff_startup(ArchiveModuleState *state);
 static bool waldiff_configured(ArchiveModuleState *state);
 static bool waldiff_archive(ArchiveModuleState *state, const char *file, const char *path);
 static void waldiff_shutdown(ArchiveModuleState *state);
-void WALDIFFOpenSegment(WALDIFFSegmentContext segcxt, WALDIFFSegment *seg);
+void WALDIFFOpenSegment(WALDIFFSegmentContext *segcxt, WALDIFFSegment *seg);
 void WALDIFFCloseSegment(WALDIFFSegment *seg);
 WALDIFFRecordReadResult WALDIFFReadRecord(WALDIFFReaderState *waldiff_reader,
 										  XLogRecPtr targetPagePtr,
@@ -39,6 +39,7 @@ WALDIFFRecordWriteResult WALDIFFWriteRecords(WALDIFFWriterState *waldiff_writer,
 											 XLogRecPtr targetRecPtr,
 											 char *writeBuf,
 											 int reqLen);
+static int getWALsegsize(const char *WALpath);											 
 
 /*
  * _PG_init
@@ -93,11 +94,16 @@ waldiff_startup(ArchiveModuleState *state)
     /* First, allocating the archive module's memory context */
 	if (memory_context_storage == NULL)
 		memory_context_storage = (MemoryContextStorage *) MemoryContextAllocZero(TopMemoryContext, 
-																				sizeof(MemoryContextStorage));
-    memory_context_storage->current = AllocSetContextCreate(TopMemoryContext,
+		  																		 sizeof(MemoryContextStorage));
+	Assert(memory_context_storage != NULL);
+
+	memory_context_storage->current = AllocSetContextCreate(TopMemoryContext,
 										                    "waldiff",
 										                    ALLOCSET_DEFAULT_SIZES);
-    memory_context_storage->old = MemoryContextSwitchTo(memory_context_storage->current);    
+    Assert(memory_context_storage->current != NULL);
+
+	memory_context_storage->old = MemoryContextSwitchTo(memory_context_storage->current);    
+	Assert(memory_context_storage->old != NULL);
 
     /* Secondly, allocating the hash table */
     hash_ctl.keysize    = sizeof(uint32_t);
@@ -107,9 +113,12 @@ waldiff_startup(ArchiveModuleState *state)
 	// hash_ctl.hcxt 		= tmemory_conext_storage->current;      
 	hash_ctl.hcxt = AllocSetContextCreate(memory_context_storage->current,
 										  "WALDIFF_HTAB",
-										  ALLOCSET_DEFAULT_SIZES);                   
+										  ALLOCSET_DEFAULT_SIZES);  
+	Assert(hash_ctl.hcxt != NULL);								  
+
     hash_table = hash_create("WALDIFFHashTable", INITIAL_HASHTABLE_SIZE,
                              &hash_ctl, HASH_ELEM | HASH_CONTEXT | HASH_FUNCTION);
+	Assert(hash_table != NULL);
 }
 
 /*
@@ -156,26 +165,55 @@ waldiff_configured(ArchiveModuleState *state)
  * 
  */
 bool 
-waldiff_archive(ArchiveModuleState *state, const char *file, const char *path)
+waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALpath)
 {
-
 	/* Preparations */
+	static int wal_segment_size = 0;
 
-    if (writer_state == NULL)
-		writer_state = WALDIFFWriterAllocate(XLOG_BLCKSZ, XLOGDIR, 
-											 WALDIFFWRITER_ROUTINE(.write_records = WALDIFFWriteRecords,
-									  							   .segment_open = WALDIFFOpenSegment,
-									  							   .segment_close = WALDIFFCloseSegment));
+	if (wal_segment_size == 0)
+		wal_segment_size = getWALsegsize(WALpath);
+	Assert(IsValidWalSegSize(wal_segment_size));
 
 	if (reader_state == NULL)
-		reader_state = WALDIFFReaderAllocate(XLOG_BLCKSZ, waldiff_dir,
+		reader_state = WALDIFFReaderAllocate(wal_segment_size, waldiff_dir,
 											 WALDIFFREADER_ROUTINE(.read_record = WALDIFFReadRecord,
 																   .segment_open = WALDIFFOpenSegment,
 																   .segment_close = WALDIFFCloseSegment));
+	Assert(reader_state != NULL);
 
+    if (writer_state == NULL)
+		writer_state = WALDIFFWriterAllocate(wal_segment_size, XLOGDIR, 
+											 WALDIFFWRITER_ROUTINE(.write_records = WALDIFFWriteRecords,
+									  							   .segment_open = WALDIFFOpenSegment,
+									  							   .segment_close = WALDIFFCloseSegment));
+	Assert(writer_state != NULL);
 
 	/* Main work */
-	
+	ereport(LOG, errmsg("archiving WAL file : %s", WALpath));
+
+	/* Determines tli, segno and startPtr values of archived WAL segment
+	 * and future WALDIFF segment
+	 */
+	{
+		XLogSegNo segNo;
+		TimeLineID tli;
+		XLogRecPtr startPtr;
+
+		XLogFromFilName(WALfile, &tli, &segNo, reader_state->segcxt.segsize);
+		XLogSegNoOffsetToRecPtr(segNo, 0, reader_state->segcxt.segsize, startPtr);
+		Assert(startPtr != InvalidXLogRecPtr);
+
+		WALDIFFBeginRead(reader_state, startPtr, segNo, tli);
+		WALDIFFBeginWrite(writer_state, startPtr, segNo, tli);
+	}
+
+	/* Main reading&writing loop */
+	for (;;)
+	{
+		
+	}
+
+
 
 	return true;
 }
@@ -199,16 +237,30 @@ waldiff_shutdown(ArchiveModuleState *state)
 }
 
 void 
-WALDIFFOpenSegment(WALDIFFSegmentContext segcxt, WALDIFFSegment *seg)
+WALDIFFOpenSegment(WALDIFFSegmentContext *segcxt, WALDIFFSegment *seg)
 {
+	char fname[XLOG_FNAME_LEN];
+	char fpath[MAXPGPATH];
 
+	XLogFileName(fname, seg->tli, seg->segno, segcxt->segsize);
 
+	if (snprintf(fpath, MAXPGPATH, "%s/%s", segcxt->dir, fname) == -1)
+		ereport(ERROR,
+				errmsg("error during opening WAL segment: %s/%s", segcxt->dir, fname));
+	
+	seg->fd = OpenTransientFile(fpath, PG_BINARY | O_RDWR | O_CREAT | O_APPEND);
+	if (seg->fd == -1)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				errmsg("could not open WAL segment \"%s\": %m", fpath)));
 }
 
 void 
 WALDIFFCloseSegment(WALDIFFSegment *seg)
 {
+	Assert(seg->fd != -1);
 	close(seg->fd);
+
 	seg->fd = -1;
 	seg->segno = 0;
 	seg->tli = 0;
@@ -235,4 +287,30 @@ WALDIFFWriteRecords(WALDIFFWriterState *waldiff_writer,
 					int reqLen)
 {
 
+}
+
+int 
+getWALsegsize(const char *WALpath)
+{
+	int fd;
+	int read_bytes;
+	XLogLongPageHeader page_hdr;
+	int wal_segment_size;
+
+	fd = OpenTransientFile(WALpath, O_RDONLY | PG_BINARY);
+	if (fd == -1)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				errmsg("could not open file \"%s\": %m", WALpath)));
+
+	read_bytes = read(fd, (void *)(&page_hdr), sizeof(XLogLongPageHeader));
+	if (read_bytes != sizeof(XLogLongPageHeader))
+		ereport(ERROR,
+				errmsg("could not read XLogLongPageHeader of WAL segment\"%s\": %m", 
+					   WALpath));
+
+	wal_segment_size = page_hdr->xlp_seg_size;
+	Assert(IsValidWalSegSize(wal_segment_size));
+
+	return wal_segment_size;
 }

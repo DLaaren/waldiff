@@ -13,6 +13,8 @@
 
 extern void testWALDIFFArchiveModule();
 
+extern void testWALDIFFReadAndWrite();
+
 /*
  * Add function for testing
  *  read and write process 
