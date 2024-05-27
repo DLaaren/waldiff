@@ -22,7 +22,7 @@ typedef enum WALDIFFRecordWriteResult
 
 /* Function type definitions for various WALDIFFWriter interactions */
 typedef WALDIFFRecordWriteResult (*WALDIFFRecordWriteCB) (WALDIFFWriterState *waldiff_writer,
-														  WALDIFFRecord record);
+														  XLogRecord *record);
 typedef void (*WALDIFFWriterSegmentOpenCB) (WALDIFFSegmentContext *segcxt,
 											WALDIFFSegment *seg);
 typedef void (*WALDIFFWriterSegmentCloseCB) (WALDIFFSegment *seg);

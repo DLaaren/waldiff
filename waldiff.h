@@ -61,9 +61,29 @@ typedef struct WALDIFFSegmentContext
 	int			segsize;
 } WALDIFFSegmentContext;
 
+/* Structure representing XLogRecord block data */
+typedef struct WALDIFFBlock {
+	
+	XLogRecordBlockHeader blk_hdr;
+
+	/* Identify the block this refers to */
+	RelFileLocator file_loc;
+	ForkNumber	forknum;
+	BlockNumber blkno;
+
+	/* we are not working with images */
+
+	/* Buffer holding the rmgr-specific data associated with this block */
+	bool		has_data;
+	char	   *block_data;
+	uint16		block_data_len;
+
+} WALDIFFBlock;
+
 /* Structure representing folded WAL records */
 typedef struct WALDIFFRecordData
 {
+	XLogRecPtr	    lsn;
 	XLogRecord      rec_hdr;	
 
 	TransactionId   t_xmin;
@@ -72,27 +92,18 @@ typedef struct WALDIFFRecordData
 
 	/* Pointer to latest tuple version */
 	ItemPointerData current_t_ctid;
-
 	/* In delete/update case this is the pointer on deleted tuple version */
 	ItemPointerData prev_t_ctid;	
 
-	ForkNumber 		forknum;	
-	RelFileLocator 	file_loc;
-	BlockNumber		blck_num;
-
-	/* Offset to user data */
+	/* Offset to tuple data. (0 if none) */
 	uint8			t_hoff;
-	uint16			t_infomask;	
-	uint16			t_infomask2;
-	/* Size of bitmap + padding + header + prefix length + suffix length + user_data */
-	uint32 			data_len;
 
-	/*
-	 * Here comes [bitmap] + [padding] and then header + user_data.
-	 * In update case 'user_data' also includes prefix and suffix lengths
-	 * that comes right after 'xl_heap_update'
-	 */
-	bits8			t_bits[FLEXIBLE_ARRAY_MEMBER];
+	char *main_data;
+	uint32 main_data_len;
+
+	/* highest block_id (-1 if none) */
+	int max_block_id;
+	WALDIFFBlock blocks[FLEXIBLE_ARRAY_MEMBER];
 
 } WALDIFFRecordData;
 
