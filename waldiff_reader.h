@@ -108,15 +108,15 @@ struct WALDIFFReaderState
 };
 
 /*
- * Macros that provide access to parts of the record most recently returned by
- * WALDIFF read function.
+ * Macros that provide access to parts of the record 
  */
-#define WALGetRec(reader) ((reader)->record->xl_xid)
-#define WALRecGetTotalLen(reader) ((reader)->record->xl_tot_len)
-#define WALRecGetPrev(reader) ((reader)->record->xl_prev)
-#define WALRecGetInfo(reader) ((reader)->record->xl_info)
-#define WALRecGetRmid(reader) ((reader)->record->xl_rmid)
-#define WALRecGetXid(reader) ((reader)->record->xl_xid)
+#define WALGetRec(reader) ((reader)->record)
+#define WALRecGetTotalLen(record) ((record)->xl_tot_len)
+#define WALRecGetPrev(record) ((record)->xl_prev)
+#define WALRecGetInfo(record) ((record)->xl_info)
+#define WALRecGetRmid(record) ((record)->xl_rmid)
+#define WALRecGetXid(record) ((record)->xl_xid)
+#define WALRecGetXLogType(record) ((record)->xl_info & XLR_RMGR_INFO_MASK & XLOG_HEAP_OPMASK)
 
 /* Get a new WALDIFFReader */
 extern WALDIFFReaderState *WALDIFFReaderAllocate(int wal_segment_size,

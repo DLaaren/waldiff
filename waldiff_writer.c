@@ -15,7 +15,7 @@ WALDIFFWriterAllocate(int wal_segment_size,
 
 	state->routine = *routine;
 
-	state->writeBuf =(char *) palloc_extended(XLOG_BLCKSZ,
+	state->writeBuf =(char *) palloc_extended(XLogRecordMaxSize,
 											  MCXT_ALLOC_NO_OOM);
 
 	if (!state->writeBuf)

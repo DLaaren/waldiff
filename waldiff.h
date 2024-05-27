@@ -64,10 +64,41 @@ typedef struct WALDIFFSegmentContext
 /* Structure representing folded WAL records */
 typedef struct WALDIFFRecordData
 {
+	XLogRecord      rec_hdr;	
+
+	TransactionId   t_xmin;
+	TransactionId   t_xmax;
+	CommandId	    t_cid;
+
+	/* Pointer to latest tuple version */
+	ItemPointerData current_t_ctid;
+
+	/* In delete/update case this is the pointer on deleted tuple version */
+	ItemPointerData prev_t_ctid;	
+
+	ForkNumber 		forknum;	
+	RelFileLocator 	file_loc;
+	BlockNumber		blck_num;
+
+	/* Offset to user data */
+	uint8			t_hoff;
+	uint16			t_infomask;	
+	uint16			t_infomask2;
+	/* Size of bitmap + padding + header + prefix length + suffix length + user_data */
+	uint32 			data_len;
+
+	/*
+	 * Here comes [bitmap] + [padding] and then header + user_data.
+	 * In update case 'user_data' also includes prefix and suffix lengths
+	 * that comes right after 'xl_heap_update'
+	 */
+	bits8			t_bits[FLEXIBLE_ARRAY_MEMBER];
 
 } WALDIFFRecordData;
 
 typedef WALDIFFRecordData *WALDIFFRecord;
+
+#define SizeOfChainRecord offsetof(WALDIFFRecordData, t_bits)
 
 
 #endif /* _WALDIFF_H_ */

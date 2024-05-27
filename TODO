@@ -1,5 +1,3 @@
 continue refactoring
-write WALDIFFReader
 add test functions
-check memory leaks
 НАЙТИ ГЛОБАЛЬНУЮ ПЕРЕМЕННУЮ В КОТОРОЙ ЗАПИСАН РАЗМЕР СЕГМЕНТА

@@ -14,8 +14,8 @@ WALDIFFReaderAllocate(int wal_segment_size,
 
 	state->routine = *routine;
 
-	state->record =(char *) palloc_extended(XLOG_BLCKSZ,
-											  MCXT_ALLOC_NO_OOM);
+	state->record =(char *) palloc_extended(XLogRecordMaxSize,
+											MCXT_ALLOC_NO_OOM);
 	if (!state->record)
 	{
 		pfree(state);
