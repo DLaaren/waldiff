@@ -603,7 +603,7 @@ fetch_insert(XLogReaderState *record)
 	/* 
 	 * Copy tuple's version pointers
 	 * At this step, t_ctid always will be point to itself,
-	 * because we recon this record as first
+	 * because we reckon this record as first
 	 */
 	ItemPointerSetBlockNumber(&(WDRec->current_t_ctid), blknum);
     ItemPointerSetOffsetNumber(&(WDRec->current_t_ctid), main_data->offnum);
@@ -631,6 +631,7 @@ fetch_insert(XLogReaderState *record)
 	WDRec->blocks[0].forknum = forknum;
 	WDRec->blocks[0].blknum = blknum;
 	WDRec->blocks[0].has_data = true;
+	Assert(XLogRecHasBlockData(record, 0));
 	WDRec->blocks[0].block_data = block_data;
 	WDRec->blocks[0].block_data_len = block_data_len;
 
@@ -660,8 +661,57 @@ fetch_update(XLogReaderState *record)
 WALDIFFRecord 
 fetch_delete(XLogReaderState *record)
 {
-	WALDIFFRecord WDRec;
-	xl_heap_delete *main_data = (xl_heap_delete *) XLogRecGetData(record);
+	WALDIFFRecord WDRec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord);
+	XLogRecordBlockHeader blk_hdr;
+	RelFileLocator rel_file_locator;
+	ForkNumber forknum;
+	BlockNumber blknum;
+	xl_heap_delete *main_data;
+
+	/* Copy lsn */
+	WDRec->lsn = record->record->lsn;
+
+	/* Copy XLogRecord aka header */
+	WDRec->rec_hdr = record->record->header;
+
+	/* Copy some info */
+	WDRec->t_xmin = 0;
+	WDRec->t_xmax = main_data->xmax;
+	WDRec->t_cid = 0;
+	
+	/* 
+	 * Copy tuple's version pointers
+	 * At this step, t_ctid always will be point to itself,
+	 * because we reckon this record as first
+	 */
+	ItemPointerSetBlockNumber(&(WDRec->current_t_ctid), blknum);
+    ItemPointerSetOffsetNumber(&(WDRec->current_t_ctid), main_data->offnum);
+	WDRec->prev_t_ctid = WDRec->current_t_ctid;
+
+	/* Copy main data */
+	/* check do we need to allocate space for main data? 
+	 * 'cause there is a huge ring buffer for all records(?) */
+	main_data = (xl_heap_insert *) XLogRecGetData(record);
+	WDRec->main_data = main_data;
+	WDRec->main_data = SizeOfHeapInsert;
+
+	/* Copy block data */
+	XLogRecGetBlockTag(record, 0, &rel_file_locator, &forknum, &blknum);
+
+	WDRec->max_block_id = 0;
+
+	blk_hdr.id = 0;
+	blk_hdr.fork_flags = record->record->blocks[0].flags;
+	blk_hdr.data_length = 0;
+
+	WDRec->blocks[0].blk_hdr = blk_hdr;
+	WDRec->blocks[0].file_loc = rel_file_locator;
+	WDRec->blocks[0].forknum = forknum;
+	WDRec->blocks[0].blknum = blknum;
+	WDRec->blocks[0].has_data = false;
+	Assert(!XLogRecHasBlockData(record, 0));
+
+	main_data = (xl_heap_delete *) XLogRecGetData(record);
 
 	return WDRec;
 }
@@ -710,7 +760,7 @@ getWALsegsize(const char *WALpath)
  * Creates WALDIFF records according to data in hash table 
  * and writes them into WALDIFF segment
  * 
- * [ I recon We should remain RMGR records' structure ]
+ * [ I reckon We should remain RMGR records' structure ]
  */
 void 
 constructWALDIFFs(void)
