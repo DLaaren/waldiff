@@ -47,9 +47,9 @@ WALDIFFRecordWriteResult WALDIFFWriteRecord(WALDIFFWriterState *waldiff_writer,
 											XLogRecord *record);
 
 /* This three fuctions returns palloced struct */
-static WALDIFFRecord fetch_insert(XLogRecord *fetched_record);
-static WALDIFFRecord fetch_update(XLogRecord *fetched_record);
-static WALDIFFRecord fetch_delete(XLogRecord *fetched_record);
+static WALDIFFRecord fetch_insert(XLogReaderState *record);
+static WALDIFFRecord fetch_update(XLogReaderState *record);
+static WALDIFFRecord fetch_delete(XLogReaderState *record);
 
 static void overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup);
 
@@ -310,18 +310,18 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
         }
 
 		/* Now we're processing only several HEAP type WAL records and without image*/
-		if (WALRec->xl_rmid == RM_HEAP_ID && !XLogRecHasBlockImage(reader_state, 0))
+		if (XLogRecGetRmid(reader_state)== RM_HEAP_ID && !XLogRecHasBlockImage(reader_state, 0))
 		{
 			uint32_t prev_hash_key;
 			uint32_t hash_key;
 			HTABElem *entry;
 			bool is_found;
-			uint8 xlog_type = WALRec->xl_info & XLOG_HEAP_OPMASK;
+			uint8 xlog_type = XLogRecGetInfo(reader_state) & XLOG_HEAP_OPMASK;
 
 			switch(xlog_type)
 			{
 				case XLOG_HEAP_INSERT:
-					WDRec = fetch_insert(WALRec);
+					WDRec = fetch_insert(reader_state);
 					if (WDRec == NULL)
 						ereport(ERROR, errmsg("fetch_insert failed"));
 
@@ -337,7 +337,7 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
 					break;
 
 				case XLOG_HEAP_UPDATE:
-					WDRec = fetch_update(WALRec);
+					WDRec = fetch_update(reader_state);
 					if (WDRec == NULL)
 						ereport(ERROR, errmsg("fetch_update failed"));
 
@@ -369,7 +369,7 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
 					break;
 
 				case XLOG_HEAP_DELETE:
-					WDRec = fetch_delete(WALRec);
+					WDRec = fetch_delete(reader_state);
 					if (WDRec == NULL)
 						ereport(ERROR, errmsg("fetch_delete failed"));
 
@@ -578,10 +578,66 @@ WALDIFFWriteRecord(WALDIFFWriterState *waldiff_writer,
  * 
  */
 WALDIFFRecord 
-fetch_insert(XLogRecord *fetched_record)
+fetch_insert(XLogReaderState *record)
 {
+	WALDIFFRecord WDRec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord);
+	XLogRecordBlockHeader blk_hdr;
+	char *block_data;
+	Size block_data_len;
+	RelFileLocator rel_file_locator;
+	ForkNumber forknum;
+	BlockNumber blknum;
+	xl_heap_insert *main_data;
 
-	return NULL;
+	/* Copy lsn */
+	WDRec->lsn = record->record->lsn;
+
+	/* Copy XLogRecord aka header */
+	WDRec->rec_hdr = record->record->header;
+
+	/* Copy some info */
+	WDRec->t_xmin = XLogRecGetXid(record);
+	WDRec->t_xmax = 0;
+	WDRec->t_cid = 0;
+	
+	/* 
+	 * Copy tuple's version pointers
+	 * At this step, t_ctid always will be point to itself,
+	 * because we recon this record as first
+	 */
+	ItemPointerSetBlockNumber(&(WDRec->current_t_ctid), blknum);
+    ItemPointerSetOffsetNumber(&(WDRec->current_t_ctid), main_data->offnum);
+	WDRec->prev_t_ctid = WDRec->current_t_ctid;
+
+	/* Copy main data */
+	/* check do we need to allocate space for main data? 
+	 * 'cause there is a huge ring buffer for all records(?) */
+	main_data = (xl_heap_insert *) XLogRecGetData(record);
+	WDRec->main_data = main_data;
+	WDRec->main_data = SizeOfHeapInsert;
+
+	/* Copy block data */
+	XLogRecGetBlockTag(record, 0, &rel_file_locator, &forknum, &blknum);
+	block_data = XLogRecGetBlockData(record, 0, &block_data_len);
+
+	WDRec->max_block_id = 0;
+
+	blk_hdr.id = 0;
+	blk_hdr.fork_flags = record->record->blocks[0].flags;
+	blk_hdr.data_length = block_data_len;
+
+	WDRec->blocks[0].blk_hdr = blk_hdr;
+	WDRec->blocks[0].file_loc = rel_file_locator;
+	WDRec->blocks[0].forknum = forknum;
+	WDRec->blocks[0].blknum = blknum;
+	WDRec->blocks[0].has_data = true;
+	WDRec->blocks[0].block_data = block_data;
+	WDRec->blocks[0].block_data_len = block_data_len;
+
+	WDRec->t_hoff = SizeOfXLogRecord + SizeOfXLogRecordBlockHeader + \
+					sizeof(RelFileLocator) + sizeof(BlockNumber) + SizeOfHeapHeader;
+
+	return WDRec;
 }
 
 /*
@@ -589,10 +645,12 @@ fetch_insert(XLogRecord *fetched_record)
  * 
  */
 WALDIFFRecord 
-fetch_update(XLogRecord *fetched_record)
+fetch_update(XLogReaderState *record)
 {
+	WALDIFFRecord WDRec;
+	xl_heap_update *main_data = (xl_heap_update *) XLogRecGetData(record);
 
-	return NULL;
+	return WDRec;
 }
 
 /*
@@ -600,10 +658,12 @@ fetch_update(XLogRecord *fetched_record)
  * 
  */
 WALDIFFRecord 
-fetch_delete(XLogRecord *fetched_record)
+fetch_delete(XLogReaderState *record)
 {
+	WALDIFFRecord WDRec;
+	xl_heap_delete *main_data = (xl_heap_delete *) XLogRecGetData(record);
 
-	return NULL;
+	return WDRec;
 }
 
 void 
@@ -698,7 +758,7 @@ constructWALDIFFs(void)
 					record->xl_tot_len +=  sizeof(RelFileLocator);
 
 					/* BlockNumber */
-					memcpy(record, &(block_0.blkno), sizeof(BlockNumber));
+					memcpy(record, &(block_0.blknum), sizeof(BlockNumber));
 					record->xl_tot_len += sizeof(BlockNumber);
 
 					/* block data */
@@ -739,7 +799,7 @@ constructWALDIFFs(void)
 					record->xl_tot_len +=  sizeof(RelFileLocator);
 
 					/* BlockNumber 0 */
-					memcpy(record, &(block_0.blkno), sizeof(BlockNumber));
+					memcpy(record, &(block_0.blknum), sizeof(BlockNumber));
 					record->xl_tot_len += sizeof(BlockNumber);
 
 					/* block data 0 */
@@ -751,7 +811,7 @@ constructWALDIFFs(void)
 					record->xl_tot_len += SizeOfXLogRecordBlockHeader;
 
 					/* BlockNumber 1 */
-					memcpy(record, &(block_1.blkno), sizeof(BlockNumber));
+					memcpy(record, &(block_1.blknum), sizeof(BlockNumber));
 					record->xl_tot_len += sizeof(BlockNumber);
 
 					break;
@@ -777,7 +837,7 @@ constructWALDIFFs(void)
 					record->xl_tot_len +=  sizeof(RelFileLocator);
 
 					/* BlockNumber */
-					memcpy(record, &(block_0.blkno), sizeof(BlockNumber));
+					memcpy(record, &(block_0.blknum), sizeof(BlockNumber));
 					record->xl_tot_len += sizeof(BlockNumber);
 
 					break;

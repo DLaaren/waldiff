@@ -69,7 +69,7 @@ typedef struct WALDIFFBlock {
 	/* Identify the block this refers to */
 	RelFileLocator file_loc;
 	ForkNumber	forknum;
-	BlockNumber blkno;
+	BlockNumber blknum;
 
 	/* we are not working with images */
 
@@ -86,9 +86,8 @@ typedef struct WALDIFFRecordData
 	XLogRecPtr	    lsn;
 	XLogRecord      rec_hdr;	
 
-
 	/* 
-	 * If some of them not used in ChainRecord (for example. insert does not need t_xmax), 
+	 * If some of them not used (for example. insert does not need t_xmax), 
 	 * they will be NULL during fetching.
 	 */
 	TransactionId   t_xmin;
@@ -114,7 +113,7 @@ typedef struct WALDIFFRecordData
 
 typedef WALDIFFRecordData *WALDIFFRecord;
 
-#define SizeOfChainRecord offsetof(WALDIFFRecordData, t_bits)
+#define SizeOfWALDIFFRecord offsetof(WALDIFFRecordData, blocks)
 
 
 #endif /* _WALDIFF_H_ */
