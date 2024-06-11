@@ -106,21 +106,10 @@ struct WALDIFFWriterState
 	bool		errormsg_deferred;
 };
 
-/*
- * Macros that provide access to parts of the record 
- */
-#define WALDIFFGetRec(reader) ((reader)->record)
-#define WALDIFFRecGetTotalLen(record) ((record)->rec_hdr->xl_tot_len)
-#define WALDIFFRecGetPrev(record) ((record)->rec_hdr->xl_prev)
-#define WALDIFFRecGetInfo(record) ((record)->rec_hdr->xl_info)
-#define WALDIFFRecGetRmid(record) ((record)->rec_hdr->xl_rmid)
-#define WALDIFFRecGetXid(record) ((record)->rec_hdr->xl_xid)
-#define WALDIFFRecGetXLogType(record) ((record)->rec_hdr.xl_info & XLR_RMGR_INFO_MASK & XLOG_HEAP_OPMASK)
-
 /* Get a new WALDIFFWriter */
 extern WALDIFFWriterState *WALDIFFWriterAllocate(int wal_segment_size,
-										      const char *waldir,
-										      WALDIFFWriterRoutine *routine);
+										      	 char *waldir,
+										      	 WALDIFFWriterRoutine *routine);
 
 /* Free a WALDIFFWriter */
 extern void WALDIFFWriterFree(WALDIFFWriterState *state);

@@ -2,7 +2,7 @@
 
 WALDIFFReaderState *
 WALDIFFReaderAllocate(int wal_segment_size,
-					  const char *wal_dir,
+					  char *wal_dir,
 					  WALDIFFReaderRoutine *routine)
 {
 	WALDIFFReaderState *state;
@@ -14,9 +14,9 @@ WALDIFFReaderAllocate(int wal_segment_size,
 
 	state->routine = *routine;
 
-	state->record =(char *) palloc_extended(XLogRecordMaxSize,
+	state->readBuf =(char *) palloc_extended(XLogRecordMaxSize,
 											MCXT_ALLOC_NO_OOM);
-	if (!state->record)
+	if (!state->readBuf)
 	{
 		pfree(state);
 		return NULL;
@@ -35,15 +35,17 @@ WALDIFFReaderAllocate(int wal_segment_size,
 										  MCXT_ALLOC_NO_OOM);
 	if (!state->errormsg_buf)
 	{
-		pfree(state->record);
+		pfree(state->readBuf);
 		pfree(state);
 		return NULL;
 	}
 	state->errormsg_buf[0] = '\0';
 
-	if (state->record)
-		pfree(state->record);
-	state->record = (char *) palloc0(XLogRecordMaxSize);
+	if (state->readBuf)
+		pfree(state->readBuf);
+	state->readBuf = (char *) palloc(BLCKSZ);
+	state->readBuf[0] = '\0';
+	state->readBufSize = 0;
 
 	return state;	
 }                                          
@@ -55,7 +57,7 @@ WALDIFFReaderFree(WALDIFFReaderState *state)
 		state->routine.segment_close(&(state->seg));
 
 	pfree(state->errormsg_buf);
-	pfree(state->record);
+	pfree(state->readBuf);
 	pfree(state);
 }
 
@@ -73,5 +75,5 @@ WALDIFFBeginRead(WALDIFFReaderState *state,
 	state->seg.segno = segNo;
 	state->seg.tli = tli;
 
-	state->routine.segment_open(&(state->seg), &(state->segcxt));
+	state->routine.segment_open(&(state->segcxt), &(state->seg));
 }                         

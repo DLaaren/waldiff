@@ -98,9 +98,12 @@ struct WALDIFFReaderState
 	XLogRecPtr	EndRecPtr;		/* end+1 of last record read */
 
     /*
-	 * Recently read WAL record
+	 * Buffer with read WALDIFF record
+	 * Max size of the buffer = BLCKSZ
+	 * Should be cast to XLogRecord
 	 */
-	XLogRecord	*record;
+	char	   *readBuf;
+	uint32		readBufSize;
 
 	/* Buffer to hold error message */
 	char	   *errormsg_buf;
@@ -108,19 +111,13 @@ struct WALDIFFReaderState
 };
 
 /*
- * Macros that provide access to parts of the record 
+ * Macros
  */
-#define WALGetRec(reader) ((reader)->record)
-#define WALRecGetTotalLen(record) ((record)->xl_tot_len)
-#define WALRecGetPrev(record) ((record)->xl_prev)
-#define WALRecGetInfo(record) ((record)->xl_info)
-#define WALRecGetRmid(record) ((record)->xl_rmid)
-#define WALRecGetXid(record) ((record)->xl_xid)
-#define WALRecGetXLogType(record) ((record)->xl_info & XLR_RMGR_INFO_MASK & XLOG_HEAP_OPMASK)
+#define WALGetRec(reader) ((reader)->readBuf)
 
 /* Get a new WALDIFFReader */
 extern WALDIFFReaderState *WALDIFFReaderAllocate(int wal_segment_size,
-										      	 const char *wal_dir,
+										      	 char *wal_dir,
 										      	 WALDIFFReaderRoutine *routine);
 
 /* Free a WALDIFFWReader */

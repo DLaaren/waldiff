@@ -1,19 +1,16 @@
 #include "waldiff.h"
 #include "waldiff_writer.h"
-#include "waldiff_reader.h"
 #include "waldiff_test.h"
 
 PG_MODULE_MAGIC;
 
-/* The value hould be a power of 2 */
-#define INITIAL_HASHTABLE_SIZE 128
 /* GUC value's store */
 static char *waldiff_dir;
 
 /* Global data */
 static MemoryContextStorage *memory_context_storage;
 static WALDIFFWriterState   *writer_state;
-static WALDIFFReaderState   *reader_state;
+static XLogReaderState		*reader_state;
 static HTAB 				*hash_table;
 
 typedef struct HTABElem
@@ -22,29 +19,45 @@ typedef struct HTABElem
 	WALDIFFRecord data;
 } HTABElem;
 
+typedef struct XLogReaderPrivate
+{
+	TimeLineID	timeline;
+	XLogRecPtr	startptr;
+	XLogRecPtr	endptr;
+	bool		endptr_reached;
+} XLogReaderPrivate;
+
+
 /* Forward declaration */
 static void waldiff_startup(ArchiveModuleState *state);
 static bool waldiff_configured(ArchiveModuleState *state);
 static bool waldiff_archive(ArchiveModuleState *state, const char *file, const char *path);
 static void waldiff_shutdown(ArchiveModuleState *state);
 
+/* Custom defined callbacks for WALDIFFReader and WALDIFFWriter */
+void WalOpenSegment(XLogReaderState *state,
+					XLogSegNo nextSegNo,
+					TimeLineID *tli_p);
 void WALDIFFOpenSegment(WALDIFFSegmentContext *segcxt, WALDIFFSegment *seg);
+int WalReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
+				XLogRecPtr targetPtr, char *readBuff);
+void WalCloseSegment(XLogReaderState *state);				
 void WALDIFFCloseSegment(WALDIFFSegment *seg);
-
-WALDIFFRecordReadResult WALDIFFReadRecord(WALDIFFReaderState *waldiff_reader);
 WALDIFFRecordWriteResult WALDIFFWriteRecord(WALDIFFWriterState *waldiff_writer,
 											XLogRecord *record);
 
 /* This three fuctions returns palloced struct */
-static WALDIFFRecord fetch_insert(XLogRecord *record);
-static WALDIFFRecord fetch_update(XLogRecord *record);
-static WALDIFFRecord fetch_delete(XLogRecord *record);
+static WALDIFFRecord fetch_insert(XLogRecord *fetched_record);
+static WALDIFFRecord fetch_update(XLogRecord *fetched_record);
+static WALDIFFRecord fetch_delete(XLogRecord *fetched_record);
 
 static void overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup);
 
 static int getWALsegsize(const char *WALpath);											 
-static void constructWALDIFFs();
-static void finishWALDIFFSegment(); // do we need this? 
+static void constructWALDIFFs(void);
+// do we need this?
+// need to check how postgres deal with not full WAL segment
+static void finishWALDIFFSegment(void);
 
 #define GetHashKeyOfWALDIFFRecord(record) \
 ( \
@@ -114,6 +127,8 @@ _PG_archive_module_init(void)
 void 
 waldiff_startup(ArchiveModuleState *state)
 {
+	/* The value should be a power of 2 */
+	enum {hash_table_initial_size = 128};
     HASHCTL hash_ctl;
 
     /* First, allocating the archive module's memory context */
@@ -143,7 +158,7 @@ waldiff_startup(ArchiveModuleState *state)
 										  ALLOCSET_DEFAULT_SIZES);  
 	Assert(hash_ctl.hcxt != NULL);								  
 
-    hash_table = hash_create("WALDIFFHashTable", INITIAL_HASHTABLE_SIZE,
+    hash_table = hash_create("WALDIFFHashTable", hash_table_initial_size,
                              &hash_ctl, HASH_ELEM | HASH_CONTEXT | HASH_FUNCTION);
 	Assert(hash_table != NULL);
 
@@ -198,6 +213,7 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
 {
 	/* Preparations */
 	static int wal_segment_size = 0;
+	XLogReaderPrivate reader_private = {0};
 
 	if (wal_segment_size == 0)
 		wal_segment_size = getWALsegsize(WALpath);
@@ -205,11 +221,37 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
 
 	ereport(LOG, errmsg("WAL segment size is: %d", wal_segment_size));
 
+	/* Determines tli, segno and startPtr values of archived WAL segment
+	 * and future WALDIFF segment
+	 */
+	{
+		XLogSegNo segno;
+
+		reader_private.timeline = 1;
+		reader_private.startptr = InvalidXLogRecPtr;
+		reader_private.endptr = InvalidXLogRecPtr;
+		reader_private.endptr_reached = false;
+
+		XLogFromFileName(WALfile, &reader_private.timeline, &segno, wal_segment_size);
+		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, reader_private.startptr);
+		XLogSegNoOffsetToRecPtr(segno + 1, 0, wal_segment_size, reader_private.endptr);
+		Assert(reader_private.startptr != InvalidXLogRecPtr);
+
+		WALDIFFBeginWrite(writer_state, reader_private.startptr, segno, reader_private.timeline);
+
+		ereport(LOG, errmsg("segNo is: %lu", segno));
+		ereport(LOG, errmsg("tli is: %u", reader_private.timeline));
+		ereport(LOG, errmsg("startptr is: %lu", reader_private.startptr));
+		ereport(LOG, errmsg("endptr is: %lu", reader_private.endptr));
+	}
+
+
 	if (reader_state == NULL)
-		reader_state = WALDIFFReaderAllocate(wal_segment_size, waldiff_dir,
-											 WALDIFFREADER_ROUTINE(.read_record = WALDIFFReadRecord,
-																   .segment_open = WALDIFFOpenSegment,
-																   .segment_close = WALDIFFCloseSegment));
+		reader_state = XLogReaderAllocate(wal_segment_size, waldiff_dir,
+										  XL_ROUTINE(.page_read = WalReadPage,
+													 .segment_open = WalOpenSegment,
+													 .segment_close = WalCloseSegment),
+										  &reader_private);
 	Assert(reader_state != NULL);
 
 	ereport(LOG, errmsg("WALDIFFReader was allocated successfully"));
@@ -226,54 +268,60 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
 	/* Main work */
 	ereport(LOG, errmsg("archiving WAL file: %s", WALpath));
 
-	/* Determines tli, segno and startPtr values of archived WAL segment
-	 * and future WALDIFF segment
-	 */
 	{
-		XLogSegNo segNo;
-		TimeLineID tli;
-		XLogRecPtr startPtr;
+		XLogPageHeader page_hdr;
+		XLogRecPtr 	   first_record = XLogFindNextRecord(reader_state, reader_private.startptr);
+		
+		if (first_record == InvalidXLogRecPtr)
+		{
+			ereport(FATAL, 
+					errmsg("could not find a valid record after %X/%X", 
+							LSN_FORMAT_ARGS(reader_private.startptr)));
+			return false;
+		}
 
-		XLogFromFilName(WALfile, &tli, &segNo, reader_state->segcxt.segsize);
-		XLogSegNoOffsetToRecPtr(segNo, 0, reader_state->segcxt.segsize, startPtr);
-		Assert(startPtr != InvalidXLogRecPtr);
+		page_hdr = (XLogPageHeader) reader_state->readBuf;
 
-		WALDIFFBeginRead(reader_state, startPtr, segNo, tli);
-		WALDIFFBeginWrite(writer_state, startPtr, segNo, tli);
+		// This cases we should consider later 
+		if (page_hdr->xlp_rem_len)
+			ereport(LOG, 
+					errmsg("got some remaining data from a previous page : %d", page_hdr->xlp_rem_len));
 
-		ereport(LOG, errmsg("segNo is: %d", segNo));
-		ereport(LOG, errmsg("tli is: %d", tli));
-		ereport(LOG, errmsg("startPtr is: %d", startPtr));
+		if (first_record != reader_private.startptr && 
+			XLogSegmentOffset(reader_private.startptr, wal_segment_size) != 0)
+			ereport(LOG, 
+					errmsg("skipping over %u bytes", (uint32) (first_record - reader_private.startptr)));
 	}
 
 	/* Main reading & constructing & writing loop */
 	for (;;)
 	{
 		WALDIFFRecord WDRec;
-		XLogRecord *readRec;
+		XLogRecord 	  *WALRec;
+		char 		  *errormsg;
 
-		WALDIFFRecordReadResult res = WALDIFFReadRecord(reader_state);
-		if (res == WALDIFFREAD_FAIL)
-			ereport(ERROR,
-				errmsg("error during reading WAL record"));
-			
-		if (res == WALDIFFREAD_EOF)
-			break;
+		WALRec = XLogReadRecord(reader_state, &errormsg);
+		if (WALRec == InvalidXLogRecPtr) {
+			if (reader_private.endptr_reached)
+				break;
 
-		readRec = WALGetRec(reader_state);
+            ereport(ERROR, 
+					errmsg("XLogReadRecord failed to read WAL record: %s", errormsg));
+        }
 
-		/* Now we're processing only several HEAP type WAL records*/
-		if (WALRecGetRmid(WALGetRec(reader_state)) == RM_HEAP_ID)
+		/* Now we're processing only several HEAP type WAL records and without image*/
+		if (WALRec->xl_rmid == RM_HEAP_ID && !XLogRecHasBlockImage(reader_state, 0))
 		{
 			uint32_t prev_hash_key;
 			uint32_t hash_key;
 			HTABElem *entry;
 			bool is_found;
+			uint8 xlog_type = WALRec->xl_info & XLOG_HEAP_OPMASK;
 
-			switch(WALRecGetXLogType(WALGetRec(reader_state)))
+			switch(xlog_type)
 			{
 				case XLOG_HEAP_INSERT:
-					WDRec = fetch_insert(readRec);
+					WDRec = fetch_insert(WALRec);
 					if (WDRec == NULL)
 						ereport(ERROR, errmsg("fetch_insert failed"));
 
@@ -289,7 +337,7 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
 					break;
 
 				case XLOG_HEAP_UPDATE:
-					WDRec = fetch_update(readRec);
+					WDRec = fetch_update(WALRec);
 					if (WDRec == NULL)
 						ereport(ERROR, errmsg("fetch_update failed"));
 
@@ -299,7 +347,8 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
 					entry = (HTABElem *) hash_search(hash_table, (void*) &prev_hash_key, HASH_FIND, &is_found);
 					if (is_found)
 					{
-						bool is_insert_WDrec = (WALDIFFRecGetXLogType(entry->data) == XLOG_HEAP_INSERT);
+						uint8 prev_xlog_type = entry->data->rec_hdr.xl_info & XLOG_HEAP_OPMASK;
+						bool is_insert_WDrec = (prev_xlog_type == XLOG_HEAP_INSERT);
 						overlay_update(entry->data, WDRec);
 
 						if (!is_insert_WDrec) 
@@ -320,7 +369,7 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
 					break;
 
 				case XLOG_HEAP_DELETE:
-					WDRec = fetch_delete(readRec);
+					WDRec = fetch_delete(WALRec);
 					if (WDRec == NULL)
 						ereport(ERROR, errmsg("fetch_delete failed"));
 
@@ -347,7 +396,7 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
 
 				/* unprocessed record type */
 				default:
-					WALDIFFRecordWriteResult res = WALDIFFWriteRecord(writer_state, readRec);
+					WALDIFFRecordWriteResult res = WALDIFFWriteRecord(writer_state, WALRec);
 					if (res == WALDIFFWRITE_FAIL) 
 						ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive"));
 					break;
@@ -356,7 +405,7 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
 		
 		else 
 		{
-			WALDIFFRecordWriteResult res = WALDIFFWriteRecord(writer_state, readRec);
+			WALDIFFRecordWriteResult res = WALDIFFWriteRecord(writer_state, WALRec);
 			if (res == WALDIFFWRITE_FAIL) 
 				ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive"));
 		}
@@ -371,7 +420,8 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
 	constructWALDIFFs();
 
 	ereport(LOG, errmsg("finishing WALDIFF segment"));
-
+	
+	/* Questionable */
 	/* End the segment with SWITCH record */
 	finishWALDIFFSegment();
 
@@ -388,14 +438,85 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
 void 
 waldiff_shutdown(ArchiveModuleState *state)
 {
-	close(reader_state->seg.fd);
 	close(writer_state->seg.fd);
+
+	/* Must have 'case this function closes fd */
+	XLogReaderFree(reader_state);
 
 	hash_destroy(hash_table);
 
 	MemoryContextSwitchTo(memory_context_storage->old);
 	Assert(CurrentMemoryContext != memory_context_storage->current);
 	MemoryContextDelete(memory_context_storage->current);
+}
+
+void 
+WalOpenSegment(XLogReaderState *state,
+			   XLogSegNo nextSegNo,
+			   TimeLineID *tli_p)
+{
+	TimeLineID tli = *tli_p;
+    char fname[XLOG_FNAME_LEN];
+	char fpath[MAXPGPATH];
+
+    XLogFileName(fname, tli, nextSegNo, state->segcxt.ws_segsize);
+
+	if (snprintf(fpath, MAXPGPATH, "%s/%s", state->segcxt.ws_dir, fname) == -1)
+		ereport(ERROR,
+				errmsg("error during reading WAL absolute path : %s/%s", state->segcxt.ws_dir, fname));
+
+	state->seg.ws_file = OpenTransientFile(fpath, PG_BINARY | O_RDONLY);
+	if (state->seg.ws_file == -1)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open WAL segment \"%s\": %m", fpath)));
+}
+
+int 
+WalReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
+			XLogRecPtr targetPtr, char *readBuff)
+{
+	XLogReaderPrivate *private = state->private_data;
+	int				  count = XLOG_BLCKSZ;
+	WALReadError 	  errinfo;
+
+	if (private->endptr != InvalidXLogRecPtr)
+	{
+		if (targetPagePtr + XLOG_BLCKSZ <= private->endptr)
+			count = XLOG_BLCKSZ;
+		else if (targetPagePtr + reqLen <= private->endptr)
+			count = private->endptr - targetPagePtr;
+		else
+		{
+			private->endptr_reached = true;
+			return -1;
+		}
+	}
+
+	if (!WALRead(state, readBuff, targetPagePtr, count, private->timeline,
+				 &errinfo))
+	{
+		WALOpenSegment *seg = &errinfo.wre_seg;
+		char		   fname[MAXPGPATH];
+
+		XLogFileName(fname, seg->ws_tli, seg->ws_segno,
+					 state->segcxt.ws_segsize);
+
+		if (errinfo.wre_errno != 0)
+		{
+			errno = errinfo.wre_errno;
+			ereport(ERROR, 
+					errmsg("could not read from file %s, offset %d: %m",
+					fname, errinfo.wre_off));
+		}
+		else
+			ereport(ERROR,
+					errmsg("could not read from file %s, offset %d: read %d of %d",
+					fname, errinfo.wre_off, errinfo.wre_read,
+					errinfo.wre_req));
+	}
+
+	return count;
 }
 
 /*
@@ -413,20 +534,23 @@ WALDIFFOpenSegment(WALDIFFSegmentContext *segcxt, WALDIFFSegment *seg)
 
 	if (snprintf(fpath, MAXPGPATH, "%s/%s", segcxt->dir, fname) == -1)
 		ereport(ERROR,
-				errmsg("error during opening WAL segment: %s/%s", segcxt->dir, fname));
+				errmsg("error during reading WALDIFF absolute path: %s/%s", segcxt->dir, fname));
 	
-	seg->fd = OpenTransientFile(fpath, PG_BINARY | O_RDWR | O_CREAT | O_APPEND);
+	seg->fd = OpenTransientFile(fpath, PG_BINARY | O_RDWR | O_CREAT);
 	if (seg->fd == -1)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				errmsg("could not open WAL segment \"%s\": %m", fpath)));
+				errmsg("could not open WALDIFF segment \"%s\": %m", fpath)));
 }
 
-/*
- * WALDIFFCloseSegment
- *
- * Closes previously opend WAL segment
- */
+
+void 
+WalCloseSegment(XLogReaderState *state)
+{
+	close(state->seg.ws_file);
+	state->seg.ws_file = -1;
+}
+
 void 
 WALDIFFCloseSegment(WALDIFFSegment *seg)
 {
@@ -434,21 +558,6 @@ WALDIFFCloseSegment(WALDIFFSegment *seg)
 	close(seg->fd);
 
 	seg->fd = -1;
-	seg->segno = 0;
-	seg->tli = 0;
-}
-
-
-/* 
- * WALDIFFReadRecord
- * 
- * Read one record
- */
-WALDIFFRecordReadResult 
-WALDIFFReadRecord(WALDIFFReaderState *waldiff_reader)
-{
-
-	return WALDIFFREAD_SUCCESS;
 }
 
 /* 
@@ -469,9 +578,10 @@ WALDIFFWriteRecord(WALDIFFWriterState *waldiff_writer,
  * 
  */
 WALDIFFRecord 
-fetch_insert(XLogRecord *record)
+fetch_insert(XLogRecord *fetched_record)
 {
 
+	return NULL;
 }
 
 /*
@@ -479,9 +589,10 @@ fetch_insert(XLogRecord *record)
  * 
  */
 WALDIFFRecord 
-fetch_update(XLogRecord *record)
+fetch_update(XLogRecord *fetched_record)
 {
 
+	return NULL;
 }
 
 /*
@@ -489,9 +600,16 @@ fetch_update(XLogRecord *record)
  * 
  */
 WALDIFFRecord 
-fetch_delete(XLogRecord *record)
+fetch_delete(XLogRecord *fetched_record)
 {
 
+	return NULL;
+}
+
+void 
+overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
+{
+	
 }
 
 /*
@@ -522,6 +640,7 @@ getWALsegsize(const char *WALpath)
 	wal_segment_size = page_hdr->xlp_seg_size;
 	Assert(IsValidWalSegSize(wal_segment_size));
 
+	close(fd);
 	return wal_segment_size;
 }
 
@@ -530,12 +649,15 @@ getWALsegsize(const char *WALpath)
  * 
  * Creates WALDIFF records according to data in hash table 
  * and writes them into WALDIFF segment
+ * 
+ * [ I recon We should remain RMGR records' structure ]
  */
 void 
-constructWALDIFFs()
+constructWALDIFFs(void)
 {
 	HTABElem *entry;
 	HASH_SEQ_STATUS status;
+	WALDIFFRecordWriteResult res;
 
 	hash_seq_init(&status, hash_table);
 	while ((entry = (HTABElem *) hash_seq_search(&status)) != NULL)
@@ -545,13 +667,15 @@ constructWALDIFFs()
 		if (record == NULL) 
 			record = palloc0(XLogRecordMaxSize);
 
-		if (WALRecGetRmid(WALGetRec(reader_state)) == RM_HEAP_ID)
+		if (WDRec->rec_hdr.xl_rmid == RM_HEAP_ID)
 		{
+			uint8 xlog_type = WDRec->rec_hdr.xl_info & XLOG_HEAP_OPMASK;
+
 			/* The records have the same header */
-			memcpy(record, WDRec, SizeOfXLogRecord);
+			memcpy(record, &(WDRec->rec_hdr), SizeOfXLogRecord);
 			record->xl_tot_len += SizeOfXLogRecord;
 
-			switch(WALRecGetXLogType(WALGetRec(reader_state)))
+			switch(xlog_type)
 			{
 				/* 
 				 * Contains XLogRecord + XLogRecordBlockHeader_0 +  
@@ -559,7 +683,11 @@ constructWALDIFFs()
 				 * block_data_0(xl_heap_header + tuple data) + main_data(xl_heap_insert)
 				 */
 				case XLOG_HEAP_INSERT:
-					WALDIFFBlock block_0 = WDRec->blocks[0];
+				{
+					WALDIFFBlock block_0;
+
+					Assert(WDRec->max_block_id >= 0);
+					block_0 = WDRec->blocks[0];
 
 					/* XLogRecordBlockHeader */
 					memcpy(record, &(block_0.blk_hdr), SizeOfXLogRecordBlockHeader);
@@ -570,14 +698,15 @@ constructWALDIFFs()
 					record->xl_tot_len +=  sizeof(RelFileLocator);
 
 					/* BlockNumber */
-					memcpy(record, block_0.blkno, sizeof(BlockNumber));
+					memcpy(record, &(block_0.blkno), sizeof(BlockNumber));
 					record->xl_tot_len += sizeof(BlockNumber);
 
 					/* block data */
-					memcpy(record, block_0.block_data, block_0.block_data_len);
+					memcpy(record, &(block_0.block_data), block_0.block_data_len);
 					record->xl_tot_len += block_0.block_data_len;
 
 					break;
+				}
 				
 				/* 
 				 * Contains XLogRecord + XLogRecordBlockHeader_0 + 
@@ -589,12 +718,17 @@ constructWALDIFFs()
 				 * 
 				 * block 0: new page
 				 * block 1: old page, if different. (no data, just a reference to the blk)
-				 * [As I got it, block 1 = header1 + blockNo1, and main_data contains offset to
+				 * [ As I got it, block 1 = header1 + blockNo1, and main_data contains offset to
 				 * old tuple in this blockNo1 ]
 				 */
 				case XLOG_HEAP_UPDATE:
-					WALDIFFBlock block_0 = WDRec->blocks[0];
-					WALDIFFBlock block_1 = WDRec->blocks[1];
+				{
+					WALDIFFBlock block_0;
+					WALDIFFBlock block_1;
+					
+					Assert(WDRec->max_block_id >= 1);
+					block_0 = WDRec->blocks[0];
+					block_1 = WDRec->blocks[1];
 
 					/* XLogRecordBlockHeader 0 */
 					memcpy(record, &(block_0.blk_hdr), SizeOfXLogRecordBlockHeader);
@@ -605,11 +739,11 @@ constructWALDIFFs()
 					record->xl_tot_len +=  sizeof(RelFileLocator);
 
 					/* BlockNumber 0 */
-					memcpy(record, block_0.blkno, sizeof(BlockNumber));
+					memcpy(record, &(block_0.blkno), sizeof(BlockNumber));
 					record->xl_tot_len += sizeof(BlockNumber);
 
 					/* block data 0 */
-					memcpy(record, block_0.block_data, block_0.block_data_len);
+					memcpy(record, &(block_0.block_data), block_0.block_data_len);
 					record->xl_tot_len += block_0.block_data_len;
 
 					/* XLogRecordBlockHeader 1 */
@@ -617,17 +751,22 @@ constructWALDIFFs()
 					record->xl_tot_len += SizeOfXLogRecordBlockHeader;
 
 					/* BlockNumber 1 */
-					memcpy(record, block_1.blkno, sizeof(BlockNumber));
+					memcpy(record, &(block_1.blkno), sizeof(BlockNumber));
 					record->xl_tot_len += sizeof(BlockNumber);
 
 					break;
+				}
 
 				/* 
 				 * Contains XLogRecord + XLogRecordBlockHeader_0 + 
 				 * RelFileLocator_0 + BlockNumber_0 + main_data(xl_heap_delete)
 				 */
 				case XLOG_HEAP_DELETE:
-					WALDIFFBlock block_0 = WDRec->blocks[0];
+				{
+					WALDIFFBlock block_0;
+
+					Assert(WDRec->max_block_id >= 0);
+					block_0 = WDRec->blocks[0];
 
 					/* XLogRecordBlockHeader */
 					memcpy(record, &(block_0.blk_hdr), SizeOfXLogRecordBlockHeader);
@@ -638,10 +777,11 @@ constructWALDIFFs()
 					record->xl_tot_len +=  sizeof(RelFileLocator);
 
 					/* BlockNumber */
-					memcpy(record, block_0.blkno, sizeof(BlockNumber));
+					memcpy(record, &(block_0.blkno), sizeof(BlockNumber));
 					record->xl_tot_len += sizeof(BlockNumber);
 
 					break;
+				}
 
 				default:
 					ereport(ERROR, errmsg("unproccessed XLOG_HEAP type"));
@@ -660,20 +800,20 @@ constructWALDIFFs()
 				COMP_CRC32C(crc, (char *) record, offsetof(XLogRecord, xl_crc));
 				FIN_CRC32C(crc);
 
-				memcpy(record + SizeOfXLogRecord - sizeof(pg_crc32c), &crc, sizeof(pg_crc32c));
+				memcpy(((char *) record) + SizeOfXLogRecord - sizeof(pg_crc32c), &crc, sizeof(pg_crc32c));
 			}
 		}
 		else 
 			ereport(ERROR, errmsg("WALDIFF cannot contains not XLOG_HEAP types"));
 
-		WALDIFFRecordWriteResult res = WALDIFFWriteRecord(writer_state, record);
+		res = WALDIFFWriteRecord(writer_state, record);
 		if (res == WALDIFFWRITE_FAIL) 
 			ereport(ERROR, errmsg("error during writing WALDIFF records in constructWALDIFFs"));
 	}
 }
 
 void 
-finishWALDIFFSegment()
+finishWALDIFFSegment(void)
 {
 
 }

@@ -86,6 +86,11 @@ typedef struct WALDIFFRecordData
 	XLogRecPtr	    lsn;
 	XLogRecord      rec_hdr;	
 
+
+	/* 
+	 * If some of them not used in ChainRecord (for example. insert does not need t_xmax), 
+	 * they will be NULL during fetching.
+	 */
 	TransactionId   t_xmin;
 	TransactionId   t_xmax;
 	CommandId	    t_cid;

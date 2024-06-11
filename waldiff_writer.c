@@ -3,7 +3,7 @@
 
 WALDIFFWriterState *
 WALDIFFWriterAllocate(int wal_segment_size,
-					  const char *waldiff_dir,
+					  char *waldiff_dir,
 					  WALDIFFWriterRoutine *routine)
 {
 	WALDIFFWriterState *state;
@@ -77,5 +77,5 @@ WALDIFFBeginWrite(WALDIFFWriterState *state,
 	state->seg.segno = segNo;
 	state->seg.tli = tli;
 
-	state->routine.segment_open(&(state->seg), &(state->segcxt));
+	state->routine.segment_open(&(state->segcxt), &(state->seg));
 }

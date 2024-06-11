@@ -2,7 +2,6 @@ waldiff_sources = files(
   'waldiff.c',
   'waldiff.c',
 	'waldiff_writer.c',
-	'waldiff_reader.c',
 	'waldiff_test.c',
 )
 

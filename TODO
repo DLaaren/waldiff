@@ -1,3 +1,4 @@
-continue refactoring
+rewriter "fetch_*" functions because the structure of WALDIFF was changed
+write function // idea is to collect data and then flush it all at once
 add test functions
-НАЙТИ ГЛОБАЛЬНУЮ ПЕРЕМЕННУЮ В КОТОРОЙ ЗАПИСАН РАЗМЕР СЕГМЕНТА
+НАЙТИ ГЛОБАЛЬНУЮ ПЕРЕМЕННУЮ В КОТОРОЙ ЗАПИСАН РАЗМЕР СЕГМЕНТА -- модет гук достать?
