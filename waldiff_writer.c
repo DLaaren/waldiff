@@ -55,7 +55,8 @@ WALDIFFWriterAllocate(int wal_segment_size,
 void 
 WALDIFFWriterFree(WALDIFFWriterState *writer)
 {
-	// check buffer and flushed leftovers
+	if (writer->writeBufSize > 0)
+		WALDIFFFlushBuffer(writer);
 
 	if (writer->seg.fd != -1)
 		writer->routine.segment_close(&(writer->seg));
@@ -89,6 +90,8 @@ WALDIFFFlushBuffer(WALDIFFWriterState *writer)
 
 	Assert(WALDIFFWriterGetBufSize(writer) >= 0);
 
+	ereport(LOG, errmsg("Writing to WALDIFF segment; curr buff size: %u", writer->writeBufSize));
+
 	written_bytes = write(writer->seg.fd, WALDIFFWriterGetBuf(writer), WALDIFFWriterGetBufSize(writer));
 
 	if (written_bytes != WALDIFFWriterGetBufSize(writer))
@@ -102,10 +105,18 @@ WALDIFFFlushBuffer(WALDIFFWriterState *writer)
 		return WALDIFFWRITE_FAIL;
 	}
 	
+	ereport(LOG, errmsg("Wrote %d bytes to WALDIFF segment", written_bytes));
+
 	pg_fsync(writer->seg.fd);
+
+	ereport(LOG, errmsg("WALDIFF old StartRecPtr: %lu", writer->StartRecPtr));
+	ereport(LOG, errmsg("WALDIFF old EndRecPtr: %lu", writer->EndRecPtr));
 
 	writer->StartRecPtr = writer->EndRecPtr;
 	writer->EndRecPtr += written_bytes;
+
+	ereport(LOG, errmsg("WALDIFF new StartRecPtr: %lu", writer->StartRecPtr));
+	ereport(LOG, errmsg("WALDIFF new EndRecPtr: %lu", writer->EndRecPtr));
 
 	return WALDIFFWRITE_SUCCESS;
 }

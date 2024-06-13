@@ -410,7 +410,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 		{
 			WALDIFFRecordWriteResult res = WALDIFFWriteRecord(writer, WALRec);
 			if (res == WALDIFFWRITE_FAIL) 
-				ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive^ %s", 
+				ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive %s", 
 									  WALDIFFWriterGetErrMsg(writer)));
 		}
 	}
@@ -418,7 +418,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 	Assert(((writer->seg.segno + 1) * writer->segcxt.segsize) - 
 			writer->segoff > 0);
 
-	ereport(LOG, errmsg("start constructing WALDIFFs"));
+	ereport(LOG, errmsg("constructing WALDIFFs"));
 
 	/* Constructing and writing WALDIFFs to WALDIFF segment */
 	constructWALDIFFs();
@@ -429,9 +429,10 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 	/* End the segment with SWITCH record */
 	finishWALDIFFSegment();
 
+	if (writer->writeBufSize > 0)
+		WALDIFFFlushBuffer(writer);
+
 	ereport(LOG, errmsg("archived WAL file: %s", WALpath));
-	Assert(wal_segment_size >= segno * wal_segment_size - writer->EndRecPtr);
-	ereport(LOG, errmsg("WALDIFF segment size: %lu", segno * wal_segment_size - writer->EndRecPtr));
 
 	return true;
 }
@@ -592,7 +593,7 @@ WALDIFFWriteRecord(WALDIFFWriterState *waldiff_writer,
 		XLogLongPageHeaderData long_page_hdr = {0};
 		XLogPageHeaderData page_hdr = {0};
 
-		ereport(LOG, errmsg("Writing long page header of the very first WALDIFF segment"));
+		ereport(LOG, errmsg("Putting long page header of the very first WALDIFF segment"));
 
 		page_hdr.xlp_magic = XLOG_PAGE_MAGIC;		
 		page_hdr.xlp_info |= XLP_LONG_HEADER;
@@ -614,7 +615,7 @@ WALDIFFWriteRecord(WALDIFFWriterState *waldiff_writer,
 	{
 		XLogPageHeaderData page_hdr = {0};
 
-		ereport(LOG, errmsg("Writing page header of a new WALDIFF segment"));
+		ereport(LOG, errmsg("Putting page header of a new WALDIFF segment"));
 		
 		page_hdr.xlp_magic = XLOG_PAGE_MAGIC;		
 		page_hdr.xlp_info = 0;
