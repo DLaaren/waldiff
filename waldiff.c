@@ -296,7 +296,7 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
 	/* Main reading & constructing & writing loop */
 	for (;;)
 	{
-		WALDIFFRecord WDRec;
+		WALDIFFRecord WDrec;
 		XLogRecord 	  *WALRec;
 		char 		  *errormsg;
 
@@ -321,65 +321,65 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
 			switch(xlog_type)
 			{
 				case XLOG_HEAP_INSERT:
-					WDRec = fetch_insert(reader_state);
-					if (WDRec == NULL)
+					WDrec = fetch_insert(reader_state);
+					if (WDrec == NULL)
 						ereport(ERROR, errmsg("fetch_insert failed"));
 
-					hash_key = GetHashKeyOfWALDIFFRecord(WDRec);
+					hash_key = GetHashKeyOfWALDIFFRecord(WDrec);
 					hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
 					if (is_found)
 						entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
 
 					entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
-					entry->data = WDRec;
+					entry->data = WDrec;
 					Assert(entry->key == hash_key);
 					
 					break;
 
 				case XLOG_HEAP_UPDATE:
-					WDRec = fetch_update(reader_state);
-					if (WDRec == NULL)
+					WDrec = fetch_update(reader_state);
+					if (WDrec == NULL)
 						ereport(ERROR, errmsg("fetch_update failed"));
 
-					prev_hash_key = GetHashKeyOfPrevWALDIFFRecord(WDRec);
-					hash_key = GetHashKeyOfWALDIFFRecord(WDRec);
+					prev_hash_key = GetHashKeyOfPrevWALDIFFRecord(WDrec);
+					hash_key = GetHashKeyOfWALDIFFRecord(WDrec);
 
 					entry = (HTABElem *) hash_search(hash_table, (void*) &prev_hash_key, HASH_FIND, &is_found);
 					if (is_found)
 					{
 						uint8 prev_xlog_type = entry->data->rec_hdr.xl_info & XLOG_HEAP_OPMASK;
 						bool is_insert_WDrec = (prev_xlog_type == XLOG_HEAP_INSERT);
-						overlay_update(entry->data, WDRec);
+						overlay_update(entry->data, WDrec);
 
 						if (!is_insert_WDrec) 
 						{
 							entry = (HTABElem *) hash_search(hash_table, (void*) &prev_hash_key, HASH_REMOVE, NULL);
 							entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
-							entry->data = WDRec;
+							entry->data = WDrec;
 							Assert(entry->key == hash_key);
 						}
 					}
 					else 
 					{
 						entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
-						entry->data = WDRec;
+						entry->data = WDrec;
 						Assert(entry->key == hash_key);
 					}
 
 					break;
 
 				case XLOG_HEAP_DELETE:
-					WDRec = fetch_delete(reader_state);
-					if (WDRec == NULL)
+					WDrec = fetch_delete(reader_state);
+					if (WDrec == NULL)
 						ereport(ERROR, errmsg("fetch_delete failed"));
 
-					prev_hash_key = GetHashKeyOfPrevWALDIFFRecord(WDRec);
-					hash_key = GetHashKeyOfWALDIFFRecord(WDRec);
+					prev_hash_key = GetHashKeyOfPrevWALDIFFRecord(WDrec);
+					hash_key = GetHashKeyOfWALDIFFRecord(WDrec);
 
 					entry = hash_search(hash_table, (void*) &prev_hash_key, HASH_FIND, &is_found);
 					if (is_found)
 					{
-						/* if prev WDRec is not presented in the HTAB then it's not in WALDIFF segment */
+						/* if prev WDrec is not presented in the HTAB then it's not in WALDIFF segment */
 						entry = (HTABElem *) hash_search(hash_table, (void*) &prev_hash_key, HASH_REMOVE, NULL);
 						Assert(entry == NULL);
 					}
@@ -388,7 +388,7 @@ waldiff_archive(ArchiveModuleState *state, const char *WALfile, const char *WALp
 					else 
 					{
 						entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
-						entry->data = WDRec;
+						entry->data = WDrec;
 						Assert(entry->key == hash_key);
 					}
 
@@ -581,7 +581,7 @@ WALDIFFRecord
 fetch_insert(XLogReaderState *record)
 {
 	/* HEAP_INSERT contains one block */
-	WALDIFFRecord WDRec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord + sizeof(WALDIFFBlock));
+	WALDIFFRecord WDrec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord + sizeof(WALDIFFBlock));
 	XLogRecordBlockHeader blk_hdr;
 	char *block_data;
 	Size block_data_len;
@@ -590,67 +590,152 @@ fetch_insert(XLogReaderState *record)
 	BlockNumber blknum;
 	xl_heap_insert *main_data = (xl_heap_insert *) XLogRecGetData(record);
 
-	WDRec->type = XLOG_HEAP_INSERT;
+	WDrec->type = XLOG_HEAP_INSERT;
 
 	/* Copy lsn */
-	WDRec->lsn = record->record->lsn;
+	WDrec->lsn = record->record->lsn;
 
 	/* Copy XLogRecord aka header */
-	WDRec->rec_hdr = record->record->header;
+	WDrec->rec_hdr = record->record->header;
 
 	/* Copy some info */
-	WDRec->t_xmin = XLogRecGetXid(record);
-	WDRec->t_xmax = 0;
-	WDRec->t_cid = 0;
+	WDrec->t_xmin = XLogRecGetXid(record);
+	WDrec->t_xmax = 0;
+	WDrec->t_cid = FirstCommandId;
+
+	XLogRecGetBlockTag(record, 0, &rel_file_locator, &forknum, &blknum);
 	
 	/* 
 	 * Copy tuple's version pointers
 	 * At this step, t_ctid always will be point to itself,
 	 * because we reckon this record as first
 	 */
-	ItemPointerSetBlockNumber(&(WDRec->current_t_ctid), blknum);
-    ItemPointerSetOffsetNumber(&(WDRec->current_t_ctid), main_data->offnum);
-	WDRec->prev_t_ctid = WDRec->current_t_ctid;
+	ItemPointerSetBlockNumber(&(WDrec->current_t_ctid), blknum);
+    ItemPointerSetOffsetNumber(&(WDrec->current_t_ctid), main_data->offnum);
+	WDrec->prev_t_ctid = WDrec->current_t_ctid;
 
 	/* Copy main data */
 	/* check do we need to allocate space for main data? 
 	 * 'cause there is a huge ring buffer for all records(?) */
-	WDRec->main_data = main_data;
-	WDRec->main_data_len = SizeOfHeapInsert;
+	WDrec->main_data = main_data;
+	WDrec->main_data_len = SizeOfHeapInsert;
 
 	/* Copy block data */
-	XLogRecGetBlockTag(record, 0, &rel_file_locator, &forknum, &blknum);
 	block_data = XLogRecGetBlockData(record, 0, &block_data_len);
 
-	WDRec->max_block_id = 0;
+	WDrec->max_block_id = 0;
 
 	blk_hdr.id = 0;
 	blk_hdr.fork_flags = record->record->blocks[0].flags;
 	blk_hdr.data_length = block_data_len;
 
-	WDRec->blocks[0].blk_hdr = blk_hdr;
-	WDRec->blocks[0].file_loc = rel_file_locator;
-	WDRec->blocks[0].forknum = forknum;
-	WDRec->blocks[0].blknum = blknum;
-	WDRec->blocks[0].has_data = true;
+	WDrec->blocks[0].blk_hdr = blk_hdr;
+	WDrec->blocks[0].file_loc = rel_file_locator;
+	WDrec->blocks[0].forknum = forknum;
+	WDrec->blocks[0].blknum = blknum;
+	WDrec->blocks[0].has_data = true;
 	Assert(XLogRecHasBlockData(record, 0));
-	WDRec->blocks[0].block_data = block_data;
-	WDRec->blocks[0].block_data_len = block_data_len;
+	WDrec->blocks[0].block_data = block_data;
+	WDrec->blocks[0].block_data_len = block_data_len;
 
-	return WDRec;
+	return WDrec;
 }
 
 /*
  * fetch_update
  * 
+ * Backup blk 0: new page
+ *
+ * If XLH_UPDATE_PREFIX_FROM_OLD or XLH_UPDATE_SUFFIX_FROM_OLD flags are set,
+ * the prefix and/or suffix come first, as one or two uint16s.
+ *
+ * After that, xl_heap_header and new tuple data follow.  The new tuple
+ * data doesn't include the prefix and suffix, which are copied from the
+ * old tuple on replay.
+ *
+ * If XLH_UPDATE_CONTAINS_NEW_TUPLE flag is given, the tuple data is
+ * included even if a full-page image was taken.
+ *
+ * Backup blk 1: old page, if different. (no data, just a reference to the blk)
  */
 WALDIFFRecord 
 fetch_update(XLogReaderState *record)
 {
-	WALDIFFRecord WDRec;
+	/* HEAP_UPDATE contains two blocks */
+	WALDIFFRecord WDrec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord + 2 * sizeof(WALDIFFBlock));
+	XLogRecordBlockHeader blk_hdr;
+	char *block_data;
+	Size block_data_len;
+	RelFileLocator rel_file_locator;
+	ForkNumber forknum;
+	BlockNumber new_blknum,
+				old_blknum;
 	xl_heap_update *main_data = (xl_heap_update *) XLogRecGetData(record);
 
-	return WDRec;
+	WDrec->type = XLOG_HEAP_UPDATE;
+
+	/* Copy lsn */
+	WDrec->lsn = record->record->lsn;
+
+	/* Copy XLogRecord aka header */
+	WDrec->rec_hdr = record->record->header;
+
+	/* Copy some info */
+	WDrec->t_xmin = XLogRecGetXid(record);
+	WDrec->t_xmax = main_data->new_xmax;
+	WDrec->t_cid = FirstCommandId;
+
+	XLogRecGetBlockTag(record, 0, &rel_file_locator, &forknum, &new_blknum);
+	if (!XLogRecGetBlockTagExtended(record, 1, NULL, NULL, &old_blknum, NULL))
+		old_blknum = new_blknum;
+
+	/* 
+	 * Copy tuple's version pointers
+	 */
+	ItemPointerSetBlockNumber(&(WDrec->current_t_ctid), new_blknum);
+    ItemPointerSetOffsetNumber(&(WDrec->current_t_ctid), main_data->new_offnum);
+	ItemPointerSetBlockNumber(&(WDrec->prev_t_ctid), old_blknum);
+    ItemPointerSetOffsetNumber(&(WDrec->prev_t_ctid), main_data->old_offnum);
+
+	/* Copy main data */
+	/* check do we need to allocate space for main data? 
+	 * 'cause there is a huge ring buffer for all records(?) */
+	WDrec->main_data = main_data;
+	WDrec->main_data_len = SizeOfHeapUpdate;
+
+	/* Copy block data */
+	block_data = XLogRecGetBlockData(record, 0, &block_data_len);
+
+	WDrec->max_block_id = 1;
+
+	/* Block 0 */
+	blk_hdr.id = 0;
+	blk_hdr.fork_flags = record->record->blocks[0].flags;
+	blk_hdr.data_length = block_data_len;
+
+	WDrec->blocks[0].blk_hdr = blk_hdr;
+	WDrec->blocks[0].file_loc = rel_file_locator;
+	WDrec->blocks[0].forknum = forknum;
+	WDrec->blocks[0].blknum = new_blknum;
+	WDrec->blocks[0].has_data = true;
+	Assert(XLogRecHasBlockData(record, 0));
+	WDrec->blocks[0].block_data = block_data;
+	WDrec->blocks[0].block_data_len = block_data_len;
+
+	/* Block 1 */
+	blk_hdr.id = 1;
+	blk_hdr.fork_flags = record->record->blocks[1].flags;
+	blk_hdr.data_length = 0;
+
+	WDrec->blocks[0].blk_hdr = blk_hdr;
+	WDrec->blocks[0].blknum = old_blknum;
+	WDrec->blocks[0].has_data = false;
+	Assert(!XLogRecHasBlockData(record, 1));
+
+	if (main_data->flags & XLH_UPDATE_PREFIX_FROM_OLD || main_data->flags & XLH_UPDATE_SUFFIX_FROM_OLD)
+		Assert(new_blknum == old_blknum);
+
+	return WDrec;
 }
 
 /*
@@ -661,58 +746,58 @@ WALDIFFRecord
 fetch_delete(XLogReaderState *record)
 {
 	/* HEAP_DELETE contains one block */
-	WALDIFFRecord WDRec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord + sizeof(WALDIFFBlock));
+	WALDIFFRecord WDrec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord + sizeof(WALDIFFBlock));
 	XLogRecordBlockHeader blk_hdr;
 	RelFileLocator rel_file_locator;
 	ForkNumber forknum;
 	BlockNumber blknum;
 	xl_heap_delete *main_data = (xl_heap_delete *) XLogRecGetData(record);
 
-	WDRec->type = XLOG_HEAP_DELETE;
+	WDrec->type = XLOG_HEAP_DELETE;
 
 	/* Copy lsn */
-	WDRec->lsn = record->record->lsn;
+	WDrec->lsn = record->record->lsn;
 
 	/* Copy XLogRecord aka header */
-	WDRec->rec_hdr = record->record->header;
+	WDrec->rec_hdr = record->record->header;
 
 	/* Copy some info */
-	WDRec->t_xmin = 0;
-	WDRec->t_xmax = main_data->xmax;
-	WDRec->t_cid = 0;
+	WDrec->t_xmin = 0;
+	WDrec->t_xmax = main_data->xmax;
+	WDrec->t_cid = FirstCommandId;
+
+	XLogRecGetBlockTag(record, 0, &rel_file_locator, &forknum, &blknum);
 	
 	/* 
 	 * Copy tuple's version pointers
 	 * At this step, t_ctid always will be point to itself,
 	 * because we reckon this record as first
 	 */
-	ItemPointerSetBlockNumber(&(WDRec->current_t_ctid), blknum);
-    ItemPointerSetOffsetNumber(&(WDRec->current_t_ctid), main_data->offnum);
-	WDRec->prev_t_ctid = WDRec->current_t_ctid;
+	ItemPointerSetBlockNumber(&(WDrec->current_t_ctid), blknum);
+    ItemPointerSetOffsetNumber(&(WDrec->current_t_ctid), main_data->offnum);
+	WDrec->prev_t_ctid = WDrec->current_t_ctid;
 
 	/* Copy main data */
 	/* check do we need to allocate space for main data? 
 	 * 'cause there is a huge ring buffer for all records(?) */
-	WDRec->main_data = main_data;
-	WDRec->main_data_len = SizeOfHeapDelete;
+	WDrec->main_data = main_data;
+	WDrec->main_data_len = SizeOfHeapDelete;
 
 	/* Copy block data */
-	XLogRecGetBlockTag(record, 0, &rel_file_locator, &forknum, &blknum);
-
-	WDRec->max_block_id = 0;
+	WDrec->max_block_id = 0;
 
 	blk_hdr.id = 0;
 	blk_hdr.fork_flags = record->record->blocks[0].flags;
 	blk_hdr.data_length = 0;
 
-	WDRec->blocks[0].blk_hdr = blk_hdr;
-	WDRec->blocks[0].file_loc = rel_file_locator;
-	WDRec->blocks[0].forknum = forknum;
-	WDRec->blocks[0].blknum = blknum;
-	WDRec->blocks[0].has_data = false;
+	WDrec->blocks[0].blk_hdr = blk_hdr;
+	WDrec->blocks[0].file_loc = rel_file_locator;
+	WDrec->blocks[0].forknum = forknum;
+	WDrec->blocks[0].blknum = blknum;
+	WDrec->blocks[0].has_data = false;
 	Assert(!XLogRecHasBlockData(record, 0));
 
-	return WDRec;
+	return WDrec;
 }
 
 void 
@@ -771,17 +856,17 @@ constructWALDIFFs(void)
 	hash_seq_init(&status, hash_table);
 	while ((entry = (HTABElem *) hash_seq_search(&status)) != NULL)
 	{
-		WALDIFFRecord WDRec = entry->data;
+		WALDIFFRecord WDrec = entry->data;
 		static XLogRecord *record;
 		if (record == NULL) 
 			record = palloc0(XLogRecordMaxSize);
 
-		if (WDRec->rec_hdr.xl_rmid == RM_HEAP_ID)
+		if (WDrec->rec_hdr.xl_rmid == RM_HEAP_ID)
 		{
-			uint8 xlog_type = WDRec->rec_hdr.xl_info & XLOG_HEAP_OPMASK;
+			uint8 xlog_type = WDrec->rec_hdr.xl_info & XLOG_HEAP_OPMASK;
 
 			/* The records have the same header */
-			memcpy(record, &(WDRec->rec_hdr), SizeOfXLogRecord);
+			memcpy(record, &(WDrec->rec_hdr), SizeOfXLogRecord);
 			record->xl_tot_len += SizeOfXLogRecord;
 
 			switch(xlog_type)
@@ -795,8 +880,8 @@ constructWALDIFFs(void)
 				{
 					WALDIFFBlock block_0;
 
-					Assert(WDRec->max_block_id >= 0);
-					block_0 = WDRec->blocks[0];
+					Assert(WDrec->max_block_id >= 0);
+					block_0 = WDrec->blocks[0];
 
 					/* XLogRecordBlockHeader */
 					memcpy(record, &(block_0.blk_hdr), SizeOfXLogRecordBlockHeader);
@@ -835,9 +920,9 @@ constructWALDIFFs(void)
 					WALDIFFBlock block_0;
 					WALDIFFBlock block_1;
 					
-					Assert(WDRec->max_block_id >= 1);
-					block_0 = WDRec->blocks[0];
-					block_1 = WDRec->blocks[1];
+					Assert(WDrec->max_block_id >= 1);
+					block_0 = WDrec->blocks[0];
+					block_1 = WDrec->blocks[1];
 
 					/* XLogRecordBlockHeader 0 */
 					memcpy(record, &(block_0.blk_hdr), SizeOfXLogRecordBlockHeader);
@@ -874,8 +959,8 @@ constructWALDIFFs(void)
 				{
 					WALDIFFBlock block_0;
 
-					Assert(WDRec->max_block_id >= 0);
-					block_0 = WDRec->blocks[0];
+					Assert(WDrec->max_block_id >= 0);
+					block_0 = WDrec->blocks[0];
 
 					/* XLogRecordBlockHeader */
 					memcpy(record, &(block_0.blk_hdr), SizeOfXLogRecordBlockHeader);
@@ -897,8 +982,8 @@ constructWALDIFFs(void)
 			}
 
 			/* main data */
-			memcpy(record, WDRec->main_data, WDRec->main_data_len);
-			record->xl_tot_len += WDRec->main_data_len;
+			memcpy(record, WDrec->main_data, WDrec->main_data_len);
+			record->xl_tot_len += WDrec->main_data_len;
 
 			/* calculate and insert record's crc */
 			{
