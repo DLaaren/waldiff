@@ -87,8 +87,9 @@ WALDIFFFlushBuffer(WALDIFFWriterState *writer)
 {
 	int written_bytes = 0;
 
-	written_bytes = FileWrite(writer->seg.fd, WALDIFFWriterGetBuf(writer), WALDIFFWriterGetBufSize(writer), 
-							  writer->EndRecPtr, WAIT_EVENT_COPY_FILE_WRITE);
+	Assert(WALDIFFWriterGetBufSize(writer) >= 0);
+
+	written_bytes = write(writer->seg.fd, WALDIFFWriterGetBuf(writer), WALDIFFWriterGetBufSize(writer));
 
 	if (written_bytes != WALDIFFWriterGetBufSize(writer))
 	{
@@ -96,10 +97,15 @@ WALDIFFFlushBuffer(WALDIFFWriterState *writer)
 				(errcode_for_file_access(),
 				errmsg("error while writing to WALDIFF segment in WALDIFFFlushBuffer() : %m")));
 		snprintf(writer->errormsg_buf, MAX_ERRORMSG_LEN, 
-				 "FileWrite() returns: %d, but expected: %d",
+				 "write() returns: %d, but expected: %d",
 				 written_bytes, WALDIFFWriterGetBufSize(writer));
 		return WALDIFFWRITE_FAIL;
 	}
+	
+	pg_fsync(writer->seg.fd);
+
+	writer->StartRecPtr = writer->EndRecPtr;
+	writer->EndRecPtr += written_bytes;
 
 	return WALDIFFWRITE_SUCCESS;
 }

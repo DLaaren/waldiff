@@ -430,8 +430,8 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 	finishWALDIFFSegment();
 
 	ereport(LOG, errmsg("archived WAL file: %s", WALpath));
-	Assert(wal_segment_size >= wal_segment_size - writer->EndRecPtr);
-	ereport(LOG, errmsg("WALDIFF segment size: %lu", wal_segment_size - writer->EndRecPtr));
+	Assert(wal_segment_size >= segno * wal_segment_size - writer->EndRecPtr);
+	ereport(LOG, errmsg("WALDIFF segment size: %lu", segno * wal_segment_size - writer->EndRecPtr));
 
 	return true;
 }
@@ -444,7 +444,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 void 
 waldiff_shutdown(ArchiveModuleState *reader)
 {
-	FileClose(writer->seg.fd);
+	CloseTransientFile(writer->seg.fd);
 
 	/* Must have 'case this function closes fd */
 	XLogReaderFree(reader_state);
@@ -472,7 +472,7 @@ WalOpenSegment(XLogReaderState *reader,
 		ereport(ERROR,
 				errmsg("error during reading WAL absolute path : %s/%s", reader->segcxt.ws_dir, fname));
 
-	reader->seg.ws_file = PathNameOpenFile(fpath, PG_BINARY | O_RDONLY);
+	reader->seg.ws_file = OpenTransientFile(fpath, PG_BINARY | O_RDONLY);
 	if (reader->seg.ws_file == -1)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -543,7 +543,7 @@ WALDIFFOpenSegment(WALDIFFSegmentContext *segcxt, WALDIFFSegment *seg)
 		ereport(ERROR,
 				errmsg("error during reading WALDIFF absolute path: %s/%s", segcxt->dir, fname));
 	
-	seg->fd = PathNameOpenFile(fpath, PG_BINARY | O_RDWR | O_CREAT);
+	seg->fd = OpenTransientFile(fpath, PG_BINARY | O_RDWR | O_CREAT);
 	if (seg->fd == -1)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -555,7 +555,7 @@ void
 WalCloseSegment(XLogReaderState *reader)
 {
 	Assert(reader->seg.ws_file != -1);
-	FileClose(reader->seg.ws_file);
+	CloseTransientFile(reader->seg.ws_file);
 	reader->seg.ws_file = -1;
 }
 
@@ -563,7 +563,7 @@ void
 WALDIFFCloseSegment(WALDIFFSegment *seg)
 {
 	Assert(seg->fd != -1);
-	FileClose(seg->fd);
+	CloseTransientFile(seg->fd);
 	seg->fd = -1;
 }
 
@@ -586,13 +586,11 @@ WALDIFFWriteRecord(WALDIFFWriterState *waldiff_writer,
 
 	Assert(!XLogRecPtrIsInvalid(startptr));
 
-	if (writer->EndRecPtr == startptr && writer->seg.segno == first_segno)
+	if (writer->EndRecPtr == startptr && writer->seg.segno == first_segno &&
+		WALDIFFWriterGetBufSize(writer) == 0)
 	{
 		XLogLongPageHeaderData long_page_hdr = {0};
 		XLogPageHeaderData page_hdr = {0};
-
-		/* Check if header is the first info that will be flushed to segment */
-		Assert(WALDIFFWriterGetBufSize(writer) == 0);
 
 		ereport(LOG, errmsg("Writing long page header of the very first WALDIFF segment"));
 
@@ -611,12 +609,10 @@ WALDIFFWriteRecord(WALDIFFWriterState *waldiff_writer,
 		memcpy(WALDIFFWriterGetBuf(writer), &long_page_hdr, SizeOfXLogLongPHD);
 		WALDIFFWriterGetBufSize(writer) += SizeOfXLogLongPHD;
 	}
-	else if (writer->EndRecPtr % writer->segcxt.segsize == 0)
+	else if (writer->EndRecPtr % writer->segcxt.segsize == 0 &&
+			 WALDIFFWriterGetBufSize(writer) == 0)
 	{
 		XLogPageHeaderData page_hdr = {0};
-
-		/* Check if header is the first info that will be flushed to segment */
-		Assert(WALDIFFWriterGetBufSize(writer) == 0);
 
 		ereport(LOG, errmsg("Writing page header of a new WALDIFF segment"));
 		
@@ -890,18 +886,18 @@ overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
 int 
 getWALsegsize(const char *WALpath)
 {
-	File fd;
+	int fd;
 	int read_bytes;
 	XLogLongPageHeader page_hdr = (XLogLongPageHeader) palloc0(SizeOfXLogLongPHD);
 	int wal_segment_size;
 
-	fd = PathNameOpenFile(WALpath, O_RDONLY | PG_BINARY);
+	fd = OpenTransientFile(WALpath, O_RDONLY | PG_BINARY);
 	if (fd == -1)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				errmsg("could not open file \"%s\": %m", WALpath)));
 
-	read_bytes = FileRead(fd, page_hdr, SizeOfXLogLongPHD, 0, WAIT_EVENT_COPY_FILE_READ);
+	read_bytes = read(fd, page_hdr, SizeOfXLogLongPHD);
 	if (read_bytes != SizeOfXLogLongPHD)
 		ereport(ERROR,
 				errmsg("could not read XLogLongPageHeader of WAL segment\"%s\": %m", 
@@ -911,7 +907,7 @@ getWALsegsize(const char *WALpath)
 	Assert(IsValidWalSegSize(wal_segment_size));
 
 	pfree(page_hdr);
-	FileClose(fd);
+	CloseTransientFile(fd);
 
 	return wal_segment_size;
 }
