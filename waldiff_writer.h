@@ -83,7 +83,7 @@ struct WALDIFFWriterState
 	uint64 system_identifier;
 
     /*
-	 * Start and end point of last record written.  
+	 * Start and end point of last records written.  
      * EndRecPtr is also used as the position to write to next.  
      * Calling WALDIFFBeginWrite() sets EndRecPtr to the
 	 * starting position and StartRecPtr to invalid.
@@ -106,6 +106,11 @@ struct WALDIFFWriterState
 	bool		errormsg_deferred;
 };
 
+#define WALDIFFWriterGetBuf(writer) ((writer)->writeBuf)
+#define WALDIFFWriterGetBufSize(writer) ((writer)->writeBufSize)
+#define WALDIFFWriterGetRestOfBufSize(writer) (BLCKSZ - ((writer)->writeBufSize))
+#define WALDIFFWriterGetErrMsg(writer) ((writer)->errormsg_buf)
+
 /* Get a new WALDIFFWriter */
 extern WALDIFFWriterState *WALDIFFWriterAllocate(int wal_segment_size,
 										      	 char *waldir,
@@ -119,6 +124,8 @@ extern void WALDIFFBeginWrite(WALDIFFWriterState *state,
                               XLogRecPtr RecPtr,
 							  XLogSegNo segNo, 
 							  TimeLineID tli);
+
+extern WALDIFFRecordWriteResult WALDIFFFlushBuffer(WALDIFFWriterState *state);
 
 
 #endif /* _WALDIFF_WRITER_H_ */

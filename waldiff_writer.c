@@ -6,76 +6,100 @@ WALDIFFWriterAllocate(int wal_segment_size,
 					  char *waldiff_dir,
 					  WALDIFFWriterRoutine *routine)
 {
-	WALDIFFWriterState *state;
-	state = (WALDIFFWriterState *)
+	WALDIFFWriterState *writer;
+	writer = (WALDIFFWriterState *)
 		palloc_extended(sizeof(WALDIFFWriterState),
 						MCXT_ALLOC_NO_OOM | MCXT_ALLOC_ZERO);
-	if (!state)
+	if (!writer)
 		return NULL;
 
-	state->routine = *routine;
+	writer->routine = *routine;
 
-	state->writeBuf =(char *) palloc_extended(XLogRecordMaxSize,
+	writer->writeBuf =(char *) palloc_extended(XLogRecordMaxSize,
 											  MCXT_ALLOC_NO_OOM);
 
-	if (!state->writeBuf)
+	if (!writer->writeBuf)
 	{
-		pfree(state);
+		pfree(writer);
 		return NULL;
 	}					
 
-	state->seg.fd = -1;
-	state->seg.segno = 0;
-	state->seg.tli = 0;
+	writer->seg.fd = -1;
+	writer->seg.segno = 0;
+	writer->seg.tli = 0;
 
-	state->segcxt.segsize = wal_segment_size;
+	writer->segcxt.segsize = wal_segment_size;
 	if (waldiff_dir)
-		state->segcxt.dir = waldiff_dir;
+		writer->segcxt.dir = waldiff_dir;
 
 	/* ReadRecPtr, EndRecPtr and readLen initialized to zeroes above */
-	state->errormsg_buf = palloc_extended(MAX_ERRORMSG_LEN + 1,
-										  MCXT_ALLOC_NO_OOM);
-	if (!state->errormsg_buf)
+	writer->errormsg_buf = palloc_extended(MAX_ERRORMSG_LEN + 1,
+										   MCXT_ALLOC_NO_OOM);
+	if (!writer->errormsg_buf)
 	{
-		pfree(state->writeBuf);
-		pfree(state);
+		pfree(writer->writeBuf);
+		pfree(writer);
 		return NULL;
 	}
-	state->errormsg_buf[0] = '\0';
+	writer->errormsg_buf[0] = '\0';
 
-	if (state->writeBuf)
-		pfree(state->writeBuf);
-	state->writeBuf = (char *) palloc(BLCKSZ);
-	state->writeBuf[0] = '\0';
-	state->writeBufSize = 0;
+	if (writer->writeBuf)
+		pfree(writer->writeBuf);
+	writer->writeBuf = (char *) palloc(BLCKSZ);
+	writer->writeBuf[0] = '\0';
+	writer->writeBufSize = 0;
 
-	return state;						
+	return writer;						
 }
 
 void 
-WALDIFFWriterFree(WALDIFFWriterState *state)
+WALDIFFWriterFree(WALDIFFWriterState *writer)
 {
-	if (state->seg.fd != -1)
-		state->routine.segment_close(&(state->seg));
+	// check buffer and flushed leftovers
 
-	pfree(state->errormsg_buf);
-	pfree(state->writeBuf);
-	pfree(state);
+	if (writer->seg.fd != -1)
+		writer->routine.segment_close(&(writer->seg));
+
+	pfree(writer->errormsg_buf);
+	pfree(writer->writeBuf);
+	pfree(writer);
 }
 
 void 
-WALDIFFBeginWrite(WALDIFFWriterState *state,
+WALDIFFBeginWrite(WALDIFFWriterState *writer,
 				  XLogRecPtr RecPtr, 
 				  XLogSegNo segNo, 
 				  TimeLineID tli)
 {
 	Assert(!XLogRecPtrIsInvalid(RecPtr));
 
-	state->StartRecPtr = InvalidXLogRecPtr;
-	state->EndRecPtr = RecPtr;
+	writer->StartRecPtr = InvalidXLogRecPtr;
+	writer->EndRecPtr = RecPtr;
 
-	state->seg.segno = segNo;
-	state->seg.tli = tli;
+	writer->seg.segno = segNo;
+	writer->seg.tli = tli;
 
-	state->routine.segment_open(&(state->segcxt), &(state->seg));
+	writer->routine.segment_open(&(writer->segcxt), &(writer->seg));
+}
+
+WALDIFFRecordWriteResult 
+WALDIFFFlushBuffer(WALDIFFWriterState *writer)
+{
+	int written_bytes = 0;
+
+	written_bytes = FileWrite(writer->seg.fd, WALDIFFWriterGetBuf(writer), WALDIFFWriterGetBufSize(writer), 
+							  writer->EndRecPtr, WAIT_EVENT_COPY_FILE_WRITE);
+
+	if (written_bytes != WALDIFFWriterGetBufSize(writer))
+	{
+		ereport(ERROR, 
+				(errcode_for_file_access(),
+				errmsg("error while writing to WALDIFF segment in WALDIFFFlushBuffer() : %m")));
+		snprintf(writer->errormsg_buf, MAX_ERRORMSG_LEN, 
+				 "FileWrite() returns: %d, but expected: %d",
+				 written_bytes, WALDIFFWriterGetBufSize(writer));
+		return WALDIFFWRITE_FAIL;
+	}
+
+	return WALDIFFWRITE_SUCCESS;
 }

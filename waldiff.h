@@ -49,7 +49,7 @@ typedef struct MemoryContextStorage
 /* WALDIFFSegment represents a WALDIFF segment being written */
 typedef struct WALDIFFSegment
 {
-	int			fd; 		/* segment file descriptor */
+	File		fd; 		/* segment file descriptor */
 	XLogSegNo	segno;		/* segment number */
 	TimeLineID	tli;		/* timeline ID of the currently open file */
 } WALDIFFSegment;
