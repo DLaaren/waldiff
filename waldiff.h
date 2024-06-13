@@ -68,8 +68,8 @@ typedef struct WALDIFFBlock {
 
 	/* Identify the block this refers to */
 	RelFileLocator file_loc;
-	ForkNumber	forknum;
-	BlockNumber blknum;
+	ForkNumber	   forknum;
+	BlockNumber    blknum;
 
 	/* we are not working with images */
 
@@ -83,6 +83,8 @@ typedef struct WALDIFFBlock {
 /* Structure representing folded WAL records */
 typedef struct WALDIFFRecordData
 {
+	uint8 			type;
+
 	XLogRecPtr	    lsn;
 	XLogRecord      rec_hdr;	
 
@@ -99,14 +101,11 @@ typedef struct WALDIFFRecordData
 	/* In delete/update case this is the pointer on deleted tuple version */
 	ItemPointerData prev_t_ctid;	
 
-	/* Offset to tuple data. (0 if none) */
-	uint8			t_hoff;
-
-	char *main_data;
+	char   *main_data;
 	uint32 main_data_len;
 
 	/* highest block_id (-1 if none) */
-	int max_block_id;
+	int          max_block_id;
 	WALDIFFBlock blocks[FLEXIBLE_ARRAY_MEMBER];
 
 } WALDIFFRecordData;

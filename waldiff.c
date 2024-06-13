@@ -580,14 +580,17 @@ WALDIFFWriteRecord(WALDIFFWriterState *waldiff_writer,
 WALDIFFRecord 
 fetch_insert(XLogReaderState *record)
 {
-	WALDIFFRecord WDRec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord);
+	/* HEAP_INSERT contains one block */
+	WALDIFFRecord WDRec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord + sizeof(WALDIFFBlock));
 	XLogRecordBlockHeader blk_hdr;
 	char *block_data;
 	Size block_data_len;
 	RelFileLocator rel_file_locator;
 	ForkNumber forknum;
 	BlockNumber blknum;
-	xl_heap_insert *main_data;
+	xl_heap_insert *main_data = (xl_heap_insert *) XLogRecGetData(record);
+
+	WDRec->type = XLOG_HEAP_INSERT;
 
 	/* Copy lsn */
 	WDRec->lsn = record->record->lsn;
@@ -612,9 +615,8 @@ fetch_insert(XLogReaderState *record)
 	/* Copy main data */
 	/* check do we need to allocate space for main data? 
 	 * 'cause there is a huge ring buffer for all records(?) */
-	main_data = (xl_heap_insert *) XLogRecGetData(record);
 	WDRec->main_data = main_data;
-	WDRec->main_data = SizeOfHeapInsert;
+	WDRec->main_data_len = SizeOfHeapInsert;
 
 	/* Copy block data */
 	XLogRecGetBlockTag(record, 0, &rel_file_locator, &forknum, &blknum);
@@ -634,9 +636,6 @@ fetch_insert(XLogReaderState *record)
 	Assert(XLogRecHasBlockData(record, 0));
 	WDRec->blocks[0].block_data = block_data;
 	WDRec->blocks[0].block_data_len = block_data_len;
-
-	WDRec->t_hoff = SizeOfXLogRecord + SizeOfXLogRecordBlockHeader + \
-					sizeof(RelFileLocator) + sizeof(BlockNumber) + SizeOfHeapHeader;
 
 	return WDRec;
 }
@@ -661,12 +660,15 @@ fetch_update(XLogReaderState *record)
 WALDIFFRecord 
 fetch_delete(XLogReaderState *record)
 {
-	WALDIFFRecord WDRec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord);
+	/* HEAP_DELETE contains one block */
+	WALDIFFRecord WDRec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord + sizeof(WALDIFFBlock));
 	XLogRecordBlockHeader blk_hdr;
 	RelFileLocator rel_file_locator;
 	ForkNumber forknum;
 	BlockNumber blknum;
-	xl_heap_delete *main_data;
+	xl_heap_delete *main_data = (xl_heap_delete *) XLogRecGetData(record);
+
+	WDRec->type = XLOG_HEAP_DELETE;
 
 	/* Copy lsn */
 	WDRec->lsn = record->record->lsn;
@@ -691,9 +693,8 @@ fetch_delete(XLogReaderState *record)
 	/* Copy main data */
 	/* check do we need to allocate space for main data? 
 	 * 'cause there is a huge ring buffer for all records(?) */
-	main_data = (xl_heap_insert *) XLogRecGetData(record);
 	WDRec->main_data = main_data;
-	WDRec->main_data = SizeOfHeapInsert;
+	WDRec->main_data_len = SizeOfHeapDelete;
 
 	/* Copy block data */
 	XLogRecGetBlockTag(record, 0, &rel_file_locator, &forknum, &blknum);
@@ -710,8 +711,6 @@ fetch_delete(XLogReaderState *record)
 	WDRec->blocks[0].blknum = blknum;
 	WDRec->blocks[0].has_data = false;
 	Assert(!XLogRecHasBlockData(record, 0));
-
-	main_data = (xl_heap_delete *) XLogRecGetData(record);
 
 	return WDRec;
 }
