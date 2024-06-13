@@ -70,9 +70,9 @@ WALDIFFBeginWrite(WALDIFFWriterState *state,
 				  TimeLineID tli)
 {
 	Assert(!XLogRecPtrIsInvalid(RecPtr));
-	
-	state->EndRecPtr = RecPtr;
+
 	state->StartRecPtr = InvalidXLogRecPtr;
+	state->EndRecPtr = RecPtr;
 
 	state->seg.segno = segNo;
 	state->seg.tli = tli;
