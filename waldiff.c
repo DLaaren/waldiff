@@ -350,10 +350,9 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 					if (is_found)
 					{
 						uint8 prev_xlog_type = entry->data->rec_hdr.xl_info & XLOG_HEAP_OPMASK;
-						bool is_insert_WDrec = (prev_xlog_type == XLOG_HEAP_INSERT);
 						overlay_update(entry->data, WDrec);
 
-						if (!is_insert_WDrec) 
+						if (prev_xlog_type != XLOG_HEAP_INSERT) 
 						{
 							entry = (HTABElem *) hash_search(hash_table, (void*) &prev_hash_key, HASH_REMOVE, NULL);
 							entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
@@ -690,7 +689,8 @@ fetch_insert(XLogReaderState *record)
 	/* Copy main data */
 	/* check do we need to allocate space for main data? 
 	 * 'cause there is a huge ring buffer for all records(?) */
-	WDrec->main_data = (char *) main_data;
+	WDrec->main_data = (char*) palloc0(SizeOfHeapInsert);
+	memcpy(WDrec->main_data, main_data, SizeOfHeapInsert);
 	WDrec->main_data_len = SizeOfHeapInsert;
 
 	/* Copy block data */
@@ -707,8 +707,10 @@ fetch_insert(XLogReaderState *record)
 	WDrec->blocks[0].forknum = forknum;
 	WDrec->blocks[0].blknum = blknum;
 	WDrec->blocks[0].has_data = true;
+
 	Assert(XLogRecHasBlockData(record, 0));
-	WDrec->blocks[0].block_data = block_data;
+	WDrec->blocks[0].block_data = (char*) palloc0(block_data_len);
+	memcpy(WDrec->blocks[0].block_data, block_data, block_data_len);
 	WDrec->blocks[0].block_data_len = block_data_len;
 
 	return WDrec;
@@ -773,7 +775,8 @@ fetch_update(XLogReaderState *record)
 	/* Copy main data */
 	/* check do we need to allocate space for main data? 
 	 * 'cause there is a huge ring buffer for all records(?) */
-	WDrec->main_data = (char *) main_data;
+	WDrec->main_data = (char*) palloc0(SizeOfHeapUpdate);
+	memcpy(WDrec->main_data, main_data, SizeOfHeapUpdate);
 	WDrec->main_data_len = SizeOfHeapUpdate;
 
 	/* Copy block data */
@@ -791,18 +794,21 @@ fetch_update(XLogReaderState *record)
 	WDrec->blocks[0].forknum = forknum;
 	WDrec->blocks[0].blknum = new_blknum;
 	WDrec->blocks[0].has_data = true;
+
 	Assert(XLogRecHasBlockData(record, 0));
-	WDrec->blocks[0].block_data = block_data;
+	WDrec->blocks[0].block_data = (char*) palloc0(block_data_len);
+	memcpy(WDrec->blocks[0].block_data, block_data, block_data_len);
 	WDrec->blocks[0].block_data_len = block_data_len;
 
 	/* Block 1 */
+	memset((void*)&blk_hdr, 0, SizeOfXLogRecordBlockHeader);
 	blk_hdr.id = 1;
 	blk_hdr.fork_flags = record->record->blocks[1].flags;
 	blk_hdr.data_length = 0;
 
-	WDrec->blocks[0].blk_hdr = blk_hdr;
-	WDrec->blocks[0].blknum = old_blknum;
-	WDrec->blocks[0].has_data = false;
+	WDrec->blocks[1].blk_hdr = blk_hdr;
+	WDrec->blocks[1].blknum = old_blknum;
+	WDrec->blocks[1].has_data = false;
 	Assert(!XLogRecHasBlockData(record, 1));
 
 	if (main_data->flags & XLH_UPDATE_PREFIX_FROM_OLD || main_data->flags & XLH_UPDATE_SUFFIX_FROM_OLD)
@@ -853,7 +859,8 @@ fetch_delete(XLogReaderState *record)
 	/* Copy main data */
 	/* check do we need to allocate space for main data? 
 	 * 'cause there is a huge ring buffer for all records(?) */
-	WDrec->main_data = (char *) main_data;
+	WDrec->main_data = (char*) palloc0(SizeOfHeapDelete);
+	memcpy(WDrec->main_data, main_data, SizeOfHeapDelete);
 	WDrec->main_data_len = SizeOfHeapDelete;
 
 	/* Copy block data */
