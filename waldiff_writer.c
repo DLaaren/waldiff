@@ -7,22 +7,13 @@ WALDIFFWriterAllocate(int wal_segment_size,
 					  WALDIFFWriterRoutine *routine)
 {
 	WALDIFFWriterState *writer;
-	writer = (WALDIFFWriterState *)
-		palloc_extended(sizeof(WALDIFFWriterState),
-						MCXT_ALLOC_NO_OOM | MCXT_ALLOC_ZERO);
-	if (!writer)
-		return NULL;
+	writer = (WALDIFFWriterState*) palloc0(sizeof(WALDIFFWriterState));
 
 	writer->routine = *routine;
 
-	writer->writeBuf =(char *) palloc_extended(XLogRecordMaxSize,
-											  MCXT_ALLOC_NO_OOM);
-
-	if (!writer->writeBuf)
-	{
-		pfree(writer);
-		return NULL;
-	}					
+	writer->writeBuf = (char*) palloc0(WALDIFF_WRITER_BUFF_CAPACITY);
+	writer->writeBuf[0] = '\0';
+	writer->writeBufFullness = 0;
 
 	writer->seg.fd = -1;
 	writer->seg.segno = 0;
@@ -33,21 +24,8 @@ WALDIFFWriterAllocate(int wal_segment_size,
 		writer->segcxt.dir = waldiff_dir;
 
 	/* ReadRecPtr, EndRecPtr and readLen initialized to zeroes above */
-	writer->errormsg_buf = palloc_extended(MAX_ERRORMSG_LEN + 1,
-										   MCXT_ALLOC_NO_OOM);
-	if (!writer->errormsg_buf)
-	{
-		pfree(writer->writeBuf);
-		pfree(writer);
-		return NULL;
-	}
+	writer->errormsg_buf = palloc0(MAX_ERRORMSG_LEN + 1);
 	writer->errormsg_buf[0] = '\0';
-
-	if (writer->writeBuf)
-		pfree(writer->writeBuf);
-	writer->writeBuf = (char *) palloc(BLCKSZ);
-	writer->writeBuf[0] = '\0';
-	writer->writeBufSize = 0;
 
 	return writer;						
 }
@@ -55,7 +33,7 @@ WALDIFFWriterAllocate(int wal_segment_size,
 void 
 WALDIFFWriterFree(WALDIFFWriterState *writer)
 {
-	if (writer->writeBufSize > 0)
+	if (writer->writeBufFullness > 0)
 		WALDIFFFlushBuffer(writer);
 
 	if (writer->seg.fd != -1)
@@ -88,20 +66,20 @@ WALDIFFFlushBuffer(WALDIFFWriterState *writer)
 {
 	int written_bytes = 0;
 
-	Assert(WALDIFFWriterGetBufSize(writer) >= 0);
+	Assert(WALDIFFWriterGetBufFullness(writer) >= 0);
 
-	ereport(LOG, errmsg("Writing to WALDIFF segment; curr buff size: %u", writer->writeBufSize));
+	ereport(LOG, errmsg("Writing to WALDIFF segment; curr buff size: %u", writer->writeBufFullness));
 
-	written_bytes = write(writer->seg.fd, WALDIFFWriterGetBuf(writer), WALDIFFWriterGetBufSize(writer));
+	written_bytes = write(writer->seg.fd, WALDIFFWriterGetBuf(writer), WALDIFFWriterGetBufFullness(writer));
 
-	if (written_bytes != WALDIFFWriterGetBufSize(writer))
+	if (written_bytes != WALDIFFWriterGetBufFullness(writer))
 	{
 		ereport(ERROR, 
 				(errcode_for_file_access(),
 				errmsg("error while writing to WALDIFF segment in WALDIFFFlushBuffer() : %m")));
 		snprintf(writer->errormsg_buf, MAX_ERRORMSG_LEN, 
 				 "write() returns: %d, but expected: %d",
-				 written_bytes, WALDIFFWriterGetBufSize(writer));
+				 written_bytes, WALDIFFWriterGetBufFullness(writer));
 		return WALDIFFWRITE_FAIL;
 	}
 	

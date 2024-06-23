@@ -10,6 +10,7 @@
 
 #include "waldiff.h"
 
+#define WALDIFF_WRITER_BUFF_CAPACITY (XLogRecordMaxSize + SizeOfXLogLongPHD)
 
 typedef struct WALDIFFWriterState WALDIFFWriterState;
 
@@ -96,10 +97,11 @@ struct WALDIFFWriterState
 
     /*
 	 * Buffer with current WALDIFF records to write
-	 * Max size of the buffer = BLCKSZ
+	 * Max size of the buffer = WALDIFF_WRITER_BUFF_CAPACITY
 	 */
+
 	char	   *writeBuf;
-	uint32		writeBufSize;
+	Size		writeBufFullness;
 
 	/* Buffer to hold error message */
 	char	   *errormsg_buf;
@@ -107,8 +109,8 @@ struct WALDIFFWriterState
 };
 
 #define WALDIFFWriterGetBuf(writer) ((writer)->writeBuf)
-#define WALDIFFWriterGetBufSize(writer) ((writer)->writeBufSize)
-#define WALDIFFWriterGetRestOfBufSize(writer) (BLCKSZ - ((writer)->writeBufSize))
+#define WALDIFFWriterGetBufFullness(writer) ((writer)->writeBufFullness)
+#define WALDIFFWriterGetRestOfBufCapacity(writer) (WALDIFF_WRITER_BUFF_CAPACITY - ((writer)->writeBufFullness))
 #define WALDIFFWriterGetErrMsg(writer) ((writer)->errormsg_buf)
 
 /* Get a new WALDIFFWriter */

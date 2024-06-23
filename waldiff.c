@@ -458,7 +458,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 	/* End the segment with SWITCH record */
 	finishWALDIFFSegment();
 
-	if (writer->writeBufSize > 0)
+	if (writer->writeBufFullness > 0)
 		WALDIFFFlushBuffer(writer);
 
 	ereport(LOG, errmsg("archived WAL file: %s", WALpath));
@@ -611,13 +611,12 @@ WALDIFFWriteRecord(WALDIFFWriterState *waldiff_writer,
 	 * If it is the very first WALDIFF segment then page header has additional fields.
 	 */
 	XLogRecPtr startptr = InvalidXLogRecPtr;
-	XLogSegNo first_segno = 1;
-	XLogSegNoOffsetToRecPtr(first_segno, 0, writer->segcxt.segsize, startptr);
+	XLogSegNoOffsetToRecPtr(writer->seg.segno, 0, writer->segcxt.segsize, startptr);
 
 	Assert(!XLogRecPtrIsInvalid(startptr));
 
-	if (writer->EndRecPtr == startptr && writer->seg.segno == first_segno &&
-		WALDIFFWriterGetBufSize(writer) == 0)
+	if (writer->EndRecPtr == startptr &&
+		WALDIFFWriterGetBufFullness(writer) == 0)
 	{
 		XLogLongPageHeaderData long_page_hdr = {0};
 		XLogPageHeaderData page_hdr = {0};
@@ -637,10 +636,9 @@ WALDIFFWriteRecord(WALDIFFWriterState *waldiff_writer,
 
 		/* Write to buffer */
 		memcpy(WALDIFFWriterGetBuf(writer), &long_page_hdr, SizeOfXLogLongPHD);
-		WALDIFFWriterGetBufSize(writer) += SizeOfXLogLongPHD;
+		WALDIFFWriterGetBufFullness(writer) += SizeOfXLogLongPHD;
 	}
-	else if (writer->EndRecPtr % writer->segcxt.segsize == 0 &&
-			 WALDIFFWriterGetBufSize(writer) == 0)
+	else if (writer->EndRecPtr % writer->segcxt.segsize == 0)
 	{
 		XLogPageHeaderData page_hdr = {0};
 
@@ -654,22 +652,22 @@ WALDIFFWriteRecord(WALDIFFWriterState *waldiff_writer,
 
 		/* Write to buffer */
 		memcpy(WALDIFFWriterGetBuf(writer), &page_hdr, SizeOfXLogShortPHD);
-		WALDIFFWriterGetBufSize(writer) += SizeOfXLogShortPHD;
+		WALDIFFWriterGetBufFullness(writer) += SizeOfXLogShortPHD;
 	}
 
 	/* Flush the buffer if there is no space for the next record */
-	if (record->xl_tot_len > WALDIFFWriterGetRestOfBufSize(writer))
+	if (record->xl_tot_len > WALDIFFWriterGetRestOfBufCapacity(writer))
 	{
 		if (WALDIFFFlushBuffer(waldiff_writer) == WALDIFFWRITE_FAIL)
 			return WALDIFFWRITE_FAIL;
 	}
 
-	memcpy(WALDIFFWriterGetBuf(writer) + WALDIFFWriterGetBufSize(writer), 
+	memcpy(WALDIFFWriterGetBuf(writer) + WALDIFFWriterGetBufFullness(writer), 
 		   record, record->xl_tot_len);
-	WALDIFFWriterGetBufSize(writer) += record->xl_tot_len;
+	WALDIFFWriterGetBufFullness(writer) += record->xl_tot_len;
 
 	/* flush the full buffer, so we don't need to do it in the next time */
-	if (record->xl_tot_len == WALDIFFWriterGetRestOfBufSize(writer))
+	if (record->xl_tot_len == WALDIFFWriterGetRestOfBufCapacity(writer))
 		return WALDIFFFlushBuffer(waldiff_writer);
 
 	return WALDIFFWRITE_SUCCESS;
