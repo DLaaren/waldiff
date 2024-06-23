@@ -51,7 +51,7 @@ static WALDIFFRecord fetch_insert(XLogReaderState *record);
 static WALDIFFRecord fetch_update(XLogReaderState *record);
 static WALDIFFRecord fetch_delete(XLogReaderState *record);
 
-static void overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup);
+static int overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup);
 
 static int getWALsegsize(const char *WALpath);											 
 static void constructWALDIFFs(void);
@@ -880,10 +880,229 @@ fetch_delete(XLogReaderState *record)
 	return WDrec;
 }
 
-void 
+/*
+ * Possible cases :
+ * 1) prev_tup is insert record, so we write data from curr_tup (update record) on top of prev_tup data.
+ * 2) prev tup is update record, so we form update record, that contain both changes. 
+ * 	  2.1) If some updated fields (from insert record) matches in both records, we put curr_tup data on top of prev_tup data. 
+ * 	  2.2) If one record contains a field that is not in another record, this field will be saved unchanged.
+ * 	  2.3) If records has some fields "between" each other, we cannot overlay them, because those fields will be lost.
+ *		   Function returns -1 in this case
+ * 
+ * After this function, curr_tup can be deallocated (if return value is 0)
+ */
+int
 overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
 {
+	uint16 			curr_tup_prefix_len  	  = 0;
+	uint16 			curr_tup_suffix_len 	  = 0;
+	Size 			curr_tup_bitmap_len 	  = 0;
+
+	/*
+	 * 'user data' is just content of tuple that user is working with
+	 */
+	Size 			curr_tup_offset2user_data = 0;
+	Size 			curr_tup_user_data_len 	  = 0;
+
+	xl_heap_header* curr_tup_xl_hdr;
+	char* 			curr_tup_block_data 	  = (char*) curr_tup->blocks[0].block_data;
+
+	Size 			prev_tup_bitmap_len 	  = 0;
+	char* 			prev_tup_block_data 	  = (char*) prev_tup->blocks[0].block_data;
+	xl_heap_header* prev_tup_xl_hdr;
+
+	Assert(curr_tup->type == XLOG_HEAP_UPDATE);
+	Assert(prev_tup->type == XLOG_HEAP_UPDATE || prev_tup->type == XLOG_HEAP_INSERT);
+
+	/*
+	 * block 0 data of update tuple looks like this : 
+	 * [prefix len] + [suffix len] + xl_heap_header + bitmap + padding + user data
+	 */
+	if (curr_tup->main_data->flags & XLH_UPDATE_PREFIX_FROM_OLD)
+	{
+		memcpy((void*)&curr_tup_prefix_len, curr_tup_block_data, sizeof(uint16));
+		curr_tup_block_data += sizeof(uint16);
+		curr_tup_offset2user_data += sizeof(uint16);
+	}
+	if (curr_tup->main_data->flags & XLH_UPDATE_SUFFIX_FROM_OLD)
+	{
+		memcpy((void*)&curr_tup_suffix_len, curr_tup_block_data, sizeof(uint16));
+		curr_tup_block_data += sizeof(uint16);
+		curr_tup_offset2user_data += sizeof(uint16);
+	}
+
+	curr_tup_xl_hdr = (xl_heap_header*) curr_tup_block_data;
+	/*
+	 * t_hoff filed is just a copy of t_hoff from HeapTupleHeaderData, so
+	 * we must calculate bitmap length using SizeofHeapTupleHeader
+	 */
+	curr_tup_bitmap_len = curr_tup_xl_hdr->t_hoff - SizeofHeapTupleHeader;
+
+	/*
+	 * Now curr_tup_block_data will be point to user_data of update record
+	 */
+	curr_tup_block_data += (SizeOfHeapHeader + curr_tup_bitmap_len);
+
+	curr_tup_offset2user_data += (SizeOfHeapHeader + curr_tup_bitmap_len);
+	curr_tup_user_data_len = curr_tup->blocks[0].block_data_len - curr_tup_offset2user_data;
 	
+	if (prev_tup->type == XLOG_HEAP_INSERT)
+	{
+		
+		prev_tup_xl_hdr = (xl_heap_header*) prev_tup_block_data;
+
+		/*
+		 * Same logic as in curr_tup_bitmap_len calculation
+		 */
+		prev_tup_bitmap_len = prev_tup_xl_hdr->t_hoff - SizeofHeapTupleHeader;
+
+		/*
+		 * Now prev_tup_block_data will be point to user_data of insert record
+		 */
+		prev_tup_block_data += (SizeOfHeapHeader + prev_tup_bitmap_len);
+
+		memcpy(prev_tup_block_data + curr_tup_prefix_len, curr_tup_block_data, curr_tup_user_data_len);
+	}
+	else if (prev_tup->type == XLOG_HEAP_UPDATE)
+	{
+		uint16 			prev_tup_prefix_len  	  = 0;
+		uint16 			prev_tup_suffix_len 	  = 0;
+		Size 			prev_tup_offset2user_data = 0;
+		Size 			prev_tup_user_data_len 	  = 0;
+
+		/*
+		 * Same logic as in curr_tup prefix, suffix and user_data_len calculation
+		 */
+		if (prev_tup->main_data->flags & XLH_UPDATE_PREFIX_FROM_OLD)
+		{
+			memcpy((void*)&prev_tup_prefix_len, prev_tup_block_data, sizeof(uint16));
+			prev_tup_block_data += sizeof(uint16);
+			prev_tup_offset2user_data += sizeof(uint16);
+		}
+		if (prev_tup->main_data->flags & XLH_UPDATE_SUFFIX_FROM_OLD)
+		{
+			memcpy((void*)&prev_tup_suffix_len, prev_tup_block_data, sizeof(uint16));
+			prev_tup_block_data += sizeof(uint16);
+			prev_tup_offset2user_data += sizeof(uint16);
+		}
+
+		prev_tup_xl_hdr = (xl_heap_header*) prev_tup_block_data;
+		prev_tup_bitmap_len = prev_tup_xl_hdr->t_hoff - SizeofHeapTupleHeader;
+
+		/*
+		* Now curr_tup_block_data will be point to user_data of update record
+		*/
+		prev_tup_block_data += (SizeOfHeapHeader + prev_tup_bitmap_len);
+
+		prev_tup_offset2user_data += (SizeOfHeapHeader + curr_tup_bitmap_len);
+		prev_tup_user_data_len = prev_tup->blocks[0].block_data_len - prev_tup_offset2user_data;
+
+		/*
+		 * There may be a situation, when updated parts of tuples are not intersects.
+		 * For example, original tuple consists of 6 fields : [1, 2, 3, 4, 5, 6], 
+		 * prev_tup updates 2 and 3 field, curr_tup updates 5 and 6 field.
+		 * In this case we cannot overlay updates on each other, because we will lost 4 field in future
+		 */
+
+		if (curr_tup_prefix_len > (prev_tup_prefix_len + prev_tup_user_data_len) ||
+			curr_tup_suffix_len > (prev_tup_suffix_len + prev_tup_user_data_len))
+			return -1;
+
+		/*
+		 * OK, now we are shure, that we can overlay updates. Now we must
+		 * consider all possible "layouts" of our updates
+		 */
+
+		if (prev_tup_suffix_len < curr_tup_suffix_len &&
+			prev_tup_prefix_len < curr_tup_prefix_len)
+		{
+			/*
+			 * Second update completely "lies in" first update :
+			 * [#####] - first update
+			 *   [##] - second update
+			 */	
+
+			Size left_offset = (curr_tup_prefix_len - prev_tup_prefix_len);
+			memcpy((void*) (prev_tup_block_data + left_offset), curr_tup_block_data, curr_tup_user_data_len);
+		}
+		else if (prev_tup_prefix_len == (curr_tup_prefix_len + curr_tup_user_data_len))
+		{
+			/*
+			 * Second update "touch" first update on the left edge :
+			 * first update - [#####][##] - second update
+			 */
+
+			char prev_tup_user_data_copy[prev_tup_user_data_len];
+			memcpy(prev_tup_user_data_copy, prev_tup_block_data, prev_tup_user_data_len);
+
+			prev_tup->blocks[0].block_data_len += curr_tup_user_data_len;
+			prev_tup->blocks[0].block_data = (char*) repalloc(prev_tup->blocks[0].block_data, prev_tup->blocks[0].block_data_len);
+			prev_tup_block_data = prev_tup->blocks[0].block_data;
+
+			memcpy(prev_tup_block_data, curr_tup_block_data, curr_tup_user_data_len);
+			memcpy((void*) (prev_tup_block_data + curr_tup_user_data_len), prev_tup_user_data_copy, prev_tup_user_data_len);
+		}
+		else if (prev_tup_suffix_len == (curr_tup_suffix_len + curr_tup_user_data_len))
+		{
+			/*
+			 * Second update "touch" first update on the right edge :
+			 * second update - [##][#####] - first update
+			 */
+
+			prev_tup->blocks[0].block_data_len += curr_tup_user_data_len;
+			prev_tup->blocks[0].block_data = (char*) repalloc(prev_tup->blocks[0].block_data, prev_tup->blocks[0].block_data_len);
+			prev_tup_block_data = prev_tup->blocks[0].block_data;
+
+			memcpy((void*) (prev_tup_block_data + prev_tup_user_data_len), curr_tup_block_data, curr_tup_user_data_len);
+		}
+		else
+		{
+			if (prev_tup_prefix_len > curr_tup_prefix_len)
+			{
+				/*
+				 * Updates "intersects" like this :
+				 * 	  [###] - first update
+				 *  [###] - second update
+				 */
+
+				Size new_part_len = prev_tup_prefix_len - curr_tup_prefix_len; // unique to second update data length (new to first update)
+				Size common_part_len = prev_tup_user_data_len - (curr_tup_suffix_len - prev_tup_suffix_len);
+				Size unique_part_len = prev_tup_user_data_len - common_part_len; // unique to first update data length
+				char prev_tup_user_data_copy[unique_part_len]; // copy of unique to first update data
+
+				memcpy(prev_tup_user_data_copy, (void*) (prev_tup_block_data + common_part_len), unique_part_len);
+
+				prev_tup->blocks[0].block_data_len += new_part_len;
+				prev_tup->blocks[0].block_data = (char*) repalloc(prev_tup->blocks[0].block_data, prev_tup->blocks[0].block_data_len);
+				prev_tup_block_data = prev_tup->blocks[0].block_data;
+
+				memcpy(prev_tup_block_data, curr_tup_block_data, curr_tup_user_data_len);
+				memcpy((void*) (prev_tup_block_data + curr_tup_user_data_len), prev_tup_user_data_copy, unique_part_len);
+			}
+			else
+			{
+				/*
+				 * Updates "intersects" like this :
+				 * [###] - first update
+				 *   [###] - second update
+				 */
+
+				Size new_part_len = prev_tup_suffix_len - curr_tup_suffix_len; // unique to second update data length (new to first update)
+				Size common_part_len = prev_tup_user_data_len - (curr_tup_prefix_len - prev_tup_prefix_len);
+				Size unique_part_len = prev_tup_user_data_len - common_part_len; // unique to first update data length
+
+				// memcpy(prev_tup_user_data_copy, (void*) (prev_tup_block_data + common_part_len), unique_part_len);
+
+				prev_tup->blocks[0].block_data_len += new_part_len;
+				prev_tup->blocks[0].block_data = (char*) repalloc(prev_tup->blocks[0].block_data, prev_tup->blocks[0].block_data_len);
+				prev_tup_block_data = prev_tup->blocks[0].block_data;
+
+				memcpy((void*) prev_tup_block_data + unique_part_len, curr_tup_block_data, curr_tup_user_data_len);
+			}
+		}
+	}
+
+	return 0;
 }
 
 /*
