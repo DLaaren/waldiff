@@ -318,6 +318,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 			uint32_t hash_key;
 			HTABElem *entry;
 			bool is_found;
+			int overlay_result;
 			uint8 xlog_type = XLogRecGetInfo(reader_state) & XLOG_HEAP_OPMASK;
 
 			switch(xlog_type)
@@ -350,14 +351,26 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 					if (is_found)
 					{
 						uint8 prev_xlog_type = entry->data->rec_hdr.xl_info & XLOG_HEAP_OPMASK;
-						overlay_update(entry->data, WDrec);
+						overlay_result = overlay_update(entry->data, WDrec);
 
-						if (prev_xlog_type != XLOG_HEAP_INSERT) 
+						if (overlay_result == -1)
 						{
-							entry = (HTABElem *) hash_search(hash_table, (void*) &prev_hash_key, HASH_REMOVE, NULL);
+							/*
+							 * Overlaying failed - we must store both records
+							 */
 							entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
 							entry->data = WDrec;
 							Assert(entry->key == hash_key);
+						}
+						else
+						{
+							WALDIFFRecord tmp = entry->data;
+							entry = (HTABElem *) hash_search(hash_table, (void*) &prev_hash_key, HASH_REMOVE, NULL);
+							entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
+							entry->data = tmp;
+							Assert(entry->key == hash_key);
+
+							// TODO deallocate WDrec
 						}
 					}
 					else 
