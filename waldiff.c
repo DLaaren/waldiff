@@ -44,7 +44,7 @@ int WalReadPage(XLogReaderState *reader, XLogRecPtr targetPagePtr, int reqLen,
 void WalCloseSegment(XLogReaderState *reader);				
 void WALDIFFCloseSegment(WALDIFFSegment *seg);
 WALDIFFRecordWriteResult WALDIFFWriteRecord(WALDIFFWriterState *writer,
-											XLogRecord *record);
+											XLogRecord *record, XLogReaderState* reader);
 
 /* This three fuctions returns palloced struct */
 static WALDIFFRecord fetch_insert(XLogReaderState *record);
@@ -296,6 +296,8 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 			XLogSegmentOffset(reader_private.startptr, wal_segment_size) != 0)
 			ereport(LOG, 
 					errmsg("skipping over %u bytes", (uint32) (first_record - reader_private.startptr)));
+		
+		writer->first_page_addr = page_hdr->xlp_pageaddr;
 	}
 
 	/* Main reading & constructing & writing loop */
@@ -427,7 +429,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 
 				/* unprocessed record type */
 				default:
-					WALDIFFRecordWriteResult res = WALDIFFWriteRecord(writer, WALRec);
+					WALDIFFRecordWriteResult res = WALDIFFWriteRecord(writer, WALRec, reader_state);
 					if (res == WALDIFFWRITE_FAIL) 
 						ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
 											  WALDIFFWriterGetErrMsg(writer)));
@@ -437,7 +439,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 		
 		else 
 		{
-			WALDIFFRecordWriteResult res = WALDIFFWriteRecord(writer, WALRec);
+			WALDIFFRecordWriteResult res = WALDIFFWriteRecord(writer, WALRec, reader_state);
 			if (res == WALDIFFWRITE_FAIL) 
 				ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive %s", 
 									  WALDIFFWriterGetErrMsg(writer)));
@@ -604,55 +606,81 @@ WALDIFFCloseSegment(WALDIFFSegment *seg)
  */
 WALDIFFRecordWriteResult 
 WALDIFFWriteRecord(WALDIFFWriterState *waldiff_writer,
-				   XLogRecord *record)
+				   XLogRecord *record, XLogReaderState* reader)
 {
-	/* 
-	 * Every segments starts with page header.
-	 * If it is the very first WALDIFF segment then page header has additional fields.
-	 */
-	XLogRecPtr startptr = InvalidXLogRecPtr;
-	XLogSegNoOffsetToRecPtr(writer->seg.segno, 0, writer->segcxt.segsize, startptr);
+	Size rem_data_len = 0;
+	pg_crc32c	crc;
 
-	Assert(!XLogRecPtrIsInvalid(startptr));
-
-	if (writer->EndRecPtr == startptr &&
-		WALDIFFWriterGetBufFullness(writer) == 0)
+	while (true)
 	{
-		XLogLongPageHeaderData long_page_hdr = {0};
-		XLogPageHeaderData page_hdr = {0};
+		if (WALDIFFWriterGetAlreadyWritten(writer) % BLCKSZ == 0)
+		{
+			XLogLongPageHeaderData long_page_hdr = {0};
+			XLogPageHeaderData page_hdr = {0};
 
-		ereport(LOG, errmsg("Putting long page header of the very first WALDIFF segment"));
+			ereport(LOG, errmsg("Putting long page header of the very first WALDIFF segment"));
 
-		page_hdr.xlp_magic = XLOG_PAGE_MAGIC;		
-		page_hdr.xlp_info |= XLP_LONG_HEADER;
-		page_hdr.xlp_tli = writer->seg.tli;		
-		page_hdr.xlp_pageaddr = writer->EndRecPtr;	
-		page_hdr.xlp_rem_len = 0;
+			page_hdr.xlp_magic = XLOG_PAGE_MAGIC;		
+			page_hdr.xlp_info |= XLP_LONG_HEADER;
+			page_hdr.xlp_tli = writer->seg.tli;		
+			page_hdr.xlp_pageaddr = writer->first_page_addr;
+			page_hdr.xlp_rem_len = 0;
 
-		long_page_hdr.std = page_hdr;
-		long_page_hdr.xlp_sysid = writer->system_identifier;
-		long_page_hdr.xlp_seg_size = writer->segcxt.segsize;
-		long_page_hdr.xlp_xlog_blcksz = XLOG_BLCKSZ;
+			long_page_hdr.std = page_hdr;
+			long_page_hdr.xlp_sysid = writer->system_identifier;
+			long_page_hdr.xlp_seg_size = writer->segcxt.segsize;
+			long_page_hdr.xlp_xlog_blcksz = XLOG_BLCKSZ;
 
-		/* Write to buffer */
-		memcpy(WALDIFFWriterGetBuf(writer), &long_page_hdr, SizeOfXLogLongPHD);
-		WALDIFFWriterGetBufFullness(writer) += SizeOfXLogLongPHD;
-	}
-	else if (writer->EndRecPtr % writer->segcxt.segsize == 0)
-	{
-		XLogPageHeaderData page_hdr = {0};
+			/* Write to buffer */
+			memcpy(WALDIFFWriterGetBuf(writer), &long_page_hdr, SizeOfXLogLongPHD);
+			writer->writeBufFullness += SizeOfXLogLongPHD;
+			writer->already_written += SizeOfXLogLongPHD;
+		}
+		else 
+		{
+			XLogPageHeaderData page_hdr = {0};
 
-		ereport(LOG, errmsg("Putting page header of a new WALDIFF segment"));
-		
-		page_hdr.xlp_magic = XLOG_PAGE_MAGIC;		
-		page_hdr.xlp_info = 0;
-		page_hdr.xlp_tli = writer->seg.tli;		
-		page_hdr.xlp_pageaddr = writer->EndRecPtr;	
-		page_hdr.xlp_rem_len = 0;
+			ereport(LOG, errmsg("Putting page header of a new WALDIFF segment"));
+			
+			page_hdr.xlp_magic = XLOG_PAGE_MAGIC;		
+			page_hdr.xlp_info = 0;
+			page_hdr.xlp_tli = writer->seg.tli;		
+			page_hdr.xlp_pageaddr = writer->first_page_addr + writer->already_written;
+			page_hdr.xlp_rem_len = 0;
 
-		/* Write to buffer */
-		memcpy(WALDIFFWriterGetBuf(writer), &page_hdr, SizeOfXLogShortPHD);
-		WALDIFFWriterGetBufFullness(writer) += SizeOfXLogShortPHD;
+			/* Write to buffer */
+			memcpy(WALDIFFWriterGetBuf(writer), &page_hdr, SizeOfXLogShortPHD);
+			writer->writeBufFullness += SizeOfXLogShortPHD;
+			writer->already_written += SizeOfXLogShortPHD;
+		}
+
+		if (rem_data_len > 0)
+		{
+			// TODO implement it
+		}
+
+		/*
+		 * First record in first segment has no previous records
+		 */
+		if (writer->seg.segno == 1 && writer->already_written == SizeOfXLogLongPHD)
+			record->xl_prev = 0;
+		else 
+			record->xl_prev = writer->StartRecPtr; // TODO обновлять это значение
+
+		INIT_CRC32C(crc);
+		COMP_CRC32C(crc, ((char *) record) + SizeOfXLogRecord, record->xl_tot_len - SizeOfXLogRecord);
+		COMP_CRC32C(crc, (char *) record, offsetof(XLogRecord, xl_crc));
+		FIN_CRC32C(crc);
+		record->xl_crc = crc;
+
+		/*
+		 * If XLogRecord does not fit on the page
+		 */
+		if (SizeOfXLogRecord + WALDIFFWriterGetAlreadyWritten(writer) % BLCKSZ > BLCKSZ)
+		{
+			rem_data_len = BLCKSZ - (WALDIFFWriterGetAlreadyWritten(writer) % BLCKSZ);
+			memcpy(WALDIFFWriterGetBuf(writer))
+		}
 	}
 
 	/* Flush the buffer if there is no space for the next record */
@@ -660,6 +688,14 @@ WALDIFFWriteRecord(WALDIFFWriterState *waldiff_writer,
 	{
 		if (WALDIFFFlushBuffer(waldiff_writer) == WALDIFFWRITE_FAIL)
 			return WALDIFFWRITE_FAIL;
+	}
+
+	/*
+	 * If XLogRecord struct does not fit on page
+	 */
+	if (writer->already_written % BLCKSZ + SizeOfXLogRecord > BLCKSZ)
+	{
+
 	}
 
 	memcpy(WALDIFFWriterGetBuf(writer) + WALDIFFWriterGetBufFullness(writer), 

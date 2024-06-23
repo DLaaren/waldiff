@@ -14,10 +14,12 @@ WALDIFFWriterAllocate(int wal_segment_size,
 	writer->writeBuf = (char*) palloc0(WALDIFF_WRITER_BUFF_CAPACITY);
 	writer->writeBuf[0] = '\0';
 	writer->writeBufFullness = 0;
+	writer->already_written = 0;
 
 	writer->seg.fd = -1;
 	writer->seg.segno = 0;
 	writer->seg.tli = 0;
+	writer->first_page_addr = 0;
 
 	writer->segcxt.segsize = wal_segment_size;
 	if (waldiff_dir)

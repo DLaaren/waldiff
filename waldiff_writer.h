@@ -102,6 +102,18 @@ struct WALDIFFWriterState
 
 	char	   *writeBuf;
 	Size		writeBufFullness;
+	
+	/*
+	 * This field contains total number of bytes, written to waldiff segment.
+	 * We need it to decide, where we should insert block (page) headers
+	 */
+	Size already_written;
+
+	/*
+	 * Addres of first page in wal segment. This value also stored in
+	 * long page header
+	 */
+	XLogRecPtr first_page_addr;
 
 	/* Buffer to hold error message */
 	char	   *errormsg_buf;
@@ -109,7 +121,6 @@ struct WALDIFFWriterState
 };
 
 #define WALDIFFWriterGetBuf(writer) ((writer)->writeBuf)
-#define WALDIFFWriterGetBufFullness(writer) ((writer)->writeBufFullness)
 #define WALDIFFWriterGetRestOfBufCapacity(writer) (WALDIFF_WRITER_BUFF_CAPACITY - ((writer)->writeBufFullness))
 #define WALDIFFWriterGetErrMsg(writer) ((writer)->errormsg_buf)
 
