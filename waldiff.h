@@ -101,7 +101,7 @@ typedef struct WALDIFFRecordData
 	/* In delete/update case this is the pointer on deleted tuple version */
 	ItemPointerData prev_t_ctid;	
 
-	xl_heap_update   *main_data;
+	char   *main_data;
 	uint32 main_data_len;
 
 	/* highest block_id (-1 if none) */

@@ -51,6 +51,9 @@ static WALDIFFRecord fetch_insert(XLogReaderState *record);
 static WALDIFFRecord fetch_update(XLogReaderState *record);
 static WALDIFFRecord fetch_delete(XLogReaderState *record);
 
+static void free_waldiff_record(WALDIFFRecord record);
+static void copy_waldiff_record(WALDIFFRecord dest, WALDIFFRecord src);
+
 static int overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup);
 
 static int getWALsegsize(const char *WALpath);											 
@@ -321,6 +324,8 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 			int overlay_result;
 			uint8 xlog_type = XLogRecGetInfo(reader_state) & XLOG_HEAP_OPMASK;
 
+			entry->data = NULL;
+
 			switch(xlog_type)
 			{
 				case XLOG_HEAP_INSERT:
@@ -331,10 +336,14 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 					hash_key = GetHashKeyOfWALDIFFRecord(WDrec);
 					hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
 					if (is_found)
+					{
 						entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
+						free_waldiff_record(entry->data);
+					}
 
 					entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
-					entry->data = WDrec;
+					copy_waldiff_record(entry->data, WDrec);
+					free_waldiff_record(WDrec);
 					Assert(entry->key == hash_key);
 					
 					break;
@@ -359,7 +368,8 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 							 * Overlaying failed - we must store both records
 							 */
 							entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
-							entry->data = WDrec;
+							copy_waldiff_record(entry->data, WDrec);
+							free_waldiff_record(WDrec);
 							Assert(entry->key == hash_key);
 						}
 						else
@@ -367,16 +377,21 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 							WALDIFFRecord tmp = entry->data;
 							entry = (HTABElem *) hash_search(hash_table, (void*) &prev_hash_key, HASH_REMOVE, NULL);
 							entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
+
+							/*
+							 * We can do this without copying, because tmp dont refer to local variable
+							 */
 							entry->data = tmp;
 							Assert(entry->key == hash_key);
-
-							// TODO deallocate WDrec
+						
+							free_waldiff_record(WDrec);
 						}
 					}
 					else 
 					{
 						entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
-						entry->data = WDrec;
+						copy_waldiff_record(entry->data, WDrec);
+						free_waldiff_record(WDrec);
 						Assert(entry->key == hash_key);
 					}
 
@@ -395,6 +410,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 					{
 						/* if prev WDrec is not presented in the HTAB then it's not in WALDIFF segment */
 						entry = (HTABElem *) hash_search(hash_table, (void*) &prev_hash_key, HASH_REMOVE, NULL);
+						free_waldiff_record(entry->data);
 						Assert(entry == NULL);
 					}
 
@@ -402,7 +418,8 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 					else 
 					{
 						entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
-						entry->data = WDrec;
+						copy_waldiff_record(entry->data, WDrec);
+						free_waldiff_record(WDrec);
 						Assert(entry->key == hash_key);
 					}
 
@@ -893,6 +910,53 @@ fetch_delete(XLogReaderState *record)
 	return WDrec;
 }
 
+static void free_waldiff_record(WALDIFFRecord record)
+{
+	if (record->type == XLOG_HEAP_INSERT || record->type == XLOG_HEAP_UPDATE)
+		pfree(record->blocks[0].block_data);
+
+	pfree(record->main_data);
+	pfree(record);
+}
+
+/*
+ * After using this function you can call free_waldiff_record for src,
+ * because this function copies all arrays via memcpy
+ * dest should be NULL pointer
+ */
+static void copy_waldiff_record(WALDIFFRecord dest, WALDIFFRecord src)
+{
+	int num_blocks = 0;
+
+	Assert(dest == NULL);
+	Assert(src != NULL);
+
+	if (src->type == XLOG_HEAP_INSERT || src->type == XLOG_HEAP_DELETE)
+		num_blocks = 1;
+	else if (src->type == XLOG_HEAP_UPDATE)
+		num_blocks = 2;
+
+	Assert(num_blocks != 0);
+
+	dest = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord + (sizeof(WALDIFFBlock) * num_blocks));
+	memcpy(dest, src, SizeOfWALDIFFRecord);
+
+	dest->main_data = (char*) palloc0(sizeof(char) * src->main_data_len);
+	memcpy(dest->main_data, src->main_data, src->main_data_len);
+
+	for (int i = 0; i < num_blocks; i++)
+	{
+		memcpy((void*)&dest->blocks[i], (void*)&src->blocks[i], sizeof(WALDIFFBlock));
+		
+		if (src->type == XLOG_HEAP_DELETE || 
+			src->type == XLOG_HEAP_UPDATE && i > 0)
+			continue;
+
+		dest->blocks[i].block_data = (char*) palloc0(sizeof(char) * src->blocks[i].block_data_len);
+		memcpy(dest->blocks[i].block_data, src->blocks[i].block_data, src->blocks[i].block_data_len);
+	}
+}
+
 /*
  * Possible cases :
  * 1) prev_tup is insert record, so we write data from curr_tup (update record) on top of prev_tup data.
@@ -918,6 +982,7 @@ overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
 	Size 			curr_tup_user_data_len 	  = 0;
 
 	xl_heap_header* curr_tup_xl_hdr;
+	xl_heap_update* curr_tup_update_hdr 	  = (xl_heap_update*) curr_tup->main_data;
 	char* 			curr_tup_block_data 	  = (char*) curr_tup->blocks[0].block_data;
 
 	Size 			prev_tup_bitmap_len 	  = 0;
@@ -931,13 +996,13 @@ overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
 	 * block 0 data of update tuple looks like this : 
 	 * [prefix len] + [suffix len] + xl_heap_header + bitmap + padding + user data
 	 */
-	if (curr_tup->main_data->flags & XLH_UPDATE_PREFIX_FROM_OLD)
+	if (curr_tup_update_hdr->flags & XLH_UPDATE_PREFIX_FROM_OLD)
 	{
 		memcpy((void*)&curr_tup_prefix_len, curr_tup_block_data, sizeof(uint16));
 		curr_tup_block_data += sizeof(uint16);
 		curr_tup_offset2user_data += sizeof(uint16);
 	}
-	if (curr_tup->main_data->flags & XLH_UPDATE_SUFFIX_FROM_OLD)
+	if (curr_tup_update_hdr->flags & XLH_UPDATE_SUFFIX_FROM_OLD)
 	{
 		memcpy((void*)&curr_tup_suffix_len, curr_tup_block_data, sizeof(uint16));
 		curr_tup_block_data += sizeof(uint16);
@@ -982,17 +1047,18 @@ overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
 		uint16 			prev_tup_suffix_len 	  = 0;
 		Size 			prev_tup_offset2user_data = 0;
 		Size 			prev_tup_user_data_len 	  = 0;
+		xl_heap_update* prev_tup_update_hdr 	  = (xl_heap_update*) prev_tup->main_data;
 
 		/*
 		 * Same logic as in curr_tup prefix, suffix and user_data_len calculation
 		 */
-		if (prev_tup->main_data->flags & XLH_UPDATE_PREFIX_FROM_OLD)
+		if (prev_tup_update_hdr->flags & XLH_UPDATE_PREFIX_FROM_OLD)
 		{
 			memcpy((void*)&prev_tup_prefix_len, prev_tup_block_data, sizeof(uint16));
 			prev_tup_block_data += sizeof(uint16);
 			prev_tup_offset2user_data += sizeof(uint16);
 		}
-		if (prev_tup->main_data->flags & XLH_UPDATE_SUFFIX_FROM_OLD)
+		if (prev_tup_update_hdr->flags & XLH_UPDATE_SUFFIX_FROM_OLD)
 		{
 			memcpy((void*)&prev_tup_suffix_len, prev_tup_block_data, sizeof(uint16));
 			prev_tup_block_data += sizeof(uint16);
