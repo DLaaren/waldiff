@@ -46,20 +46,15 @@ typedef struct MemoryContextStorage
 	MemoryContext current;
 } MemoryContextStorage;
 
-/* WALDIFFSegment represents a WALDIFF segment being written */
-typedef struct WALDIFFSegment
+/* WALDIFFSegment represents a WAL/WALDIFF segment */
+typedef struct WALSegment
 {
-	int		fd; 		/* segment file descriptor */
+	int			fd; 		/* segment file descriptor */
 	XLogSegNo	segno;		/* segment number */
 	TimeLineID	tli;		/* timeline ID of the currently open file */
-} WALDIFFSegment;
-
-/* WALDIFFSegmentContext carries context information about WALDIFF segments */
-typedef struct WALDIFFSegmentContext
-{
-	char		*dir;
+	char		*dir; 		/* path to wal segment */
 	int			segsize;
-} WALDIFFSegmentContext;
+} WALSegment;
 
 /* Structure representing XLogRecord block data */
 typedef struct WALDIFFBlock {

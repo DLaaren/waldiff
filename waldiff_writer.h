@@ -10,8 +10,6 @@
 
 #include "waldiff.h"
 
-#define WALDIFF_WRITER_BUFF_CAPACITY (XLogRecordMaxSize + SizeOfXLogLongPHD)
-
 typedef struct WALDIFFWriterState WALDIFFWriterState;
 
 /* Return values from WALDIFFRecordWriteCB. */
@@ -23,39 +21,26 @@ typedef enum WALDIFFRecordWriteResult
 
 /* Function type definitions for various WALDIFFWriter interactions */
 typedef WALDIFFRecordWriteResult (*WALDIFFRecordWriteCB) (WALDIFFWriterState *waldiff_writer,
-														  XLogRecord *record);
-typedef void (*WALDIFFWriterSegmentOpenCB) (WALDIFFSegmentContext *segcxt,
-											WALDIFFSegment *seg);
-typedef void (*WALDIFFWriterSegmentCloseCB) (WALDIFFSegment *seg);
+														  XLogRecord *record,
+														  XLogReaderState* reader);
+typedef void (*WALDIFFWriterSegmentOpenCB) (WALSegment *seg);
+typedef void (*WALDIFFWriterSegmentCloseCB) (WALSegment *seg);
 
 typedef struct WALDIFFWriterRoutine
 {
-    /*
-	 * This callback shall write recordLen valid bytes from writeBuf
-     * to the WALDIFF page starting at targetPagePtr.  The callback
-	 * shall return the number of bytes written (never more than XLOG_BLCKSZ), 
-     * or -1 on failure.
-	 *
-	 * targetRecPtr is the position of the WALDIFF record we're writing to.
-	 *
-	 * The callback shall set ->seg.wds_tli to the TLI of the file the page was
-	 * written to.
+    /* 
+	 * This callback shall read given record from WAL segment
+	 * and write it to WALDIFF segment
 	 */
     WALDIFFRecordWriteCB write_records;
 
     /*
-	 * Callback to open the specified WALDIFF segment for writing.  
-     * ->seg.wds_fd shall be set to the file descriptor of the opened segment.  
-     * In case of failure, an error shall be raised by the callback and it 
-     * shall not return.
-	 *
-	 * "nextSegNo" is the number of the segment to be opened.
+	 * Callback to open the specified WAL/WALDIFF segment for writing
 	 */
     WALDIFFWriterSegmentOpenCB segment_open;
 
     /*
-	 * WALDIFF segment close callback.  ->seg.ws_fd shall be set to a negative
-	 * number.
+	 * WAL/WALDIFF segment close callback
 	 */
     WALDIFFWriterSegmentCloseCB segment_close;
 
@@ -71,11 +56,10 @@ struct WALDIFFWriterState
     WALDIFFWriterRoutine routine;
 
     /*
-     * Segment context
+     * Segments context
      */
-    WALDIFFSegmentContext segcxt;
-	WALDIFFSegment 	  	  seg;
-	uint32			      segoff;
+	WALSegment 	  	  	  wal_seg;
+	WALSegment			  waldiff_seg;
 
 	/*
 	 * System identifier of the waldiff files we're about to write.  
@@ -83,29 +67,21 @@ struct WALDIFFWriterState
 	 */
 	uint64 system_identifier;
 
-    /*
-	 * Start and end point of last records written.  
-     * EndRecPtr is also used as the position to write to next.  
-     * Calling WALDIFFBeginWrite() sets EndRecPtr to the
-	 * starting position and StartRecPtr to invalid.
-	 *
-	 * Start and end point of last record returned by WALDIFFWriteRecord().
-     * These are also available as record->lsn and record->next_lsn.
+	/*
+	 * Address of last record, written to buffer
 	 */
-	XLogRecPtr	StartRecPtr;	/* start of last record written */
-	XLogRecPtr	EndRecPtr;		/* end+1 of last record written */
+	XLogRecPtr last_record_written;
 
     /*
 	 * Buffer with current WALDIFF records to write
 	 * Max size of the buffer = WALDIFF_WRITER_BUFF_CAPACITY
 	 */
-
-	char	   *writeBuf;
-	Size		writeBufFullness;
+	char	   *buffer;
+	Size		buffer_fullness;
+	Size 		buffer_capacity;
 	
 	/*
 	 * This field contains total number of bytes, written to waldiff segment.
-	 * We need it to decide, where we should insert block (page) headers
 	 */
 	Size already_written;
 
@@ -120,21 +96,21 @@ struct WALDIFFWriterState
 	bool		errormsg_deferred;
 };
 
-#define WALDIFFWriterGetBuf(writer) ((writer)->writeBuf)
-#define WALDIFFWriterGetRestOfBufCapacity(writer) (WALDIFF_WRITER_BUFF_CAPACITY - ((writer)->writeBufFullness))
+#define WALDIFFWriterGetRestOfBufCapacity(writer) (((writer)->buffer_capacity) - ((writer)->buffer_fullness))
 #define WALDIFFWriterGetErrMsg(writer) ((writer)->errormsg_buf)
 
 /* Get a new WALDIFFWriter */
 extern WALDIFFWriterState *WALDIFFWriterAllocate(int wal_segment_size,
-										      	 char *waldir,
-										      	 WALDIFFWriterRoutine *routine);
+										      	 char *waldiff_dir,
+					  							 char* wal_dir,
+										      	 WALDIFFWriterRoutine *routine,
+												 Size buffer_capacity);
 
 /* Free a WALDIFFWriter */
 extern void WALDIFFWriterFree(WALDIFFWriterState *state);
 
 /* Position the WALDIFFWriter to the beginning */
 extern void WALDIFFBeginWrite(WALDIFFWriterState *state, 
-                              XLogRecPtr RecPtr,
 							  XLogSegNo segNo, 
 							  TimeLineID tli);
 
