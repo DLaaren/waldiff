@@ -20,27 +20,24 @@ typedef enum WALDIFFRecordWriteResult
 } WALDIFFRecordWriteResult;
 
 /* Function type definitions for various WALDIFFWriter interactions */
-typedef WALDIFFRecordWriteResult (*WALDIFFRecordWriteCB) (WALDIFFWriterState *waldiff_writer,
-														  XLogRecord *record,
-														  XLogReaderState* reader);
-typedef void (*WALDIFFWriterSegmentOpenCB) (WALSegment *seg);
+typedef WALDIFFRecordWriteResult (*WALDIFFRecordWriteCB) (WALDIFFWriterState *waldiff_writer, XLogRecord *record);
+typedef void (*WALDIFFWriterSegmentOpenCB) (WALSegment *seg, int flags);
 typedef void (*WALDIFFWriterSegmentCloseCB) (WALSegment *seg);
 
 typedef struct WALDIFFWriterRoutine
 {
     /* 
-	 * This callback shall read given record from WAL segment
-	 * and write it to WALDIFF segment
+	 * This callback shall write given record to WALDIFF segment
 	 */
-    WALDIFFRecordWriteCB write_records;
+    WALDIFFRecordWriteCB write_record;
 
     /*
-	 * Callback to open the specified WAL/WALDIFF segment for writing
+	 * Callback to open the specified WALDIFF segment for writing
 	 */
     WALDIFFWriterSegmentOpenCB segment_open;
 
     /*
-	 * WAL/WALDIFF segment close callback
+	 * WALDIFF segment close callback
 	 */
     WALDIFFWriterSegmentCloseCB segment_close;
 
@@ -56,32 +53,25 @@ struct WALDIFFWriterState
     WALDIFFWriterRoutine routine;
 
     /*
-     * Segments context
+     * Segment context
      */
-	WALSegment 	  	  	  wal_seg;
 	WALSegment			  waldiff_seg;
 
 	/*
 	 * System identifier of the waldiff files we're about to write.  
      * Set to zero (the default value) if unknown or unimportant.
 	 */
-	uint64 system_identifier;
-
-	/*
-	 * Address of last record, written to buffer
-	 */
-	XLogRecPtr last_record_written;
+	uint64 system_identifier; // TODO do we need this?
 
     /*
 	 * Buffer with current WALDIFF records to write
-	 * Max size of the buffer = WALDIFF_WRITER_BUFF_CAPACITY
 	 */
 	char	   *buffer;
 	Size		buffer_fullness;
 	Size 		buffer_capacity;
 	
 	/*
-	 * This field contains total number of bytes, written to waldiff segment.
+	 * This field contains total number of bytes, written to buffer.
 	 */
 	Size already_written;
 
@@ -89,7 +79,7 @@ struct WALDIFFWriterState
 	 * Addres of first page in wal segment. This value also stored in
 	 * long page header
 	 */
-	XLogRecPtr first_page_addr;
+	XLogRecPtr first_page_addr; // TODO do we need this?
 
 	/* Buffer to hold error message */
 	char	   *errormsg_buf;
@@ -98,11 +88,11 @@ struct WALDIFFWriterState
 
 #define WALDIFFWriterGetRestOfBufCapacity(writer) (((writer)->buffer_capacity) - ((writer)->buffer_fullness))
 #define WALDIFFWriterGetErrMsg(writer) ((writer)->errormsg_buf)
+#define WALDIFFWriterGetLastRecordWritten(writer) ((writer)->waldiff_seg.last_processed_record)
 
 /* Get a new WALDIFFWriter */
 extern WALDIFFWriterState *WALDIFFWriterAllocate(int wal_segment_size,
 										      	 char *waldiff_dir,
-					  							 char* wal_dir,
 										      	 WALDIFFWriterRoutine *routine,
 												 Size buffer_capacity);
 

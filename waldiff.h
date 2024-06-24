@@ -54,6 +54,13 @@ typedef struct WALSegment
 	TimeLineID	tli;		/* timeline ID of the currently open file */
 	char		*dir; 		/* path to wal segment */
 	int			segsize;
+
+	uint64 current_offset; 	/* offset from start of segment */
+
+	/*
+	 * Address of last read (if it wal segment) or written (if it waldiff segment) record
+	 */
+	XLogRecPtr last_processed_record;
 } WALSegment;
 
 /* Structure representing XLogRecord block data */

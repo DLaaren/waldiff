@@ -4,7 +4,6 @@
 WALDIFFWriterState *
 WALDIFFWriterAllocate(int wal_segment_size,
 					  char *waldiff_dir,
-					  char* wal_dir,
 					  WALDIFFWriterRoutine *routine,
 					  Size buffer_capacity)
 {
@@ -17,14 +16,16 @@ WALDIFFWriterAllocate(int wal_segment_size,
 	writer->buffer_fullness = 0;
 	writer->already_written = 0;
 
-	writer->wal_seg.fd = writer->waldiff_seg.fd = -1;
-	writer->wal_seg.segno = writer->waldiff_seg.segno = 0;
-	writer->wal_seg.tli = writer->waldiff_seg.tli= 0;
+	writer->waldiff_seg.fd = -1;
+	writer->waldiff_seg.segno = 0;
+	writer->waldiff_seg.tli= 0;
 
 	writer->first_page_addr = 0;
-	writer->last_record_written = InvalidXLogRecPtr;
 
-	writer->wal_seg.segsize = writer->waldiff_seg.segsize= wal_segment_size;
+	writer->waldiff_seg.current_offset = 0;
+	writer->waldiff_seg.last_processed_record = InvalidXLogRecPtr;
+
+	writer->waldiff_seg.segsize= wal_segment_size;
 
 	if (waldiff_dir)
 	{
@@ -35,16 +36,6 @@ WALDIFFWriterAllocate(int wal_segment_size,
 	}
 	else
 		writer->waldiff_seg.dir = NULL;
-	
-	if (wal_dir)
-	{
-		int dir_name_len = strlen(wal_dir);
-		writer->wal_seg.dir = (char*) palloc0(sizeof(char) * (dir_name_len + 1));
-		memcpy(writer->wal_seg.dir, wal_dir, dir_name_len);
-		writer->wal_seg.dir[dir_name_len] = '\0';
-	}
-	else
-		writer->wal_seg.dir = NULL;
 
 	writer->errormsg_buf = palloc0(MAX_ERRORMSG_LEN + 1);
 
@@ -56,15 +47,9 @@ WALDIFFWriterFree(WALDIFFWriterState *writer)
 {
 	if (writer->buffer_fullness > 0)
 		WALDIFFFlushBuffer(writer);
-
-	if (writer->wal_seg.fd != -1)
-		writer->routine.segment_close(&(writer->wal_seg));
 	
 	if (writer->waldiff_seg.fd != -1)
 		writer->routine.segment_close(&(writer->waldiff_seg));
-	
-	if (writer->wal_seg.dir != NULL)
-		pfree(writer->wal_seg.dir);
 
 	if (writer->waldiff_seg.dir != NULL)
 		pfree(writer->waldiff_seg.dir);
@@ -79,11 +64,10 @@ WALDIFFBeginWrite(WALDIFFWriterState *writer,
 				  XLogSegNo segNo, 
 				  TimeLineID tli)
 {
-	writer->wal_seg.segno = writer->waldiff_seg.segno = segNo;
-	writer->wal_seg.tli = writer->waldiff_seg.tli = tli;
+	writer->waldiff_seg.segno = segNo;
+	writer->waldiff_seg.tli = tli;
 
-	writer->routine.segment_open(&(writer->wal_seg));
-	writer->routine.segment_open(&(writer->waldiff_seg));
+	writer->routine.segment_open(&(writer->waldiff_seg), PG_BINARY | O_RDWR | O_CREAT);
 }
 
 WALDIFFRecordWriteResult 
