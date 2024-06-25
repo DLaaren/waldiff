@@ -612,30 +612,30 @@ WALDIFFCloseSegment(WALSegment *seg)
 	seg->fd = -1;
 }
 
-
+/*
+ * Read next record in WAL segment. You must reset raw_reader's buffers before 
+ * calling this function
+ */
 WALRawRecordReadResult 
-WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *record)
+WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 {
-	uint64 bytes_read = 0; /* num of bytes, read in this function call */
 	int	   nbytes = 0;
 
 	while (true)
 	{
 		/* check wheter we are in start of block */
-		if ((bytes_read + raw_reader->already_read) % BLCKSZ == 0)
+		if ((raw_reader->already_read) % BLCKSZ == 0)
 		{
 			XLogPageHeader hdr;
-			nbytes = read_file2buff(raw_reader, SizeOfXLogShortPHD, 0, true); /* skip short page header */
+			nbytes = append_to_tmp_buff(raw_reader, SizeOfXLogShortPHD); /* skip short header */
 			if (nbytes == 0)
 				return WALREAD_EOF;
 			
-			bytes_read += nbytes;
-
 			hdr = (XLogPageHeader) raw_reader->tmp_buffer;
-			if (XLogPageHeaderSize(hdr) > SizeOfXLogShortPHD)
+			if (XLogPageHeaderSize(hdr) > SizeOfXLogShortPHD) /* check whether we are in start of segment */
 			{
 				XLogLongPageHeader long_hdr;
-				nbytes = read_file2buff(raw_reader, SizeOfXLogLongPHD - SizeOfXLogShortPHD, bytes_read, true); /* skip remain part of long page header */
+				nbytes = append_to_tmp_buff(raw_reader, SizeOfXLogLongPHD - SizeOfXLogShortPHD); /* skip rest of long header */
 				if (nbytes == 0)
 					return WALREAD_EOF;
 
@@ -653,83 +653,106 @@ WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *record)
 					raw_reader->wal_seg.tli 	  = hdr->xlp_tli;
 				}
 				
-				bytes_read += nbytes;
 				ereport(LOG, errmsg("READ LONG HDR. ADDR : %ld", long_hdr->std.xlp_pageaddr));
 			}
 
 			if (hdr->xlp_rem_len > 0)
 			{
-				uint64 rem_data_len = 0;
+				/*
+				 * Even rest of record may be so large that it  will not fit on the page. 
+				 * data_len - part of record that is in the current page
+				 */
+				uint64 data_len = 0;
 
-				if (! XlogRecFitsOnPage(raw_reader->already_read + bytes_read, hdr->xlp_rem_len))
-					rem_data_len = BLCKSZ * (1 + (raw_reader->already_read + bytes_read) / BLCKSZ) - raw_reader->already_read - bytes_read;
+				if (! XlogRecFitsOnPage(raw_reader->already_read, hdr->xlp_rem_len))
+					data_len = BLCKSZ * (1 + (raw_reader->already_read / BLCKSZ)) - raw_reader->already_read; /* rest of current page */
 				else
-					rem_data_len = hdr->xlp_rem_len;
+					data_len = hdr->xlp_rem_len;
 				
-				nbytes = read_file2buff(raw_reader, rem_data_len, raw_reader->buffer_fullness, false);
+				nbytes = append_to_buff(raw_reader, data_len);
 				if (nbytes == 0)
-					break;
-				
-				bytes_read += nbytes;
-				raw_reader->buffer_fullness += nbytes;
+					return WALREAD_EOF;
 
-				if (rem_data_len == hdr->xlp_rem_len)
+				if (data_len == hdr->xlp_rem_len) /* if record remains fit on the current page */
 				{
-					lseek(raw_reader->wal_seg.fd, MAXALIGN(hdr->xlp_rem_len) - rem_data_len, SEEK_CUR);
-					bytes_read += MAXALIGN(hdr->xlp_rem_len) - rem_data_len;
-					return bytes_read;
+					lseek(raw_reader->wal_seg.fd, MAXALIGN(hdr->xlp_rem_len) - data_len, SEEK_CUR); /* Records and maxaligned, so skip padding */
+					raw_reader->already_read += MAXALIGN(hdr->xlp_rem_len) - data_len;
+
+					return WALREAD_SUCCESS; /* full record is in out buffer, so return success */
 				}
-				
-				else
+				else /* remaining part of record will be read in next iterations */
 					continue;
 			}
 		}
 
-		if (! XlogRecHdrFitsOnPage(raw_reader->already_read + bytes_read))
-		{
-			uint64 data_len = BLCKSZ * (1 + (raw_reader->already_read + bytes_read) / BLCKSZ) - raw_reader->already_read - bytes_read;
-			nbytes = read_file2buff(raw_reader, data_len, raw_reader->buffer_fullness, false);
-			if (nbytes == 0)
-				break;
-			
-			bytes_read += nbytes;
-			raw_reader->buffer_fullness += nbytes;
+		/*
+		 * We are not in the start of the page, so try read record header. 
+		 * We take into account that header may not fit on the rest of the current page
+		 */
 
+		if (! XlogRecHdrFitsOnPage(raw_reader->already_read))
+		{
+			uint64 data_len = BLCKSZ * (1 + (raw_reader->already_read) / BLCKSZ) - raw_reader->already_read; /* rest of current page */
+
+			/*
+			 * Read as much as we can. Remaining part of record will be read in next iterations
+			 */
+			nbytes = append_to_buff(raw_reader, data_len);
+			if (nbytes == 0)
+				return WALREAD_EOF;
+			
 			continue;
 		}
 		else 
 		{
-			uint64 data_len;
-			nbytes = read_file2buff(raw_reader, SizeOfXLogRecord, 0, true);
-			if (nbytes == 0)
-				break;
-			
-			bytes_read += nbytes;
+			uint64 		data_len; /* data_len - part of record that is in the current page. It may be full record length */
+			XLogRecord* record;
 
-			record = (XLogRecord*) raw_reader->tmp_buffer; // TODO сделать дефайн для такого
-			memcpy((char*) raw_reader->buffer + raw_reader->buffer_fullness, raw_reader->tmp_buffer, SizeOfXLogRecord);
+			reset_tmp_buff(raw_reader); /* we want tmp buffer to contain only record header */
+			nbytes = append_to_tmp_buff(raw_reader, SizeOfXLogRecord);
+			if (nbytes == 0)
+				return WALREAD_EOF;
+			
+			record = (XLogRecord*) raw_reader->tmp_buffer;
+
+			/*
+			 * avoid OOM
+			 */
+			if (SizeOfXLogRecord > WALRawReaderGetRestBufferCapacity(raw_reader))
+			{
+				ereport(WARNING, 
+						errmsg("cannot write xlog header to buffer with rest capacity %ld", 
+								WALRawReaderGetRestBufferCapacity(raw_reader)));
+				return WALREAD_FAIL;
+			}
+
+			/*
+			 * If we did everything right before, buffer is empty and we write header into it
+			 */
+			memcpy((void*) (raw_reader->buffer + raw_reader->buffer_fullness), raw_reader->tmp_buffer, SizeOfXLogRecord);
 			raw_reader->buffer_fullness += SizeOfXLogRecord;
 
-			if (! XlogRecFitsOnPage(raw_reader->already_read + bytes_read, record->xl_tot_len - SizeOfXLogRecord))
-				data_len = BLCKSZ * (1 + (raw_reader->already_read + bytes_read) / BLCKSZ) - raw_reader->already_read - bytes_read;
+			/*
+			 * Record may not fit on the rest of the current page
+			 */
+			if (! XlogRecFitsOnPage(raw_reader->already_read, record->xl_tot_len - SizeOfXLogRecord))
+				data_len = BLCKSZ * (1 + (raw_reader->already_read) / BLCKSZ) - raw_reader->already_read; /* rest of current page */
 			else
 				data_len = record->xl_tot_len - SizeOfXLogRecord;
 			
-			nbytes = read_file2buff(raw_reader, data_len, raw_reader->buffer_fullness, false);
+			nbytes = append_to_buff(raw_reader, data_len);
 			if (nbytes == 0)
-				break;
+				return WALREAD_EOF;
 			
-			bytes_read += nbytes;
-			raw_reader->buffer_fullness += nbytes;
-
-			if (data_len == (record->xl_tot_len - SizeOfXLogRecord))
+			if (data_len == (record->xl_tot_len - SizeOfXLogRecord)) /* If record fit on the current page */
 			{
-				lseek(raw_reader->wal_seg.fd, MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord - data_len, SEEK_CUR);
-				bytes_read += MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord - data_len;
-				return bytes_read;
+				lseek(raw_reader->wal_seg.fd, MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord - data_len, SEEK_CUR); /* Records and maxaligned, so skip padding */
+				raw_reader->already_read += MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord - data_len;
+
+				return WALREAD_SUCCESS; /* full record is in out buffer, so return success */
 			}
-			
-			continue;
+			else /* remaining part of record will be read in next iterations */
+				continue;
 		}
 	}
 	return WALREAD_FAIL;

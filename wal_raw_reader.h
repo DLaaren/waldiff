@@ -10,6 +10,8 @@
 
 #include "waldiff.h"
 
+#define TMP_BUFFER_CAPACITY BLCKSZ*2
+
 typedef struct WALRawReaderState WALRawReaderState;
 
 /* Return values from WALRecordReadCB. */
@@ -20,18 +22,32 @@ typedef enum WALRawRecordReadResult
     WALREAD_EOF = 1,            /* end of wal file reached */
 } WALRawRecordReadResult;
 
+/* Return values from WALRecordSkipCB. */
+typedef enum WALRawRecordSkipResult
+{
+	WALSKIP_SUCCESS = 0,		/* record is successfully read */
+	WALSKIP_FAIL = -1,			/* failed during reading a record */
+    WALSKIP_EOF = 1,            /* end of wal file reached */
+} WALRawRecordSkipResult;
+
 /* Function type definitions for various WALReader interactions */
-typedef WALRawRecordReadResult (*WALRawRecordReadCB) (WALRawReaderState *waldiff_reader, XLogRecord *record);
+typedef WALRawRecordReadResult (*WALRawRecordReadCB) (WALRawReaderState *waldiff_reader, XLogRecord *record); // TODO do we need XLogRecord parameter?
+typedef WALRawRecordSkipResult (*WALRawRecordSkipCB) (WALRawReaderState *waldiff_reader, XLogRecord *record);
 typedef void (*WALRawReaderSegmentOpenCB) (WALSegment *seg);
 typedef void (*WALRawReaderSegmentCloseCB) (WALSegment *seg);
 
 typedef struct WALRawReaderRoutine
 {
     /* 
-	 * This callback shall read raw record with given header from WAL segment
+	 * This callback shall read next raw record from WAL segment
 	 * and write it to internal buffer
 	 */
     WALRawRecordReadCB read_record;
+
+	/* 
+	 * This callback shall skip record with given header from WAL segment
+	 */
+    WALRawRecordSkipCB read_record;
 
     /*
 	 * Callback to open the specified WAL segment for reading
@@ -75,6 +91,7 @@ struct WALRawReaderState
 	 * Buffer for internal logic
 	 */
 	char* tmp_buffer;
+	Size  tmp_buffer_fullness;
 	
 	/*
 	 * This field contains total number of bytes, read from WAL file.
@@ -92,7 +109,8 @@ struct WALRawReaderState
 	bool		errormsg_deferred;
 };
 
-#define WALRawReaderGetRestOfBufCapacity(reader) (((reader)->buffer_capacity) - ((reader)->buffer_fullness))
+#define WALRawReaderGetRestBufferCapacity(reader) ((reader)->buffer_capacity - (reader)->buffer_fullness)
+#define WALRawReaderGetRestTmpBufferCapacity(reader) (TMP_BUFFER_CAPACITY - (reader)->tmp_buffer_fullness)
 #define WALRawReaderGetErrMsg(reader) ((reader)->errormsg_buf)
 #define WALRawReaderGetLastRecordRead(reader) ((reader)->wal_seg.last_processed_record)
 
@@ -130,6 +148,10 @@ extern void WALRawBeginRead(WALRawReaderState *state,
 							  XLogSegNo segNo, 
 							  TimeLineID tli);
 
-extern int read_file2buff(WALRawReaderState* raw_reader, uint64 size, uint64 buff_offset, bool is_tmp);
+extern int  append_to_buff(WALRawReaderState* raw_reader, uint64 size);
+extern void reset_buff(WALRawReaderState* raw_reader);
+
+extern int  append_to_tmp_buff(WALRawReaderState* raw_reader, uint64 size);
+extern void reset_tmp_buff(WALRawReaderState* raw_reader);
 
 #endif /* _WALREADER_H_ */
