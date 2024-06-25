@@ -77,7 +77,7 @@ struct WALRawReaderState
 	char* tmp_buffer;
 	
 	/*
-	 * This field contains total number of bytes, read from buffer.
+	 * This field contains total number of bytes, read from WAL file.
 	 */
 	Size already_read;
 
@@ -96,6 +96,26 @@ struct WALRawReaderState
 #define WALRawReaderGetErrMsg(reader) ((reader)->errormsg_buf)
 #define WALRawReaderGetLastRecordRead(reader) ((reader)->wal_seg.last_processed_record)
 
+/*
+ * Whether XLogRecord fits on the page with given offset from start of 
+ * WAL file
+ */
+#define XlogRecHdrFitsOnPage(file_offset) \
+( \
+	(file_offset) + SizeOfXLogRecord < \
+	BLCKSZ * (1 + (file_offset) / BLCKSZ) \
+)
+
+/*
+ * Whether record with given length fits on the page with given offset
+ * from start of WAL file
+ */
+#define XlogRecFitsOnPage(file_offset, rec_len) \
+( \
+	(file_offset) + (rec_len) < \
+	BLCKSZ * (1 + (file_offset) / BLCKSZ) \
+)
+
 /* Get a new WALReader */
 extern WALRawReaderState *WALRawReaderAllocate(int wal_segment_size,
 										  char* wal_dir,
@@ -109,5 +129,7 @@ extern void WALRawReaderFree(WALRawReaderState *state);
 extern void WALRawBeginRead(WALRawReaderState *state, 
 							  XLogSegNo segNo, 
 							  TimeLineID tli);
+
+extern int read_file2buff(WALRawReaderState* raw_reader, uint64 size, uint64 buff_offset, bool is_tmp);
 
 #endif /* _WALREADER_H_ */

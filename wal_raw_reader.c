@@ -72,3 +72,29 @@ WALBeginRead(WALRawReaderState *reader,
 
 	reader->routine.segment_open(&(reader->wal_seg));
 }
+
+/*
+ * Specific for raw reader function : reads size bytes from WAL file
+ * to internal buffer with offset. If is_tmp == true, bytes will be written to tmp_buf
+ * (in case when we want to skip some headers)
+ * Returns number of successfully read bytes
+ */
+int
+read_file2buff(WALRawReaderState* raw_reader, uint64 size, uint64 buff_offset, bool is_tmp) // TODO менять внутренние параметры по типу fullness
+{
+	int nbytes;
+
+	pgstat_report_wait_start(WAIT_EVENT_COPY_FILE_READ);
+	nbytes = read(raw_reader->wal_seg.fd, (char*) (raw_reader->buffer + buff_offset), size);
+	if (nbytes < 0)
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			errmsg("could not read WAL file : %m")));
+	if (nbytes == 0)
+		ereport(WARNING,
+			(errcode_for_file_access(),
+			errmsg("file descriptor closed for read \"%d\": %m", raw_reader->wal_seg.fd)));
+	pgstat_report_wait_end();
+	
+	return nbytes;
+}

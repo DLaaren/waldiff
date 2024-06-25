@@ -612,6 +612,129 @@ WALDIFFCloseSegment(WALSegment *seg)
 	seg->fd = -1;
 }
 
+
+WALRawRecordReadResult 
+WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *record)
+{
+	uint64 bytes_read = 0; /* num of bytes, read in this function call */
+	int	   nbytes = 0;
+
+	while (true)
+	{
+		/* check wheter we are in start of block */
+		if ((bytes_read + raw_reader->already_read) % BLCKSZ == 0)
+		{
+			XLogPageHeader hdr;
+			nbytes = read_file2buff(raw_reader, SizeOfXLogShortPHD, 0, true); /* skip short page header */
+			if (nbytes == 0)
+				return WALREAD_EOF;
+			
+			bytes_read += nbytes;
+
+			hdr = (XLogPageHeader) raw_reader->tmp_buffer;
+			if (XLogPageHeaderSize(hdr) > SizeOfXLogShortPHD)
+			{
+				XLogLongPageHeader long_hdr;
+				nbytes = read_file2buff(raw_reader, SizeOfXLogLongPHD - SizeOfXLogShortPHD, bytes_read, true); /* skip remain part of long page header */
+				if (nbytes == 0)
+					return WALREAD_EOF;
+
+				long_hdr  = (XLogLongPageHeader) raw_reader->tmp_buffer;
+
+				/*
+				 * If we are testing this function, raw_reader
+				 * still does not contain this values
+				 */
+				if (raw_reader->wal_seg.segsize == 0)
+				{
+					raw_reader->wal_seg.segsize   = long_hdr->xlp_seg_size;
+					raw_reader->system_identifier = long_hdr->xlp_sysid;
+					raw_reader->first_page_addr   = hdr->xlp_pageaddr;
+					raw_reader->wal_seg.tli 	  = hdr->xlp_tli;
+				}
+				
+				bytes_read += nbytes;
+				ereport(LOG, errmsg("READ LONG HDR. ADDR : %ld", long_hdr->std.xlp_pageaddr));
+			}
+
+			if (hdr->xlp_rem_len > 0)
+			{
+				uint64 rem_data_len = 0;
+
+				if (! XlogRecFitsOnPage(raw_reader->already_read + bytes_read, hdr->xlp_rem_len))
+					rem_data_len = BLCKSZ * (1 + (raw_reader->already_read + bytes_read) / BLCKSZ) - raw_reader->already_read - bytes_read;
+				else
+					rem_data_len = hdr->xlp_rem_len;
+				
+				nbytes = read_file2buff(raw_reader, rem_data_len, raw_reader->buffer_fullness, false);
+				if (nbytes == 0)
+					break;
+				
+				bytes_read += nbytes;
+				raw_reader->buffer_fullness += nbytes;
+
+				if (rem_data_len == hdr->xlp_rem_len)
+				{
+					lseek(raw_reader->wal_seg.fd, MAXALIGN(hdr->xlp_rem_len) - rem_data_len, SEEK_CUR);
+					bytes_read += MAXALIGN(hdr->xlp_rem_len) - rem_data_len;
+					return bytes_read;
+				}
+				
+				else
+					continue;
+			}
+		}
+
+		if (! XlogRecHdrFitsOnPage(raw_reader->already_read + bytes_read))
+		{
+			uint64 data_len = BLCKSZ * (1 + (raw_reader->already_read + bytes_read) / BLCKSZ) - raw_reader->already_read - bytes_read;
+			nbytes = read_file2buff(raw_reader, data_len, raw_reader->buffer_fullness, false);
+			if (nbytes == 0)
+				break;
+			
+			bytes_read += nbytes;
+			raw_reader->buffer_fullness += nbytes;
+
+			continue;
+		}
+		else 
+		{
+			uint64 data_len;
+			nbytes = read_file2buff(raw_reader, SizeOfXLogRecord, 0, true);
+			if (nbytes == 0)
+				break;
+			
+			bytes_read += nbytes;
+
+			record = (XLogRecord*) raw_reader->tmp_buffer; // TODO сделать дефайн для такого
+			memcpy((char*) raw_reader->buffer + raw_reader->buffer_fullness, raw_reader->tmp_buffer, SizeOfXLogRecord);
+			raw_reader->buffer_fullness += SizeOfXLogRecord;
+
+			if (! XlogRecFitsOnPage(raw_reader->already_read + bytes_read, record->xl_tot_len - SizeOfXLogRecord))
+				data_len = BLCKSZ * (1 + (raw_reader->already_read + bytes_read) / BLCKSZ) - raw_reader->already_read - bytes_read;
+			else
+				data_len = record->xl_tot_len - SizeOfXLogRecord;
+			
+			nbytes = read_file2buff(raw_reader, data_len, raw_reader->buffer_fullness, false);
+			if (nbytes == 0)
+				break;
+			
+			bytes_read += nbytes;
+			raw_reader->buffer_fullness += nbytes;
+
+			if (data_len == (record->xl_tot_len - SizeOfXLogRecord))
+			{
+				lseek(raw_reader->wal_seg.fd, MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord - data_len, SEEK_CUR);
+				bytes_read += MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord - data_len;
+				return bytes_read;
+			}
+			
+			continue;
+		}
+	}
+	return WALREAD_FAIL;
+}
+
 /* 
  * WALDIFFWriteRecord
  * 
