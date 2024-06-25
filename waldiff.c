@@ -46,7 +46,9 @@ int WalReadPage(XLogReaderState *reader, XLogRecPtr targetPagePtr, int reqLen,
 void WalCloseSegment(XLogReaderState *reader);				
 void WALDIFFCloseSegment(WALSegment *seg);
 WALDIFFRecordWriteResult WALDIFFWriteRecord(WALDIFFWriterState *writer, XLogRecord *record);
+
 WALRawRecordReadResult WALReadRawRecord(WALRawReaderState *wal_raw_reader, XLogRecord *record);
+WALRawRecordSkipResult WALSkipRawRecord(WALRawReaderState *raw_reader, XLogRecord *target);
 
 /* This three fuctions returns palloced struct */
 static WALDIFFRecord fetch_insert(XLogReaderState *record);
@@ -264,8 +266,8 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
     if (writer == NULL)
 		writer = WALDIFFWriterAllocate(wal_segment_size, 
 									   waldiff_dir,
-									   WALDIFFWRITER_ROUTINE(.write_record = WALDIFFWriteRecord,
-															 .segment_open = WALDIFFOpenSegment,
+									   WALDIFFWRITER_ROUTINE(.write_record  = WALDIFFWriteRecord,
+															 .segment_open  = WALDIFFOpenSegment,
 															 .segment_close = WALDIFFCloseSegment),
 									   XLogRecordMaxSize + SizeOfXLogLongPHD);
 	Assert(writer != NULL);
@@ -277,8 +279,9 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 	if (raw_reader == NULL)
 		raw_reader = WALRawReaderAllocate(wal_segment_size, 
 										  XLOGDIR, 
-										  WALRAWREADER_ROUTINE(.read_record = WALReadRawRecord,
-															   .segment_open = WALDIFFOpenSegment,
+										  WALRAWREADER_ROUTINE(.read_record   = WALReadRawRecord,
+										  						.skip_record  = WALSkipRawRecord,
+															   .segment_open  = WALDIFFOpenSegment,
 															   .segment_close = WALDIFFCloseSegment), 
 										  XLogRecordMaxSize);
 
@@ -613,8 +616,120 @@ WALDIFFCloseSegment(WALSegment *seg)
 }
 
 /*
+ * Skip next record in WAL segment. You must reset raw_reader's buffers before 
+ * calling this function. raw_reader's buffers will not contain skipped record
+ */
+WALRawRecordSkipResult
+WALSkipRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
+{
+	int	   nbytes = 0;
+
+	while (true)
+	{
+		/* check whether we are in start of block */
+		if ((raw_reader->already_read) % BLCKSZ == 0)
+		{
+			XLogPageHeader hdr;
+			nbytes = append_to_tmp_buff(raw_reader, SizeOfXLogShortPHD); /* skip short header */
+			if (nbytes == 0)
+				return WALSKIP_EOF;
+			
+			/*
+			 * Check whether we are in start of segment and skip rest of header if needed
+			 */
+			hdr = (XLogPageHeader) raw_reader->tmp_buffer;
+			if (XLogPageHeaderSize(hdr) > SizeOfXLogShortPHD)
+			{
+				lseek(raw_reader->wal_seg.fd, SizeOfXLogLongPHD - SizeOfXLogShortPHD, SEEK_CUR);
+				raw_reader->already_read += SizeOfXLogLongPHD - SizeOfXLogShortPHD;
+			}
+			
+			if (hdr->xlp_rem_len > 0)
+			{
+				/*
+				 * Even rest of record may be so large that it  will not fit on the page. 
+				 * data_len - part of record that is in the current page
+				 */
+				uint64 data_len = 0;
+
+				if (! XlogRecFitsOnPage(raw_reader->already_read, hdr->xlp_rem_len))
+					data_len = BLCKSZ * (1 + (raw_reader->already_read / BLCKSZ)) - raw_reader->already_read; /* rest of current page */
+				else
+					data_len = hdr->xlp_rem_len;
+				
+				lseek(raw_reader->wal_seg.fd, data_len, SEEK_CUR);
+				raw_reader->already_read += data_len;
+
+				if (data_len == hdr->xlp_rem_len) /* if record remains fit on the current page */
+				{
+					lseek(raw_reader->wal_seg.fd, MAXALIGN(hdr->xlp_rem_len) - data_len, SEEK_CUR); /* Records and maxaligned, so skip padding */
+					raw_reader->already_read += MAXALIGN(hdr->xlp_rem_len) - data_len;
+
+					return WALSKIP_SUCCESS; /* full record skipped, so return success */
+				}
+				else /* remaining part of record will be skipped in next iterations */
+					continue;
+			}
+		}
+
+		/*
+		 * We are not in the start of the page, so try read record header. 
+		 * We take into account that header may not fit on the rest of the current page
+		 */
+
+		if (! XlogRecHdrFitsOnPage(raw_reader->already_read))
+		{
+			uint64 data_len = BLCKSZ * (1 + (raw_reader->already_read) / BLCKSZ) - raw_reader->already_read; /* rest of current page */
+
+			/*
+			 * Skip as much as we can. Remaining part of record will be read in next iterations
+			 */
+			lseek(raw_reader->wal_seg.fd, data_len, SEEK_CUR);
+			raw_reader->already_read += data_len;
+			
+			continue;
+		}
+		else 
+		{
+			uint64 		data_len; /* data_len - part of record that is in the current page. It may be full record length */
+			XLogRecord* record;
+
+			reset_tmp_buff(raw_reader); /* we want tmp buffer to contain only record header */
+			nbytes = append_to_tmp_buff(raw_reader, SizeOfXLogRecord);
+			if (nbytes == 0)
+				return WALSKIP_EOF;
+			
+			record = (XLogRecord*) raw_reader->tmp_buffer;
+
+			/*
+			 * Record may not fit on the rest of the current page
+			 */
+			if (! XlogRecFitsOnPage(raw_reader->already_read, record->xl_tot_len - SizeOfXLogRecord))
+				data_len = BLCKSZ * (1 + (raw_reader->already_read) / BLCKSZ) - raw_reader->already_read; /* rest of current page */
+			else
+				data_len = record->xl_tot_len - SizeOfXLogRecord;
+
+			lseek(raw_reader->wal_seg.fd, data_len, SEEK_CUR);
+			raw_reader->already_read += data_len;
+			
+			if (data_len == (record->xl_tot_len - SizeOfXLogRecord)) /* If record fit on the current page */
+			{
+				lseek(raw_reader->wal_seg.fd, MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord - data_len, SEEK_CUR); /* Records and maxaligned, so skip padding */
+				raw_reader->already_read += MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord - data_len;
+
+				return WALSKIP_SUCCESS; /* full record skipped, so return success */
+			}
+			else /* remaining part of record will be skipped in next iterations */
+				continue;
+		}
+	}
+	return WALSKIP_FAIL;
+}
+
+/*
  * Read next record in WAL segment. You must reset raw_reader's buffers before 
  * calling this function
+ * After execution, you can get pointer to raw record via WALRawReaderGetRecord
  */
 WALRawRecordReadResult 
 WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
@@ -623,7 +738,7 @@ WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 
 	while (true)
 	{
-		/* check wheter we are in start of block */
+		/* check whether we are in start of block */
 		if ((raw_reader->already_read) % BLCKSZ == 0)
 		{
 			XLogPageHeader hdr;

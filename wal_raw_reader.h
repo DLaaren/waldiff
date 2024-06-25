@@ -47,7 +47,7 @@ typedef struct WALRawReaderRoutine
 	/* 
 	 * This callback shall skip record with given header from WAL segment
 	 */
-    WALRawRecordSkipCB read_record;
+    WALRawRecordSkipCB skip_record;
 
     /*
 	 * Callback to open the specified WAL segment for reading
