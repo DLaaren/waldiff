@@ -33,7 +33,7 @@ typedef enum WALRawRecordSkipResult
 /* Function type definitions for various WALReader interactions */
 typedef WALRawRecordReadResult (*WALRawRecordReadCB) (WALRawReaderState *waldiff_reader, XLogRecord *record); // TODO do we need XLogRecord parameter?
 typedef WALRawRecordSkipResult (*WALRawRecordSkipCB) (WALRawReaderState *waldiff_reader, XLogRecord *record);
-typedef void (*WALRawReaderSegmentOpenCB) (WALSegment *seg);
+typedef void (*WALRawReaderSegmentOpenCB) (WALSegment *seg, int flags);
 typedef void (*WALRawReaderSegmentCloseCB) (WALSegment *seg);
 
 typedef struct WALRawReaderRoutine
@@ -112,7 +112,7 @@ struct WALRawReaderState
 #define WALRawReaderGetRestBufferCapacity(reader) ((reader)->buffer_capacity - (reader)->buffer_fullness)
 #define WALRawReaderGetRestTmpBufferCapacity(reader) (TMP_BUFFER_CAPACITY - (reader)->tmp_buffer_fullness)
 #define WALRawReaderGetErrMsg(reader) ((reader)->errormsg_buf)
-#define WALRawReaderGetLastRecordRead(reader) ((reader)->wal_seg.last_processed_record)
+#define WALRawReaderGetLastRecordRead(reader) ((reader)->buffer)
 
 /*
  * Whether XLogRecord fits on the page with given offset from start of 

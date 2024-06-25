@@ -12,8 +12,6 @@ WALDIFFWriterAllocate(int wal_segment_size,
 
 	writer->routine = *routine;
 
-	writer->buffer = (char*) palloc0(buffer_capacity);
-	writer->buffer_fullness = 0;
 	writer->already_written = 0;
 
 	writer->waldiff_seg.fd = -1;
@@ -45,9 +43,6 @@ WALDIFFWriterAllocate(int wal_segment_size,
 void 
 WALDIFFWriterFree(WALDIFFWriterState *writer)
 {
-	if (writer->buffer_fullness > 0)
-		WALDIFFFlushBuffer(writer);
-	
 	if (writer->waldiff_seg.fd != -1)
 		writer->routine.segment_close(&(writer->waldiff_seg));
 
@@ -55,7 +50,6 @@ WALDIFFWriterFree(WALDIFFWriterState *writer)
 		pfree(writer->waldiff_seg.dir);
 
 	pfree(writer->errormsg_buf);
-	pfree(writer->buffer);
 	pfree(writer);
 }
 
@@ -70,31 +64,29 @@ WALDIFFBeginWrite(WALDIFFWriterState *writer,
 	writer->routine.segment_open(&(writer->waldiff_seg), PG_BINARY | O_RDWR | O_CREAT);
 }
 
-WALDIFFRecordWriteResult 
-WALDIFFFlushBuffer(WALDIFFWriterState *writer)
+/*
+ * Writes data_size bytes of given data to WALDIFF segment
+ */
+int 
+write_data_to_file(WALDIFFWriterState* writer, char* data, uint64 data_size)
 {
-	int written_bytes = 0;
+	int nbytes;
 
-	Assert(writer->buffer_fullness >= 0);
+	pgstat_report_wait_start(WAIT_EVENT_COPY_FILE_WRITE);
+	nbytes = write(writer->waldiff_seg.fd, (void*) data, data_size);
+	pgstat_report_wait_end();
 
-	ereport(LOG, errmsg("Writing to WALDIFF segment; curr buff size: %lu", writer->buffer_fullness));
+	if (nbytes != data_size)
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			errmsg("could not write to file \"%d\": %m", writer->waldiff_seg.fd)));
+	if (nbytes == 0)
+		ereport(WARNING,
+			(errcode_for_file_access(),
+			errmsg("file descriptor closed for write \"%d\": %m", writer->waldiff_seg.fd)));
 
-	written_bytes = write(writer->waldiff_seg.fd, writer->buffer, writer->buffer_fullness);
+	if (nbytes > 0)
+		writer->already_written += nbytes;
 
-	if (written_bytes != writer->buffer_fullness)
-	{
-		ereport(ERROR, 
-				(errcode_for_file_access(),
-				errmsg("error while writing to WALDIFF segment in WALDIFFFlushBuffer() : %m")));
-		snprintf(writer->errormsg_buf, MAX_ERRORMSG_LEN, 
-				 "write() returns: %d, but expected: %ld",
-				 written_bytes, writer->buffer_fullness);
-		return WALDIFFWRITE_FAIL;
-	}
-	
-	ereport(LOG, errmsg("Wrote %d bytes to WALDIFF segment", written_bytes));
-
-	pg_fsync(writer->waldiff_seg.fd);
-
-	return WALDIFFWRITE_SUCCESS;
+	return nbytes;
 }

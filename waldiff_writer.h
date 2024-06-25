@@ -17,10 +17,11 @@ typedef enum WALDIFFRecordWriteResult
 {
 	WALDIFFWRITE_SUCCESS = 0,		/* record is successfully written */
 	WALDIFFWRITE_FAIL = -1,			/* failed during writing a record */
+	WALDIFFWRITE_EOF = 1,
 } WALDIFFRecordWriteResult;
 
 /* Function type definitions for various WALDIFFWriter interactions */
-typedef WALDIFFRecordWriteResult (*WALDIFFRecordWriteCB) (WALDIFFWriterState *waldiff_writer, XLogRecord *record);
+typedef WALDIFFRecordWriteResult (*WALDIFFRecordWriteCB) (WALDIFFWriterState *waldiff_writer, char *record);
 typedef void (*WALDIFFWriterSegmentOpenCB) (WALSegment *seg, int flags);
 typedef void (*WALDIFFWriterSegmentCloseCB) (WALSegment *seg);
 
@@ -62,18 +63,18 @@ struct WALDIFFWriterState
      * Set to zero (the default value) if unknown or unimportant.
 	 */
 	uint64 system_identifier; // TODO do we need this?
-
-    /*
-	 * Buffer with current WALDIFF records to write
-	 */
-	char	   *buffer;
-	Size		buffer_fullness;
-	Size 		buffer_capacity;
 	
 	/*
-	 * This field contains total number of bytes, written to buffer.
+	 * This field contains total number of bytes, written to WALDIFF segment
 	 */
 	Size already_written;
+
+	/*
+	 * This buffer contains self-constructed structures, that
+	 * we want to write into WALDIFF segment
+	 */
+	char* buffer;
+	Size buffer_capacity;
 
 	/*
 	 * Addres of first page in wal segment. This value also stored in
@@ -104,7 +105,6 @@ extern void WALDIFFBeginWrite(WALDIFFWriterState *state,
 							  XLogSegNo segNo, 
 							  TimeLineID tli);
 
-extern WALDIFFRecordWriteResult WALDIFFFlushBuffer(WALDIFFWriterState *state);
-
+extern int write_data_to_file(WALDIFFWriterState* writer, char* data, uint64 data_size);
 
 #endif /* _WALDIFF_WRITER_H_ */

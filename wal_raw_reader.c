@@ -72,7 +72,7 @@ WALBeginRead(WALRawReaderState *reader,
 	reader->wal_seg.segno = segNo;
 	reader->wal_seg.tli = tli;
 
-	reader->routine.segment_open(&(reader->wal_seg));
+	reader->routine.segment_open(&(reader->wal_seg), O_RDONLY | PG_BINARY);
 }
 
 /*
