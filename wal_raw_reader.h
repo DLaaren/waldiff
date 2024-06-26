@@ -154,4 +154,10 @@ extern void reset_buff(WALRawReaderState* raw_reader);
 extern int  append_to_tmp_buff(WALRawReaderState* raw_reader, uint64 size);
 extern void reset_tmp_buff(WALRawReaderState* raw_reader);
 
+/*
+ * Declaration of WALDIFFWriterState routine implementations
+ */
+extern WALRawRecordSkipResult WALSkipRawRecord(WALRawReaderState *raw_reader, XLogRecord *target);
+extern WALRawRecordReadResult WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *target);
+
 #endif /* _WALREADER_H_ */
