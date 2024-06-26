@@ -70,13 +70,6 @@ struct WALDIFFWriterState
 	Size already_written;
 
 	/*
-	 * This buffer contains self-constructed structures, that
-	 * we want to write into WALDIFF segment
-	 */
-	char* buffer;
-	Size buffer_capacity;
-
-	/*
 	 * Addres of first page in wal segment. This value also stored in
 	 * long page header
 	 */
@@ -106,5 +99,12 @@ extern void WALDIFFBeginWrite(WALDIFFWriterState *state,
 							  TimeLineID tli);
 
 extern int write_data_to_file(WALDIFFWriterState* writer, char* data, uint64 data_size);
+
+/*
+ * Declaration of WALDIFFWriterState routine implementations
+ */
+extern WALDIFFRecordWriteResult WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record);
+extern void WALDIFFOpenSegment(WALSegment *seg, int flags);
+extern void WALDIFFCloseSegment(WALSegment *seg);
 
 #endif /* _WALDIFF_WRITER_H_ */

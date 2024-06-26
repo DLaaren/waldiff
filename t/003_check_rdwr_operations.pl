@@ -47,9 +47,6 @@ $node->safe_psql(
 
         already_written bigint,
 
-        buffer text,
-        buffer_capacity bigint,
-
         first_page_addr bigint
         );"
 );
