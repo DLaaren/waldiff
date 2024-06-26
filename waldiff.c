@@ -319,7 +319,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 					errmsg("skipping over %u bytes", (uint32) (first_record - reader_private.startptr)));
 		
 		writer->first_page_addr = raw_reader->first_page_addr = page_hdr->std.xlp_pageaddr;
-		writer->first_page_addr = raw_reader->first_page_addr = page_hdr->xlp_sysid;
+		writer->system_identifier = raw_reader->system_identifier = page_hdr->xlp_sysid;
 	}
 
 	/* Main reading & constructing & writing loop */
@@ -457,6 +457,9 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 					WALDIFFRecordWriteResult write_res;
 					WALRawRecordReadResult   read_res;
 
+					reset_buff(raw_reader);
+					reset_tmp_buff(raw_reader);
+					
 					read_res = raw_reader->routine.read_record(raw_reader, WALRec);
 					if (read_res == WALREAD_FAIL)
 						ereport(ERROR, errmsg("error during reading raw record from WAL segment: %s", 
@@ -474,6 +477,9 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 		{
 			WALDIFFRecordWriteResult write_res;
 			WALRawRecordReadResult   read_res;
+
+			reset_buff(raw_reader);
+			reset_tmp_buff(raw_reader);
 
 			read_res = raw_reader->routine.read_record(raw_reader, WALRec);
 			if (read_res == WALREAD_FAIL)
@@ -514,6 +520,7 @@ waldiff_shutdown(ArchiveModuleState *reader)
 	/* Must have 'case this function closes fd */
 	XLogReaderFree(reader_state);
 	WALDIFFWriterFree(writer);
+	WALRawReaderFree(raw_reader);
 
 	hash_destroy(hash_table);
 
@@ -758,6 +765,7 @@ WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 		if ((raw_reader->already_read) % BLCKSZ == 0)
 		{
 			XLogPageHeader hdr;
+			reset_tmp_buff(raw_reader); /* we want tmp buff to only contain page header */
 			nbytes = append_to_tmp_buff(raw_reader, SizeOfXLogShortPHD); /* skip short header */
 			if (nbytes == 0)
 				return WALREAD_EOF;
@@ -808,7 +816,6 @@ WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 				{
 					lseek(raw_reader->wal_seg.fd, MAXALIGN(hdr->xlp_rem_len) - data_len, SEEK_CUR); /* Records and maxaligned, so skip padding */
 					raw_reader->already_read += MAXALIGN(hdr->xlp_rem_len) - data_len;
-
 					return WALREAD_SUCCESS; /* full record is in out buffer, so return success */
 				}
 				else /* remaining part of record will be read in next iterations */
@@ -900,6 +907,7 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 	Size rem_data_len = 0;
 	pg_crc32c	crc;
 	int	nbytes = 0;
+	char* record_copy = record; /* we need second pointer for navigation through record */
 	XLogRecord* record_hdr = (XLogRecord*) record;
 
 	/* We use it when we need to put padding into file */
@@ -969,15 +977,15 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 			if (! XlogRecFitsOnPage(writer->already_written, rem_data_len))
 			{
 				uint64 data_len = BLCKSZ * (1 + (writer->already_written / BLCKSZ)) - writer->already_written; /* rest of current page */
-				nbytes = write_data_to_file(writer, record, data_len);
+				nbytes = write_data_to_file(writer, record_copy, data_len);
 				rem_data_len = rem_data_len - data_len;
-				record += data_len; /* we don't need this part of record anymore */
+				record_copy += data_len; /* we don't need this part of record anymore */
 
 				continue; /* remaining part of record will be written in next iterations */
 			}
 			else
 			{
-				nbytes = write_data_to_file(writer, record, rem_data_len);
+				nbytes = write_data_to_file(writer, record_copy, rem_data_len);
 
 				/*
 				 * Records are maxaligned, so we must write all padding too
@@ -1009,7 +1017,7 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 		 */
 		INIT_CRC32C(crc);
 		COMP_CRC32C(crc, (char*) (record_hdr + SizeOfXLogRecord), record_hdr->xl_tot_len - SizeOfXLogRecord);
-		COMP_CRC32C(crc, record, offsetof(XLogRecord, xl_crc));
+		COMP_CRC32C(crc, record_hdr, offsetof(XLogRecord, xl_crc));
 		FIN_CRC32C(crc);
 		record_hdr->xl_crc = crc;
 
@@ -1022,16 +1030,16 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 			uint64 data_len = BLCKSZ * (1 + (writer->already_written / BLCKSZ)) - writer->already_written; /* rest of current page */
 			rem_data_len = record_hdr->xl_tot_len - data_len;
 
-			nbytes = write_data_to_file(writer, record, data_len); /* write to file as much as we can */
+			nbytes = write_data_to_file(writer, record_copy, data_len); /* write to file as much as we can */
 			if (nbytes == 0)
 				return WALDIFFWRITE_EOF;
 			
-			record += data_len;
+			record_copy += data_len;
 			continue; /* remaining part of record will be written in next iterations */
 		}
 		else
 		{
-			nbytes = write_data_to_file(writer, record, record_hdr->xl_tot_len);
+			nbytes = write_data_to_file(writer, record_copy, record_hdr->xl_tot_len);
 			if (nbytes == 0)
 				return WALDIFFWRITE_EOF;
 

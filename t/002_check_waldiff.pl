@@ -58,7 +58,7 @@ my $stdout1= $node->safe_psql('postgres', 'select * from test');
 
 ok($stdout1 == 12345, 'copy was successful');
 
-sleep(3600);
+sleep(2);
 
 # Stop the server
 $node->stop('immediate');

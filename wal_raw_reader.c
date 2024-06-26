@@ -2,7 +2,7 @@
 
 
 WALRawReaderState *
-WALDIFFWriterAllocate(int wal_segment_size,
+WALRawReaderAllocate(int wal_segment_size,
 					  char *wal_dir,
 					  WALRawReaderRoutine *routine,
 					  Size buffer_capacity)
@@ -47,7 +47,7 @@ WALDIFFWriterAllocate(int wal_segment_size,
 }
 
 void
-WALReaderFree(WALRawReaderState *reader)
+WALRawReaderFree(WALRawReaderState *reader)
 {
 	if (reader->buffer_fullness > 0)
 		ereport(LOG, errmsg("WALWriter still has some data in buffer. Remain data length : %ld", reader->buffer_fullness));
@@ -65,7 +65,7 @@ WALReaderFree(WALRawReaderState *reader)
 }
 
 void 
-WALBeginRead(WALRawReaderState *reader,
+WALRawBeginRead(WALRawReaderState *reader,
 				  XLogSegNo segNo, 
 				  TimeLineID tli)
 {
