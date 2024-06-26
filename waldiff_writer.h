@@ -96,7 +96,8 @@ extern void WALDIFFWriterFree(WALDIFFWriterState *state);
 /* Position the WALDIFFWriter to the beginning */
 extern void WALDIFFBeginWrite(WALDIFFWriterState *state, 
 							  XLogSegNo segNo, 
-							  TimeLineID tli);
+							  TimeLineID tli,
+							  int flags);
 
 extern int write_data_to_file(WALDIFFWriterState* writer, char* data, uint64 data_size);
 

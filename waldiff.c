@@ -268,7 +268,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 
 	ereport(LOG, errmsg("WALDIFFWriter was allocated successfully"));
 
-	WALDIFFBeginWrite(writer, segno, reader_private.timeline);
+	WALDIFFBeginWrite(writer, segno, reader_private.timeline, PG_BINARY | O_RDWR | O_CREAT);
 
 	if (raw_reader == NULL)
 		raw_reader = WALRawReaderAllocate(wal_segment_size, 
@@ -283,7 +283,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 
 	ereport(LOG, errmsg("WALRawReader was allocated successfully"));
 
-	WALRawBeginRead(raw_reader, segno, reader_private.timeline);
+	WALRawBeginRead(raw_reader, segno, reader_private.timeline, O_RDONLY | PG_BINARY);
 
 	/* Main work */
 	ereport(LOG, errmsg("archiving WAL file: %s", WALpath));

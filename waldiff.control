@@ -1,5 +1,5 @@
 # waldiff extension
-comment = 'creates wal_diff segment based on wal segment'
+comment = 'creates waldiff segment based on wal segment'
 default_version = '1.0'
 module_pathname = '$libdir/waldiff'
 relocatable = true

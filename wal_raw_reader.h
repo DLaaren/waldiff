@@ -146,7 +146,8 @@ extern void WALRawReaderFree(WALRawReaderState *state);
 /* Position the WALReader to the beginning */
 extern void WALRawBeginRead(WALRawReaderState *state, 
 							  XLogSegNo segNo, 
-							  TimeLineID tli);
+							  TimeLineID tli,
+							  int flags);
 
 extern int  append_to_buff(WALRawReaderState* raw_reader, uint64 size);
 extern void reset_buff(WALRawReaderState* raw_reader);

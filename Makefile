@@ -11,6 +11,9 @@ PGFILEDESC = "waldiff - archive module with compressing"
 NO_INSTALLCHECK = 1
 TAP_TESTS = 1
 
+EXTENSION = waldiff
+DATA = waldiff--1.0.sql
+
 ifdef USE_PGXS
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

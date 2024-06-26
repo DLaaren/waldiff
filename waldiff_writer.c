@@ -53,15 +53,19 @@ WALDIFFWriterFree(WALDIFFWriterState *writer)
 	pfree(writer);
 }
 
+/*
+ * Update writer's internal WALDIFF segment information and open file with flags
+ */
 void 
 WALDIFFBeginWrite(WALDIFFWriterState *writer,
 				  XLogSegNo segNo, 
-				  TimeLineID tli)
+				  TimeLineID tli,
+				  int flags)
 {
 	writer->waldiff_seg.segno = segNo;
 	writer->waldiff_seg.tli = tli;
 
-	writer->routine.segment_open(&(writer->waldiff_seg), PG_BINARY | O_RDWR | O_CREAT);
+	writer->routine.segment_open(&(writer->waldiff_seg), flags);
 }
 
 /*
@@ -107,6 +111,17 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 	/* We use it when we need to put padding into file */
 	char 		null_buff[1024];
 	memset(null_buff, 0, 1024);
+
+	/*
+	 * If we are testing this function, writer
+	 * still does not contain this values
+	 */
+	if (writer->first_page_addr == 0)
+	{
+		XLogLongPageHeader long_hdr = (XLogLongPageHeader) record;
+		writer->system_identifier = long_hdr->xlp_sysid;
+		writer->first_page_addr = long_hdr->std.xlp_pageaddr;
+	}
 
 	while (true)
 	{

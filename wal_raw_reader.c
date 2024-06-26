@@ -29,7 +29,7 @@ WALRawReaderAllocate(int wal_segment_size,
 	reader->wal_seg.current_offset = 0;
 	reader->wal_seg.last_processed_record = InvalidXLogRecPtr;
 
-	reader->wal_seg.segsize= wal_segment_size;
+	reader->wal_seg.segsize = wal_segment_size;
 
 	if (wal_dir)
 	{
@@ -64,15 +64,19 @@ WALRawReaderFree(WALRawReaderState *reader)
 	pfree(reader);
 }
 
+/*
+ * Update readers's internal WAL segment information and open file with flags
+ */
 void 
 WALRawBeginRead(WALRawReaderState *reader,
 				  XLogSegNo segNo, 
-				  TimeLineID tli)
+				  TimeLineID tli,
+				  int flags)
 {
 	reader->wal_seg.segno = segNo;
 	reader->wal_seg.tli = tli;
 
-	reader->routine.segment_open(&(reader->wal_seg), O_RDONLY | PG_BINARY);
+	reader->routine.segment_open(&(reader->wal_seg), flags);
 }
 
 /*
@@ -319,12 +323,10 @@ WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 				 * If we are testing this function, raw_reader
 				 * still does not contain this values
 				 */
-				if (raw_reader->wal_seg.segsize == 0)
+				if (raw_reader->first_page_addr == 0)
 				{
-					raw_reader->wal_seg.segsize   = long_hdr->xlp_seg_size;
 					raw_reader->system_identifier = long_hdr->xlp_sysid;
 					raw_reader->first_page_addr   = hdr->xlp_pageaddr;
-					raw_reader->wal_seg.tli 	  = hdr->xlp_tli;
 				}
 				
 				ereport(LOG, errmsg("READ LONG HDR. ADDR : %ld", long_hdr->std.xlp_pageaddr));
