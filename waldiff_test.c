@@ -46,6 +46,7 @@ read_raw_xlog_rec(PG_FUNCTION_ARGS)
 	text*		arg_0 			 = PG_GETARG_TEXT_PP(0);
 	int			res;
 	char 		wal_file_name[255];
+	bytea*		record;
 
 	WALRawRecordReadResult read_result;
 	wal_seg_size = 16777216; // synthetic example
@@ -95,9 +96,13 @@ read_raw_xlog_rec(PG_FUNCTION_ARGS)
 		WALRawReaderFree(raw_reader);
 		PG_RETURN_TEXT_P(create_error_msg("Error while processing spi command"));
 	}
+
+	record = (bytea*) palloc0(raw_reader->already_read + VARHDRSZ);
+	SET_VARSIZE(record, raw_reader->already_read + VARHDRSZ);
+	memcpy(VARDATA(record), raw_reader->buffer, raw_reader->buffer_fullness);
 	
 	WALRawReaderFree(raw_reader);
-	PG_RETURN_VOID();
+	PG_RETURN_BYTEA_P(record);
 }
 
 Datum
@@ -358,7 +363,7 @@ get_actual_writer_state()
 			false, 0);
 	if (res != SPI_OK_SELECT)
 	{
-		ereport(ERROR, errmsg("Cannot select from table raw_reader_state"));
+		ereport(ERROR, errmsg("Cannot select from table writer_state"));
 		return -1;
 	}
 
@@ -376,6 +381,24 @@ get_actual_writer_state()
 
 	read_tuples_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5, &is_null);
 	writer->already_written = DatumGetUInt64(read_tuples_datum);
+
+	/*
+	 * We cannot get this values in writer's routines, so steal them from raw_reader
+	 */
+	res = SPI_execute(
+			"SELECT system_identifier, first_page_addr FROM raw_reader_state WHERE id = 1;",
+			false, 0);
+	if (res != SPI_OK_SELECT)
+	{
+		ereport(ERROR, errmsg("Cannot select from table raw_reader_state"));
+		return -1;
+	}
+
+	read_tuples_datum   = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &is_null);
+	writer->system_identifier = DatumGetUInt64(read_tuples_datum);
+
+	read_tuples_datum 	   = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &is_null);
+	writer->first_page_addr = DatumGetUInt64(read_tuples_datum);
 
 	SPI_finish();
 

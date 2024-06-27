@@ -1,6 +1,6 @@
 /* contrib/waldiff/waldiff--1.0.sql */
 
-CREATE FUNCTION read_raw_xlog_rec(TEXT) RETURNS VOID
+CREATE FUNCTION read_raw_xlog_rec(TEXT) RETURNS BYTEA
 AS 'MODULE_PATHNAME', 'read_raw_xlog_rec'
 LANGUAGE C STRICT;
 

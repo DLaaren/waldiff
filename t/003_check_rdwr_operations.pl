@@ -143,28 +143,32 @@ for (my $iter = 0; $iter < $num_records; $iter++) {
     };
 }
 
-# my $size = -s $wal_diff_file;
-# ok($size == $total_read_count, "Read bytes == write bytes");
+my $size = -s $wal_diff_file;
+ok($size == $total_read_count, "Read bytes == write bytes");
 
-# # Read all read wal and all written wal_diff
-# my ($buffer1, $buffer2);
-# open(my $fh1, '<:raw', $wal_file) or die "Cannot open file '$wal_file': $!";
-# open(my $fh2, '<:raw', $wal_diff_file) or die "Cannot open file '$wal_diff_file': $!";
-# my $bytes_read1 = read($fh1, $buffer1, $total_read_count);
-# my $bytes_read2 = read($fh2, $buffer2, $total_read_count);
-# close($fh1);
-# close($fh2);
+# Copy all read wal and all written waldiff
+my ($buffer1, $buffer2);
+open(my $fh1, '<:raw', $wal_file) or die "Cannot open file '$wal_file': $!";
+open(my $fh2, '<:raw', $wal_diff_file) or die "Cannot open file '$wal_diff_file': $!";
+my $bytes_read1 = read($fh1, $buffer1, $total_read_count);
+my $bytes_read2 = read($fh2, $buffer2, $total_read_count);
+close($fh1);
+close($fh2);
 
-# # Try to find positions, where wal differ wal_diff
-# my $is_equal = 1;
-# for (my $i = 0; $i < $total_read_count; $i++) {
-#     if (substr($buffer1, $i, 1) ne substr($buffer2, $i, 1)) {
-#         diag("NOT EQUAL IN POSITION:");
-#         diag($i);
-#         $is_equal = 0;
-#     }
-# }
-# ok($is_equal == 1, "Wal diff file is equal to wal file");
+# During writing, we chenge crc filed of XLogRecord structure, so
+# every record in waldiff will have 4 bytes, different from these
+# bytes in wal record
+my $max_differences = (4 * $num_records);
+
+# Try to find positions, where wal differ waldiff
+my $is_equal = 1;
+my $difference_count = 0;
+for (my $i = 0; $i < $total_read_count; $i++) {
+    if (substr($buffer1, $i, 1) ne substr($buffer2, $i, 1)) {
+        $difference_count++;
+    }
+}
+ok($difference_count <= $max_differences, "Wal diff file is equal to wal file");
 
 # Stop the server
 $node->stop('immediate');
