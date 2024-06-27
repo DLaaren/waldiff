@@ -26,6 +26,7 @@ static text* create_error_msg(char* error);
 
 static int update_raw_reader_state_table();
 static int update_writer_state_table();
+static int update_service_info_table(uint64 last_read_record_addr, uint64 last_read_record_length);
 
 static int get_actual_raw_reader_state();
 static int get_actual_writer_state();
@@ -77,6 +78,10 @@ read_raw_xlog_rec(PG_FUNCTION_ARGS)
 	}
 
 	lseek(raw_reader->wal_seg.fd, raw_reader->already_read, SEEK_SET);
+
+	reset_buff(raw_reader);
+	reset_tmp_buff(raw_reader);
+
 	read_result = WALReadRawRecord(raw_reader, NULL);
 
 	if (read_result == WALREAD_EOF)
@@ -95,6 +100,16 @@ read_raw_xlog_rec(PG_FUNCTION_ARGS)
 	{
 		WALRawReaderFree(raw_reader);
 		PG_RETURN_TEXT_P(create_error_msg("Error while processing spi command"));
+	}
+
+	{
+		XLogRecord* hdr = (XLogRecord*) raw_reader->buffer;
+		res = update_service_info_table(raw_reader->already_read - MAXALIGN(hdr->xl_tot_len), MAXALIGN(hdr->xl_tot_len));
+		if (res < 0)
+		{
+			WALRawReaderFree(raw_reader);
+			PG_RETURN_TEXT_P(create_error_msg("Error while processing spi command"));
+		}
 	}
 
 	record = (bytea*) palloc0(raw_reader->already_read + VARHDRSZ);
@@ -271,6 +286,39 @@ update_writer_state_table()
 	if (res != SPI_OK_UPDATE)
 	{
 		ereport(ERROR, errmsg("Cannot update table writer_state"));
+		return -1;
+	}
+
+	SPI_finish();
+
+	return 0;
+}
+
+static int 
+update_service_info_table(uint64 last_read_record_addr, uint64 last_read_record_length)
+{
+	Oid	param_types[] = {
+		BIGINT_OID, // last_read_record_position
+		BIGINT_OID, // last_read_record_length
+	};
+	Datum params_datum[] = {
+		UInt64GetDatum(last_read_record_addr),
+		UInt64GetDatum(last_read_record_length)
+	};
+
+	int res = SPI_connect();
+	if (res == SPI_ERROR_CONNECT)
+	{
+		ereport(ERROR, errmsg("Cannot connext to spi"));
+		return -1;
+	}
+
+	res = SPI_execute_with_args(
+			"UPDATE service_info SET last_read_record_position = $1, last_read_record_length = $2 WHERE id = 1;",
+			2, param_types, params_datum, NULL, false, 0);
+	if (res != SPI_OK_UPDATE)
+	{
+		ereport(ERROR, errmsg("Cannot update table service_info"));
 		return -1;
 	}
 

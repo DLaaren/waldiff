@@ -221,6 +221,8 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 
 		writer->waldiff_seg.last_processed_record = writer->already_written;
 
+		memset((void*) (record_hdr + 18), 0, 2); /* padding in struct must be set to zero */
+
 		/*
 		 * Creating checksum (we possibly change xl_prev, so checksum also must be changed)
 		 */

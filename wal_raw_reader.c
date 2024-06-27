@@ -50,7 +50,7 @@ void
 WALRawReaderFree(WALRawReaderState *reader)
 {
 	if (reader->buffer_fullness > 0)
-		ereport(LOG, errmsg("WALWriter still has some data in buffer. Remain data length : %ld", reader->buffer_fullness));
+		ereport(LOG, errmsg("WALRawReader still has some data in buffer. Remain data length : %ld", reader->buffer_fullness));
 	
 	if (reader->wal_seg.fd != -1)
 		reader->routine.segment_close(&(reader->wal_seg));
