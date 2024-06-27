@@ -26,7 +26,9 @@ static text* create_error_msg(char* error);
 
 static int update_raw_reader_state_table();
 static int update_writer_state_table();
-static int update_service_info_table(uint64 last_read_record_addr, uint64 last_read_record_length);
+static int update_service_info_table(uint64 last_read_record_addr, 
+									 uint64 last_read_record_length,
+									 uint64 last_read_record_length_maxaligned);
 
 static int get_actual_raw_reader_state();
 static int get_actual_writer_state();
@@ -104,7 +106,7 @@ read_raw_xlog_rec(PG_FUNCTION_ARGS)
 
 	{
 		XLogRecord* hdr = (XLogRecord*) raw_reader->buffer;
-		res = update_service_info_table(raw_reader->already_read - MAXALIGN(hdr->xl_tot_len), MAXALIGN(hdr->xl_tot_len));
+		res = update_service_info_table(raw_reader->wal_seg.last_processed_record, hdr->xl_tot_len, MAXALIGN(hdr->xl_tot_len));
 		if (res < 0)
 		{
 			WALRawReaderFree(raw_reader);
@@ -295,15 +297,19 @@ update_writer_state_table()
 }
 
 static int 
-update_service_info_table(uint64 last_read_record_addr, uint64 last_read_record_length)
+update_service_info_table(uint64 last_read_record_addr, 
+						  uint64 last_read_record_length,
+						  uint64 last_read_record_length_maxaligned)
 {
 	Oid	param_types[] = {
 		BIGINT_OID, // last_read_record_position
 		BIGINT_OID, // last_read_record_length
+		BIGINT_OID, // last_read_record_maxaligned_length
 	};
 	Datum params_datum[] = {
 		UInt64GetDatum(last_read_record_addr),
-		UInt64GetDatum(last_read_record_length)
+		UInt64GetDatum(last_read_record_length),
+		UInt64GetDatum(last_read_record_length_maxaligned)
 	};
 
 	int res = SPI_connect();
@@ -314,8 +320,8 @@ update_service_info_table(uint64 last_read_record_addr, uint64 last_read_record_
 	}
 
 	res = SPI_execute_with_args(
-			"UPDATE service_info SET last_read_record_position = $1, last_read_record_length = $2 WHERE id = 1;",
-			2, param_types, params_datum, NULL, false, 0);
+			"UPDATE service_info SET last_read_record_position = $1, last_read_record_length = $2, last_read_record_maxaligned_length = $3 WHERE id = 1;",
+			3, param_types, params_datum, NULL, false, 0);
 	if (res != SPI_OK_UPDATE)
 	{
 		ereport(ERROR, errmsg("Cannot update table service_info"));

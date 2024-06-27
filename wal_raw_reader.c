@@ -389,6 +389,7 @@ WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 				return WALREAD_EOF;
 			
 			record = (XLogRecord*) raw_reader->tmp_buffer;
+			raw_reader->wal_seg.last_processed_record = raw_reader->already_read;
 
 			/*
 			 * avoid OOM
