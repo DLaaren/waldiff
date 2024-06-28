@@ -124,14 +124,62 @@ my @record_addresses;
 my @record_lengths;
 my @record_maxaligned_lengths;
 
-# Read record from WAL segment and write it to WALDIFF
-# segment $num_records times
+# Skip record from WAL segment $num_skip_records times
 
-my $num_records = 100;
+my $num_skip_records = 1;
 
-for (my $iter = 0; $iter < $num_records; $iter++) 
+for (my $iter = 0; $iter < $num_skip_records; $iter++) 
 {
-    my $read_record; # this variable will contain last read record from WAL segment
+    my $read_record;
+
+    # Read record from WAL segment
+    eval 
+    {
+        $read_record = $node->safe_psql(
+            'postgres', 
+            "SELECT skip_raw_xlog_rec('$wal_file');"
+        );
+        1;
+    } 
+    or do 
+    {
+        my $error = $@ || 'Unknown error';
+        $node->stop('immediate');
+        BAIL_OUT("Failed to execute 'skip_raw_xlog_rec' ");
+    };
+
+    # Get record's address, length, maxalign length and store them into arrays
+    eval 
+    {
+        my $service_info = $node->safe_psql(
+            'postgres', 
+            "SELECT last_read_record_position, last_read_record_length, last_read_record_maxaligned_length 
+               FROM service_info WHERE id = 1;"
+        );
+        my @values = split(/\|/, $service_info);
+        my ($record_addr, $record_length, $record_maxaligned_length) = @values;
+
+        push @record_addresses, int($record_addr);
+        push @record_lengths, int($record_length);
+        push @record_maxaligned_lengths, int($record_maxaligned_length);
+        1;
+    } 
+    or do 
+    {
+        my $error = $@ || 'Unknown error';
+        $node->stop('immediate');
+        BAIL_OUT("Failed to retrieve fields from 'service_info' ");
+    };
+}
+
+# Read record from WAL segment and write it to WALDIFF
+# segment $num_read_records times
+
+my $num_read_records = 2;
+
+for (my $iter = 0; $iter < $num_read_records; $iter++) 
+{
+    my $read_record;
 
     # Read record from WAL segment
     eval 
@@ -149,7 +197,7 @@ for (my $iter = 0; $iter < $num_records; $iter++)
         BAIL_OUT("Failed to execute 'read_raw_xlog_rec' ");
     };
 
-    # Get read record's address, length, maxalign length and store them into arrays
+    # Get record's address, length, maxalign length and store them into arrays
     eval 
     {
         my $service_info = $node->safe_psql(
@@ -173,36 +221,29 @@ for (my $iter = 0; $iter < $num_records; $iter++)
     };
 
     # Write record to WALDIFF segment
-    eval 
-    {
+    eval {
         $node->safe_psql(
             'postgres', 
             "SELECT write_raw_xlog_rec('$waldiff_file', '$read_record');"
         );
         1;
-    } 
-    or do 
-    {
+    } or do {
         my $error = $@ || 'Unknown error';
         $node->stop('immediate');
         BAIL_OUT("Failed to execute 'write_raw_xlog_rec' ");
     };
 }
 
-# Get total number of read from WAL segment bytes
+# get total number of read from WAL segment bytes
 my $already_read;
 my $total_read_count = 0;
-
-eval 
-{
+eval {
     $already_read = $node->safe_psql(
         'postgres', 
         "SELECT already_read FROM raw_reader_state WHERE id = 1;"
     );
     1;
-} 
-or do 
-{
+} or do {
     my $error = $@ || 'Unknown error';
     $node->stop('immediate');
     BAIL_OUT("Failed to retrieve 'already_read' from 'raw_reader_state' ");
@@ -210,43 +251,77 @@ or do
 
 $total_read_count = int($already_read);
 
-# Check if read from WAL segment bytes number matches written to WALDIFF segment bytes number
 my $size = -s $waldiff_file;
-ok($size == $total_read_count, "Read bytes == write bytes");
 
 # Copy all read from WAL and all written to WALDIFF bytes into buffers
 my ($buffer1, $buffer2);
 open(my $fh1, '<:raw', $wal_file) or die "Cannot open file '$wal_file': $!";
 open(my $fh2, '<:raw', $waldiff_file) or die "Cannot open file '$waldiff_file': $!";
 my $bytes_read1 = read($fh1, $buffer1, $total_read_count);
-my $bytes_read2 = read($fh2, $buffer2, $total_read_count);
+my $bytes_read2 = read($fh2, $buffer2, $size);
 close($fh1);
 close($fh2);
 
+
 sub substrings_equal 
 {
-    my ($current_position, $data_len) = @_;
+    my ($current_position, $data_len, $buffer1_position, $buffer2_position) = @_;
     
-    if (substr($buffer1, $current_position, $data_len) ne substr($buffer2, $current_position, $data_len)) 
+    if (substr($buffer1, $buffer1_position, $data_len) ne substr($buffer2, $buffer2_position, $data_len)) 
     {
         return 0;
     }
     return 1;
 }
 
-# Some system parameters
+# some system parameters
 my $xlog_rec_hdr_size     = 24;
 my $block_size            = 8192;
 my $long_page_header_len  = 40;
 my $short_page_header_len = 24;
 
+# At first, skip all bytes in WAL segment, that not presented in WALDIFF segment
 my $current_position = 0;
+
+for (my $i = 0; $i < $num_skip_records; $i++) 
+{   
+    my $rec_maxaligned_len = @record_maxaligned_lengths[$i];
+    my $rec_len            = @record_lengths[$i];
+    my $hdr_len            = 0;
+
+    # Check whether we are in start of page
+    if ($current_position % $block_size == 0) 
+    {
+        $hdr_len = $short_page_header_len;
+
+        # Check whether we are in start of segment
+        if ($current_position == 0)
+        {
+            $hdr_len = $long_page_header_len;
+        }
+        
+        $current_position += $hdr_len;
+        $hdr_len = 0;
+    }
+
+    # If record doesn't fit on page, we must also read page header
+    # TODO : if record is bigger than two pages, this logic is incorrect, but it will work for a smaller ones
+    if ($block_size * (1 + (int($current_position / $block_size))) < ($current_position + $rec_len))
+    {
+        $hdr_len = $short_page_header_len;
+    }
+
+    $current_position += ($rec_maxaligned_len + $hdr_len);
+}
+
+# Finally, compare WAL and WALDIFF segment
+
 my $is_equal = 1;
+my $current_waldiff_position = 0;
 
-# Compare WAL and WALDIFF segment
-
-for (my $i = 0; $i < $num_records; $i++) 
+for (my $i = $num_skip_records; $i < $num_skip_records + $num_read_records; $i++) 
 {
+    
     my $rec_maxaligned_len = @record_maxaligned_lengths[$i];
     my $rec_len            = @record_lengths[$i];
     my $hdr_len            = 0;
@@ -263,10 +338,11 @@ for (my $i = 0; $i < $num_records; $i++)
         }
 
         # Compare headers
-        $is_equal = substrings_equal($current_position, $hdr_len);
+        $is_equal = substrings_equal($current_position, $hdr_len, $current_position, $current_waldiff_position);
         ok($is_equal == 1, "Headers match");
         
         $current_position += $hdr_len;
+        $current_waldiff_position += $hdr_len;
         $hdr_len = 0;
     }
 
@@ -276,12 +352,17 @@ for (my $i = 0; $i < $num_records; $i++)
     {
         $hdr_len = $short_page_header_len;
     }
-
-    # Compare segments byte-by-byte 
+ 
+    # Compare segments byte-by-byte
     my $mismatch_num = 0;
-    for (my $j = $current_position; $j < $current_position + $rec_maxaligned_len + $hdr_len; $j++) 
+    my $j = $current_position;
+    my $k = $current_waldiff_position;
+    my $end_position = $current_position + $rec_maxaligned_len + $hdr_len;
+
+    for (; $j < $end_position; $j++, $k++) 
     {
-        if (substr($buffer1, $j, 1) ne substr($buffer2, $j, 1)) {
+        if (substr($buffer1, $j, 1) ne substr($buffer2, $k, 1)) 
+        {
             $mismatch_num += 1;
         }
     }
@@ -293,16 +374,22 @@ for (my $i = 0; $i < $num_records; $i++)
         diag("");
         diag("record number");
         diag($i);
-        diag("current position");
+        diag("current wal position");
         diag($current_position);
+        diag("current waldiff position");
+        diag($current_waldiff_position);
         diag("record length");
         diag($rec_len);
         diag("record maxalign length");
         diag($rec_maxaligned_len);
 
-        for (my $j = $current_position; $j < $current_position + $rec_maxaligned_len + $hdr_len; $j++) 
+        $j = $current_position;
+        $k = $current_waldiff_position;
+        $end_position = $current_position + $rec_maxaligned_len + $hdr_len;
+
+        for (; $j < $end_position; $j++, $k++) 
         {
-            if (substr($buffer1, $j, 1) ne substr($buffer2, $j, 1)) 
+            if (substr($buffer1, $j, 1) ne substr($buffer2, $k, 1)) 
             {
                 diag("not equal in position");
                 diag($j);
@@ -315,6 +402,7 @@ for (my $i = 0; $i < $num_records; $i++)
     ok($is_equal == 1, "Records match");
 
     $current_position += ($rec_maxaligned_len + $hdr_len);
+    $current_waldiff_position += ($rec_maxaligned_len + $hdr_len);
 }
 
 ok($is_equal == 1, "WALDIFF file is equal to WAL file");

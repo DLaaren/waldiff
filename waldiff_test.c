@@ -41,6 +41,7 @@ static WALDIFFWriterState*  writer = NULL;
 static WALRawReaderState*   raw_reader = NULL;
 
 PG_FUNCTION_INFO_V1(read_raw_xlog_rec);
+PG_FUNCTION_INFO_V1(skip_raw_xlog_rec);
 PG_FUNCTION_INFO_V1(write_raw_xlog_rec);
 
 Datum
@@ -57,9 +58,9 @@ read_raw_xlog_rec(PG_FUNCTION_ARGS)
     raw_reader = WALRawReaderAllocate(wal_seg_size, 
 									XLOGDIR, 
 									WALRAWREADER_ROUTINE(.read_record   = WALReadRawRecord,
-															.skip_record  = WALSkipRawRecord,
-															.segment_open  = WALDIFFOpenSegment,
-															.segment_close = WALDIFFCloseSegment), 
+														 .skip_record  = WALSkipRawRecord,
+														 .segment_open  = WALDIFFOpenSegment,
+														 .segment_close = WALDIFFCloseSegment), 
 									XLogRecordMaxSize);
 
 	memcpy(wal_file_name, VARDATA(arg_0), VARSIZE_ANY_EXHDR(arg_0));
@@ -120,6 +121,80 @@ read_raw_xlog_rec(PG_FUNCTION_ARGS)
 	
 	WALRawReaderFree(raw_reader);
 	PG_RETURN_BYTEA_P(record);
+}
+
+Datum
+skip_raw_xlog_rec(PG_FUNCTION_ARGS)
+{
+	text*		arg_0 			 = PG_GETARG_TEXT_PP(0);
+	int			res;
+	char 		wal_file_name[255];
+
+	WALRawRecordSkipResult skip_result;
+	wal_seg_size = 16777216; // synthetic example
+
+    raw_reader = WALRawReaderAllocate(wal_seg_size, 
+									XLOGDIR, 
+									WALRAWREADER_ROUTINE(.read_record   = WALReadRawRecord,
+														 .skip_record  = WALSkipRawRecord,
+														 .segment_open  = WALDIFFOpenSegment,
+														 .segment_close = WALDIFFCloseSegment), 
+									XLogRecordMaxSize);
+
+	memcpy(wal_file_name, VARDATA(arg_0), VARSIZE_ANY_EXHDR(arg_0));
+	wal_file_name[VARSIZE_ANY_EXHDR(arg_0)] = '\0';
+
+	res = get_actual_raw_reader_state();
+	if (res < 0)
+	{
+		WALRawReaderFree(raw_reader);
+		PG_RETURN_TEXT_P(create_error_msg("Error while processing spi command"));
+	}
+
+	WALRawBeginRead(raw_reader, segNo, tli, O_RDONLY | PG_BINARY);
+	if (raw_reader->wal_seg.fd < 0)
+	{
+		WALRawReaderFree(raw_reader);
+		PG_RETURN_TEXT_P(create_error_msg("Error while opening wal segment file"));
+	}
+
+	lseek(raw_reader->wal_seg.fd, raw_reader->already_read, SEEK_SET);
+
+	reset_buff(raw_reader);
+	reset_tmp_buff(raw_reader);
+
+	skip_result = WALSkipRawRecord(raw_reader, NULL);
+
+	if (skip_result == WALSKIP_EOF)
+	{
+		WALRawReaderFree(raw_reader);
+		PG_RETURN_TEXT_P(create_error_msg("End of WAL segment file reached"));
+	}
+	else if (skip_result == WALSKIP_FAIL)
+	{
+		WALRawReaderFree(raw_reader);
+		PG_RETURN_TEXT_P(create_error_msg("Error during skipping raw record"));
+	}
+	
+	res = update_raw_reader_state_table();
+	if (res < 0)
+	{
+		WALRawReaderFree(raw_reader);
+		PG_RETURN_TEXT_P(create_error_msg("Error while processing spi command"));
+	}
+
+	{
+		XLogRecord* hdr = (XLogRecord*) raw_reader->tmp_buffer;
+		res = update_service_info_table(raw_reader->wal_seg.last_processed_record, hdr->xl_tot_len, MAXALIGN(hdr->xl_tot_len));
+		if (res < 0)
+		{
+			WALRawReaderFree(raw_reader);
+			PG_RETURN_TEXT_P(create_error_msg("Error while processing spi command"));
+		}
+	}
+	
+	WALRawReaderFree(raw_reader);
+	PG_RETURN_VOID();
 }
 
 Datum
@@ -214,14 +289,14 @@ update_raw_reader_state_table()
 {
 	Oid	param_types[] = {
 		INTEGER_OID, // segno
-		BIGINT_OID, // tli
-		BIGINT_OID, // system_identifier
-		TEXT_OID, // tmp_buffer
-		BIGINT_OID, // tmp_buffer_fullness
-		BIGINT_OID, // buffer_fullness
-		TEXT_OID, // buffer
-		BIGINT_OID, // already_read
-		BIGINT_OID, // first_page_addr
+		BIGINT_OID,  // tli
+		BIGINT_OID,  // system_identifier
+		TEXT_OID, 	 // tmp_buffer
+		BIGINT_OID,  // tmp_buffer_fullness
+		BIGINT_OID,  // buffer_fullness
+		TEXT_OID, 	 // buffer
+		BIGINT_OID,  // already_read
+		BIGINT_OID,  // first_page_addr
 	};
 	Datum params_datum[] = {
 		UInt64GetDatum(raw_reader->wal_seg.segno),
@@ -357,11 +432,11 @@ get_actual_raw_reader_state()
 		return -1;
 	}
 
-	read_tuples_datum   = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &is_null);
-	segNo = DatumGetUInt64(read_tuples_datum);
+	read_tuples_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &is_null);
+	segNo 			  = DatumGetUInt64(read_tuples_datum);
 
-	read_tuples_datum 	   = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &is_null);
-	tli = DatumGetUInt32(read_tuples_datum);
+	read_tuples_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &is_null);
+	tli 			  = DatumGetUInt32(read_tuples_datum);
 
 	read_tuples_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &is_null);
 	if (!is_null)
@@ -370,10 +445,10 @@ get_actual_raw_reader_state()
 		memcpy(raw_reader->tmp_buffer, tmp, TMP_BUFFER_CAPACITY);
 	}
 
-	read_tuples_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4, &is_null);
+	read_tuples_datum 				= SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4, &is_null);
 	raw_reader->tmp_buffer_fullness = DatumGetUInt64(read_tuples_datum);
 
-	read_tuples_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5, &is_null);
+	read_tuples_datum 			= SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5, &is_null);
 	raw_reader->buffer_fullness = DatumGetUInt64(read_tuples_datum);
 
 	raw_reader->buffer_capacity = XLogRecordMaxSize;
@@ -385,13 +460,13 @@ get_actual_raw_reader_state()
 		memcpy(raw_reader->buffer, tmp, raw_reader->buffer_fullness);
 	}
 
-	read_tuples_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 7, &is_null);
+	read_tuples_datum 			  = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 7, &is_null);
 	raw_reader->system_identifier = DatumGetUInt64(read_tuples_datum);
 
-	read_tuples_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 8, &is_null);
+	read_tuples_datum 			= SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 8, &is_null);
 	raw_reader->first_page_addr = DatumGetUInt64(read_tuples_datum);
 
-	read_tuples_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 9, &is_null);
+	read_tuples_datum 		 = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 9, &is_null);
 	raw_reader->already_read = DatumGetUInt64(read_tuples_datum);
 
 	SPI_finish();
@@ -421,19 +496,19 @@ get_actual_writer_state()
 		return -1;
 	}
 
-	read_tuples_datum   = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &is_null);
-	segNo = DatumGetUInt64(read_tuples_datum);
+	read_tuples_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &is_null);
+	segNo 			  = DatumGetUInt64(read_tuples_datum);
 
-	read_tuples_datum 	   = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &is_null);
-	tli = DatumGetUInt32(read_tuples_datum);
+	read_tuples_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &is_null);
+	tli 			  = DatumGetUInt32(read_tuples_datum);
 
-	read_tuples_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &is_null);
+	read_tuples_datum 		  = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &is_null);
 	writer->system_identifier = DatumGetUInt64(read_tuples_datum);
 
-	read_tuples_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4, &is_null);
+	read_tuples_datum 		= SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4, &is_null);
 	writer->first_page_addr = DatumGetUInt64(read_tuples_datum);
 
-	read_tuples_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5, &is_null);
+	read_tuples_datum 		= SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5, &is_null);
 	writer->already_written = DatumGetUInt64(read_tuples_datum);
 
 	/*
@@ -448,10 +523,10 @@ get_actual_writer_state()
 		return -1;
 	}
 
-	read_tuples_datum   = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &is_null);
+	read_tuples_datum   	  = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &is_null);
 	writer->system_identifier = DatumGetUInt64(read_tuples_datum);
 
-	read_tuples_datum 	   = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &is_null);
+	read_tuples_datum 	    = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &is_null);
 	writer->first_page_addr = DatumGetUInt64(read_tuples_datum);
 
 	SPI_finish();

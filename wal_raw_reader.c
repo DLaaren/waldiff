@@ -262,6 +262,7 @@ WALSkipRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 				return WALSKIP_EOF;
 			
 			record = (XLogRecord*) raw_reader->tmp_buffer;
+			raw_reader->wal_seg.last_processed_record = raw_reader->already_read;
 
 			/*
 			 * Record may not fit on the rest of the current page
