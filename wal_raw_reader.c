@@ -91,7 +91,7 @@ append_to_buff(WALRawReaderState* raw_reader, uint64 size)
 	if (size > WALRawReaderGetRestBufferCapacity(raw_reader))
 	{
 		ereport(ERROR, 
-				errmsg("cannot read %ld bytes from file to buffer with rest capacity %ld", 
+				errmsg("cannot read %ld bytes from WAL file to buffer with rest capacity %ld", 
 						size, WALRawReaderGetRestBufferCapacity(raw_reader)));
 		return -1;
 	}
@@ -192,6 +192,7 @@ WALSkipRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 		if ((raw_reader->already_read) % BLCKSZ == 0)
 		{
 			XLogPageHeader hdr;
+			reset_tmp_buff(raw_reader);
 			nbytes = append_to_tmp_buff(raw_reader, SizeOfXLogShortPHD); /* skip short header */
 			if (nbytes == 0)
 				return WALSKIP_EOF;

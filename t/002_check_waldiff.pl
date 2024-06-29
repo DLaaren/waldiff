@@ -38,7 +38,7 @@ $node->safe_psql('postgres', 'insert into test values(12345)');
 my ($walfile_name, $blocksize) = split '\|' => $node->safe_psql('postgres',
 	"SELECT pg_walfile_name(pg_switch_wal()), current_setting('block_size')");
 
-sleep(10);
+sleep(3600);
 
 
 # copy($node->data_dir . '/pg_wal/' . $walfile_name, $node->data_dir . '/waldiff_directory/' . $walfile_name);

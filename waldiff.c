@@ -50,7 +50,7 @@ static WALDIFFRecord fetch_update(XLogReaderState *record);
 static WALDIFFRecord fetch_delete(XLogReaderState *record);
 
 static void free_waldiff_record(WALDIFFRecord record);
-static void copy_waldiff_record(WALDIFFRecord dest, WALDIFFRecord src);
+static void copy_waldiff_record(WALDIFFRecord* dest, WALDIFFRecord src);
 
 static int overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup);
 
@@ -359,10 +359,11 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 
 					entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
 					entry->data = NULL;
-					copy_waldiff_record(entry->data, WDrec);
+					copy_waldiff_record(&(entry->data), WDrec);
 					free_waldiff_record(WDrec);
 					Assert(entry->key == hash_key);
 					
+					reset_tmp_buff(raw_reader);
 					raw_reader->routine.skip_record(raw_reader, WALRec);
 					break;
 
@@ -386,7 +387,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 							 */
 							entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
 							entry->data = NULL;
-							copy_waldiff_record(entry->data, WDrec);
+							copy_waldiff_record(&(entry->data), WDrec);
 							free_waldiff_record(WDrec);
 							Assert(entry->key == hash_key);
 						}
@@ -409,11 +410,12 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 					{
 						entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
 						entry->data = NULL;
-						copy_waldiff_record(entry->data, WDrec);
+						copy_waldiff_record(&(entry->data), WDrec);
 						free_waldiff_record(WDrec);
 						Assert(entry->key == hash_key);
 					}
 
+					reset_tmp_buff(raw_reader);
 					raw_reader->routine.skip_record(raw_reader, WALRec);
 					break;
 
@@ -438,11 +440,13 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 					else 
 					{
 						entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
-						copy_waldiff_record(entry->data, WDrec);
+						entry->data = NULL;
+						copy_waldiff_record(&(entry->data), WDrec);
 						free_waldiff_record(WDrec);
 						Assert(entry->key == hash_key);
 					}
 
+					reset_tmp_buff(raw_reader);
 					raw_reader->routine.skip_record(raw_reader, WALRec);
 					break;
 
@@ -847,13 +851,13 @@ static void free_waldiff_record(WALDIFFRecord record)
 /*
  * After using this function you can call free_waldiff_record for src,
  * because this function copies all arrays via memcpy
- * dest should be NULL pointer
+ * *dest should be NULL pointer
  */
-static void copy_waldiff_record(WALDIFFRecord dest, WALDIFFRecord src)
+static void copy_waldiff_record(WALDIFFRecord* dest, WALDIFFRecord src)
 {
 	int num_blocks = 0;
 
-	Assert(dest == NULL);
+	Assert(*dest == NULL);
 	Assert(src != NULL);
 
 	if (src->type == XLOG_HEAP_INSERT || src->type == XLOG_HEAP_DELETE)
@@ -863,22 +867,22 @@ static void copy_waldiff_record(WALDIFFRecord dest, WALDIFFRecord src)
 
 	Assert(num_blocks != 0);
 
-	dest = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord + (sizeof(WALDIFFBlock) * num_blocks));
-	memcpy(dest, src, SizeOfWALDIFFRecord);
+	*dest = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord + (sizeof(WALDIFFBlock) * num_blocks));
+	memcpy(*dest, src, SizeOfWALDIFFRecord);
 
-	dest->main_data = (char*) palloc0(sizeof(char) * src->main_data_len);
-	memcpy(dest->main_data, src->main_data, src->main_data_len);
+	(*dest)->main_data = (char*) palloc0(sizeof(char) * src->main_data_len);
+	memcpy((*dest)->main_data, src->main_data, src->main_data_len);
 
 	for (int i = 0; i < num_blocks; i++)
 	{
-		memcpy((void*)&dest->blocks[i], (void*)&src->blocks[i], sizeof(WALDIFFBlock));
+		memcpy((void*)& (*dest)->blocks[i], (void*)&src->blocks[i], sizeof(WALDIFFBlock));
 		
 		if (src->type == XLOG_HEAP_DELETE || 
 			(src->type == XLOG_HEAP_UPDATE && (i > 0) ) )
 			continue;
 
-		dest->blocks[i].block_data = (char*) palloc0(sizeof(char) * src->blocks[i].block_data_len);
-		memcpy(dest->blocks[i].block_data, src->blocks[i].block_data, src->blocks[i].block_data_len);
+		(*dest)->blocks[i].block_data = (char*) palloc0(sizeof(char) * src->blocks[i].block_data_len);
+		memcpy((*dest)->blocks[i].block_data, src->blocks[i].block_data, src->blocks[i].block_data_len);
 	}
 }
 
