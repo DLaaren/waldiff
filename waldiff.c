@@ -60,25 +60,41 @@ static void constructWALDIFFs(void);
 // need to check how postgres deal with not full WAL segment
 static void finishWALDIFFSegment(void);
 
+#define ROTL32(x, y) ((x << y) | (x >> (32 - y)))
+
+static inline uint32_t 
+_hash_combine(uint32_t seed, uint32_t value)
+{
+    return seed ^ (ROTL32(value, 15) + 0x9e3779b9 + (seed << 6) + (seed >> 2));
+}
+
 #define GetHashKeyOfWALDIFFRecord(record) \
-( \
-	(uint32_t)((record)->blocks[0].file_loc.spcOid + \
-			   (record)->blocks[0].file_loc.dbOid + \
-			   (record)->blocks[0].file_loc.relNumber + \
-			   (record)->current_t_ctid.ip_blkid.bi_hi + \
-			   (record)->current_t_ctid.ip_blkid.bi_lo + \
-			   (record)->current_t_ctid.ip_posid) \
-)
+({ \
+    uint32_t key = 0; \
+    key = _hash_combine(key, (record)->blocks[0].file_loc.spcOid); \
+    key = _hash_combine(key, (record)->blocks[0].file_loc.dbOid); \
+    key = _hash_combine(key, (record)->blocks[0].file_loc.relNumber); \
+    key = _hash_combine(key, (record)->current_t_ctid.ip_blkid.bi_hi); \
+    key = _hash_combine(key, (record)->current_t_ctid.ip_blkid.bi_lo); \
+    key = _hash_combine(key, (record)->current_t_ctid.ip_posid); \
+    key = _hash_combine(key, (record)->lsn); \
+    key = _hash_combine(key, (record)->type); \
+    key; \
+})
 
 #define GetHashKeyOfPrevWALDIFFRecord(record) \
-( \
-	(uint32_t)((record)->blocks[0].file_loc.spcOid + \
-			   (record)->blocks[0].file_loc.dbOid + \
-			   (record)->blocks[0].file_loc.relNumber + \
-			   (record)->prev_t_ctid.ip_blkid.bi_hi + \
-			   (record)->prev_t_ctid.ip_blkid.bi_lo + \
-			   (record)->prev_t_ctid.ip_posid) \
-)
+({ \
+    uint32_t key = 0; \
+    key = _hash_combine(key, (record)->blocks[0].file_loc.spcOid); \
+    key = _hash_combine(key, (record)->blocks[0].file_loc.dbOid); \
+    key = _hash_combine(key, (record)->blocks[0].file_loc.relNumber); \
+    key = _hash_combine(key, (record)->prev_t_ctid.ip_blkid.bi_hi); \
+    key = _hash_combine(key, (record)->prev_t_ctid.ip_blkid.bi_lo); \
+    key = _hash_combine(key, (record)->prev_t_ctid.ip_posid); \
+    key = _hash_combine(key, (record)->lsn); \
+    key = _hash_combine(key, (record)->type); \
+    key; \
+})
 
 /*
  * _PG_init
@@ -433,7 +449,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 						/* if prev WDrec is not presented in the HTAB then it's not in WALDIFF segment */
 						entry = (HTABElem *) hash_search(hash_table, (void*) &prev_hash_key, HASH_REMOVE, NULL);
 						free_waldiff_record(entry->data);
-						Assert(entry == NULL);
+						// Assert(entry == NULL);
 					}
 
 					/* insert/update (the prev record) is in another WAL segment */
@@ -1331,7 +1347,6 @@ constructWALDIFFs(void)
 		else 
 			ereport(ERROR, errmsg("WALDIFF cannot contains not XLOG_HEAP types"));
 
-		ereport(LOG, errmsg("Writing to WALDIFF segment"));
 		// TODO здесь мы должны назначить другой  callback для записи (или добавить все таки свой rmgr)
 		// res = WALDIFFWriteRecord(writer, record);
 		if (res == WALDIFFWRITE_FAIL) 

@@ -124,7 +124,6 @@ append_to_buff(WALRawReaderState* raw_reader, uint64 size)
 void 
 reset_buff(WALRawReaderState* raw_reader)
 {
-	memset(raw_reader->buffer, 0, raw_reader->buffer_capacity);
 	raw_reader->buffer_fullness = 0;
 }
 
@@ -173,7 +172,6 @@ append_to_tmp_buff(WALRawReaderState* raw_reader, uint64 size)
 void 
 reset_tmp_buff(WALRawReaderState* raw_reader)
 {
-	memset(raw_reader->tmp_buffer, 0, TMP_BUFFER_CAPACITY);
 	raw_reader->tmp_buffer_fullness = 0;
 }
 
