@@ -1188,12 +1188,9 @@ constructWALDIFFs(void)
 		static XLogRecord *record;
 		if (record == NULL) 
 			record = palloc0(XLogRecordMaxSize);
-		else
-			memset(record, 0, XLogRecordMaxSize);
 
 		if (WDrec->rec_hdr.xl_rmid == RM_HEAP_ID)
 		{
-			uint8 xlog_type = WDrec->rec_hdr.xl_info & XLOG_HEAP_OPMASK;
 			uint32 rec_tot_len = 0;
 
 			// ereport(LOG, errmsg("Got XLOG_HEAP"));
@@ -1202,7 +1199,7 @@ constructWALDIFFs(void)
 			memcpy(record, &(WDrec->rec_hdr), SizeOfXLogRecord);
 			rec_tot_len += SizeOfXLogRecord;
 
-			switch(xlog_type)
+			switch(WDrec->type)
 			{
 				/* 
 				 * Contains XLogRecord + XLogRecordBlockHeader_0 +  
@@ -1222,9 +1219,12 @@ constructWALDIFFs(void)
 					memcpy(record + rec_tot_len, &(block_0.blk_hdr), SizeOfXLogRecordBlockHeader);
 					rec_tot_len += SizeOfXLogRecordBlockHeader;
 
-					/* RelFileLocator */
-					memcpy(record + rec_tot_len, &(block_0.file_loc), sizeof(RelFileLocator));
-					rec_tot_len +=  sizeof(RelFileLocator);
+					if (!(block_0.blk_hdr.fork_flags & BKPBLOCK_SAME_REL))
+					{
+						/* RelFileLocator */
+						memcpy(record + rec_tot_len, &(block_0.file_loc), sizeof(RelFileLocator));
+						rec_tot_len +=  sizeof(RelFileLocator);
+					}
 
 					/* BlockNumber */
 					memcpy(record + rec_tot_len, &(block_0.blknum), sizeof(BlockNumber));
@@ -1265,9 +1265,12 @@ constructWALDIFFs(void)
 					memcpy(record + rec_tot_len, &(block_0.blk_hdr), SizeOfXLogRecordBlockHeader);
 					rec_tot_len += SizeOfXLogRecordBlockHeader;
 
-					/* RelFileLocator 0 */
-					memcpy(record + rec_tot_len, &(block_0.file_loc), sizeof(RelFileLocator));
-					rec_tot_len +=  sizeof(RelFileLocator);
+					if (!(block_0.blk_hdr.fork_flags & BKPBLOCK_SAME_REL))
+					{
+						/* RelFileLocator 0 */
+						memcpy(record + rec_tot_len, &(block_0.file_loc), sizeof(RelFileLocator));
+						rec_tot_len +=  sizeof(RelFileLocator);
+					}
 
 					/* BlockNumber 0 */
 					memcpy(record + rec_tot_len, &(block_0.blknum), sizeof(BlockNumber));
@@ -1305,9 +1308,12 @@ constructWALDIFFs(void)
 					memcpy(record + rec_tot_len, &(block_0.blk_hdr), SizeOfXLogRecordBlockHeader);
 					rec_tot_len += SizeOfXLogRecordBlockHeader;
 
-					/* RelFileLocator */
-					memcpy(record + rec_tot_len, &(block_0.file_loc), sizeof(RelFileLocator));
-					rec_tot_len +=  sizeof(RelFileLocator);
+					if (!(block_0.blk_hdr.fork_flags & BKPBLOCK_SAME_REL))
+					{
+						/* RelFileLocator */
+						memcpy(record + rec_tot_len, &(block_0.file_loc), sizeof(RelFileLocator));
+						rec_tot_len +=  sizeof(RelFileLocator);
+					}
 
 					/* BlockNumber */
 					memcpy(record + rec_tot_len, &(block_0.blknum), sizeof(BlockNumber));
