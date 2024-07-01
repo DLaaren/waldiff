@@ -15,6 +15,11 @@ static WALRawReaderState 	*raw_reader = NULL;
 static XLogReaderState		*reader_state;
 static HTAB 				*hash_table;
 
+/*
+ * We maintain an image of pg_control in shared memory.
+ */
+static ControlFileData *ControlFile = NULL;
+
 typedef struct HTABElem
 {
 	uint32_t 	  key;
@@ -59,6 +64,9 @@ static void constructWALDIFFs(void);
 // do we need this?
 // need to check how postgres deal with not full WAL segment
 static void finishWALDIFFSegment(void);
+
+static void ReadControlFile(void);
+static void WriteControlFile(void);
 
 #define ROTL32(x, y) ((x << y) | (x >> (32 - y)))
 
@@ -229,9 +237,10 @@ bool
 waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WALpath)
 {
 	/* Preparations */
-	static int wal_segment_size = 0;
+	static int 		  wal_segment_size = 0;
 	XLogReaderPrivate reader_private = {0};
-	XLogSegNo segno;
+	XLogSegNo 		  segno;
+	XLogRecPtr	  	  last_checkpoint = InvalidXLogRecPtr;
 
 	ereport(LOG, errmsg("WAL segment is being archived"));
 
@@ -486,7 +495,6 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 					break;
 			}
 		} 
-		
 		else 
 		{
 			WALDIFFRecordWriteResult write_res;
@@ -504,6 +512,9 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 			if (write_res == WALDIFFWRITE_FAIL) 
 				ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
 										WALDIFFWriterGetErrMsg(writer)));
+			
+			if (XLogRecGetRmid(reader_state)== RM_XLOG_ID)
+				last_checkpoint = writer->waldiff_seg.last_processed_record + writer->first_page_addr;
 		}
 	}
 
@@ -517,10 +528,101 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 	/* Questionable */
 	/* End the segment with SWITCH record */
 	finishWALDIFFSegment();
+	
+	ControlFile = (ControlFileData*) palloc0(sizeof(ControlFileData));
+	ereport(LOG, errmsg("write new last checkpoint location : %X/%X", LSN_FORMAT_ARGS(last_checkpoint)));
+
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	ReadControlFile();
+
+    ControlFile->checkPoint = ControlFile->checkPointCopy.redo = last_checkpoint;
+
+	INIT_CRC32C(ControlFile->crc);
+	COMP_CRC32C(ControlFile->crc,
+				(char *) ControlFile,
+				offsetof(ControlFileData, crc));
+	FIN_CRC32C(ControlFile->crc);
+
+    WriteControlFile();
+    LWLockRelease(ControlFileLock);
 
 	ereport(LOG, errmsg("archived WAL file: %s", WALpath));
 
 	return true;
+}
+
+static void 
+ReadControlFile(void)
+{
+	int			fd;
+	int			read_result;
+
+	/*
+	 * Read data...
+	 */
+	fd = BasicOpenFile(XLOG_CONTROL_FILE,
+					   O_RDWR | PG_BINARY);
+	if (fd < 0)
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m",
+						XLOG_CONTROL_FILE)));
+
+	pgstat_report_wait_start(WAIT_EVENT_CONTROL_FILE_READ);
+	read_result = read(fd, ControlFile, sizeof(ControlFileData));
+	if (read_result != sizeof(ControlFileData))
+	{
+		if (read_result < 0)
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not read file \"%s\": %m",
+							XLOG_CONTROL_FILE)));
+		else
+			ereport(PANIC,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("could not read file \"%s\": read %d of %zu",
+							XLOG_CONTROL_FILE, read_result, sizeof(ControlFileData))));
+	}
+	pgstat_report_wait_end();
+
+	close(fd);
+}
+
+static void 
+WriteControlFile(void)
+{
+	int			fd;
+	int			write_result;
+
+	/*
+	 * Read data...
+	 */
+	fd = BasicOpenFile(XLOG_CONTROL_FILE,
+					   O_RDWR | PG_BINARY);
+	if (fd < 0)
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m",
+						XLOG_CONTROL_FILE)));
+
+	pgstat_report_wait_start(WAIT_EVENT_CONTROL_FILE_READ);
+	write_result = write(fd, ControlFile, sizeof(ControlFileData));
+	if (write_result != sizeof(ControlFileData))
+	{
+		if (write_result < 0)
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not write to file \"%s\": %m",
+							XLOG_CONTROL_FILE)));
+		else
+			ereport(PANIC,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("could not write to file \"%s\": write %d of %zu",
+							XLOG_CONTROL_FILE, write_result, sizeof(ControlFileData))));
+	}
+	pgstat_report_wait_end();
+
+	close(fd);
 }
 
 /*
