@@ -929,9 +929,11 @@ overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
 	xl_heap_header* curr_tup_xl_hdr;
 	xl_heap_update* curr_tup_update_hdr 	  = (xl_heap_update*) curr_tup->main_data;
 	char* 			curr_tup_block_data 	  = (char*) curr_tup->blocks[0].block_data;
+	Size 			curr_tup_block_data_len   = curr_tup->blocks[0].block_data_len;
 
 	Size 			prev_tup_bitmap_len 	  = 0;
 	char* 			prev_tup_block_data 	  = (char*) prev_tup->blocks[0].block_data;
+	Size 			prev_tup_block_data_len   = prev_tup->blocks[0].block_data_len;
 	xl_heap_header* prev_tup_xl_hdr;
 
 	Assert(curr_tup->type == XLOG_HEAP_UPDATE);
@@ -1033,7 +1035,7 @@ overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
 			return -1;
 
 		/*
-		 * OK, now we are shure, that we can overlay updates. Now we must
+		 * OK, now we are sure, that we can overlay updates. Now we must
 		 * consider all possible "layouts" of our updates
 		 */
 
@@ -1048,7 +1050,32 @@ overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
 
 			Size left_offset = (curr_tup_prefix_len - prev_tup_prefix_len);
 			memcpy((void*) (prev_tup_block_data + left_offset), curr_tup_block_data, curr_tup_user_data_len);
+			/* prefix's and suffix's values remain the same */
 		}
+
+		else if (prev_tup_suffix_len >= curr_tup_suffix_len &&
+				 prev_tup_prefix_len >= curr_tup_prefix_len)
+		{
+			/*
+			 * Second update completely "overlays" first update :
+			 * 	[###] - first update
+			 * [#####] - second update
+			 */
+
+			prev_tup->blocks[0].block_data_len = curr_tup_user_data_len;
+			prev_tup->blocks[0].block_data = (char *) repalloc(prev_tup->blocks[0].block_data, prev_tup->blocks[0].block_data_len);
+			prev_tup_block_data = prev_tup->blocks[0].block_data;
+
+			memcpy(prev_tup_block_data, curr_tup_block_data, curr_tup_block_data_len);
+
+			/* update prefix's and suffix's values */
+			if (curr_tup_prefix_len > 0)
+				memcpy(prev_tup->blocks[0].block_data, &curr_tup_prefix_len, sizeof(uint16));
+			
+			if (curr_tup_suffix_len > 0)
+				memcpy((void *) (prev_tup->blocks[0].block_data + sizeof(uint16)), &curr_tup_suffix_len, sizeof(uint16));
+		}
+
 		else if (prev_tup_prefix_len == (curr_tup_prefix_len + curr_tup_user_data_len))
 		{
 			/*
@@ -1065,7 +1092,15 @@ overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
 
 			memcpy(prev_tup_block_data, curr_tup_block_data, curr_tup_user_data_len);
 			memcpy((void*) (prev_tup_block_data + curr_tup_user_data_len), prev_tup_user_data_copy, prev_tup_user_data_len);
+
+			/* update prefix's and suffix's values */
+			if (prev_tup_prefix_len > 0)
+				memcpy(prev_tup->blocks[0].block_data, &prev_tup_prefix_len, sizeof(uint16));
+			
+			if (curr_tup_suffix_len > 0)
+				memcpy((void *) (prev_tup->blocks[0].block_data + sizeof(uint16)), &curr_tup_suffix_len, sizeof(uint16));
 		}
+
 		else if (prev_tup_suffix_len == (curr_tup_suffix_len + curr_tup_user_data_len))
 		{
 			/*
@@ -1078,7 +1113,15 @@ overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
 			prev_tup_block_data = prev_tup->blocks[0].block_data;
 
 			memcpy((void*) (prev_tup_block_data + prev_tup_user_data_len), curr_tup_block_data, curr_tup_user_data_len);
+			
+			/* update prefix's and suffix's values */
+			if (curr_tup_prefix_len > 0)
+				memcpy(prev_tup->blocks[0].block_data, &curr_tup_prefix_len, sizeof(uint16));
+			
+			if (prev_tup_suffix_len > 0)
+				memcpy((void *) (prev_tup->blocks[0].block_data + sizeof(uint16)), &prev_tup_suffix_len, sizeof(uint16));
 		}
+
 		else
 		{
 			if (prev_tup_prefix_len > curr_tup_prefix_len)
@@ -1102,7 +1145,15 @@ overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
 
 				memcpy(prev_tup_block_data, curr_tup_block_data, curr_tup_user_data_len);
 				memcpy((void*) (prev_tup_block_data + curr_tup_user_data_len), prev_tup_user_data_copy, unique_part_len);
+			
+				/* update prefix's and suffix's values */
+				if (curr_tup_prefix_len > 0)
+					memcpy(prev_tup->blocks[0].block_data, &curr_tup_prefix_len, sizeof(uint16));
+				
+				if (prev_tup_suffix_len > 0)
+					memcpy((void *) (prev_tup->blocks[0].block_data + sizeof(uint16)), &prev_tup_suffix_len, sizeof(uint16));
 			}
+
 			else
 			{
 				/*
@@ -1122,6 +1173,13 @@ overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
 				prev_tup_block_data = prev_tup->blocks[0].block_data;
 
 				memcpy((void*) (prev_tup_block_data + unique_part_len), curr_tup_block_data, curr_tup_user_data_len);
+			
+				/* update prefix's and suffix's values */
+				if (prev_tup_prefix_len > 0)
+					memcpy(prev_tup->blocks[0].block_data, &prev_tup_prefix_len, sizeof(uint16));
+				
+				if (curr_tup_suffix_len > 0)
+					memcpy((void *) (prev_tup->blocks[0].block_data + sizeof(uint16)), &curr_tup_suffix_len, sizeof(uint16));
 			}
 		}
 	}
