@@ -1560,4 +1560,3 @@ finishWALDIFFSegment(void)
     while (writer->waldiff_seg.segsize - writer->already_written >= SizeOfXLogRecord)
         WALDIFFWriteRecord(writer, (char*) (&noop_rec));
 }
-    
