@@ -224,6 +224,7 @@ waldiff_configured(ArchiveModuleState *reader)
 	return true;
 }
 
+
 /*
  * waldiff_archive
  *
@@ -1289,6 +1290,31 @@ overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
 			}
 		}
 	}
+
+	char *prev_tup_bitmap = (char *) (prev_tup_block_data - prev_tup_bitmap_len);
+    char *curr_tup_bitmap = (char *) (curr_tup_block_data - curr_tup_bitmap_len);
+    char *result_bitmap = (char *) palloc0(sizeof(char) * prev_tup_bitmap_len);
+
+    for (int i = 0; i < prev_tup_bitmap_len; i++)
+    {
+		int result_bit = 0;
+		int bit1       = 0;
+		int bit2       = 0;
+		int bit        = 0;
+
+		for (bit = 0; bit < 8; bit++)
+		{
+			bit1 = (prev_tup_bitmap[i] >> bit) & 1;
+			bit2 = (curr_tup_bitmap[i] >> bit) & 1;
+		}
+
+		if (bit1 == 1 && bit2 == 1)
+			result_bitmap[i] |= (1 << bit);
+      	else
+			result_bitmap[i] &= ~(1 << bit);
+    }
+
+    memcpy(prev_tup_bitmap, result_bitmap, prev_tup_bitmap_len);
 
 	return 0;
 }
