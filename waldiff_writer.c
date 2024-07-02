@@ -230,8 +230,6 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 						return WALDIFFWRITE_EOF;
 				}
 
-				XLogDisplayRecord(writer, record_hdr);
-
 				return WALDIFFWRITE_SUCCESS;
 			}
 		}
@@ -253,8 +251,8 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 		 * Creating checksum (we possibly change xl_prev, so checksum also must be changed)
 		 */
 		INIT_CRC32C(crc);
-		COMP_CRC32C(crc, (char*) (record_hdr + SizeOfXLogRecord), record_hdr->xl_tot_len - SizeOfXLogRecord);
-		COMP_CRC32C(crc, record_hdr, offsetof(XLogRecord, xl_crc));
+		COMP_CRC32C(crc, ((char*) record_hdr) + SizeOfXLogRecord, record_hdr->xl_tot_len - SizeOfXLogRecord);
+		COMP_CRC32C(crc, (char*) record_hdr, offsetof(XLogRecord, xl_crc));
 		FIN_CRC32C(crc);
 		record_hdr->xl_crc = crc;
 
@@ -289,8 +287,6 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 				if (nbytes == 0)
 					return WALDIFFWRITE_EOF;
 			}
-
-			XLogDisplayRecord(writer, record_hdr);
 
 			return WALDIFFWRITE_SUCCESS;
 		}

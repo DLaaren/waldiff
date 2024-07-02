@@ -512,10 +512,13 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 			if (write_res == WALDIFFWRITE_FAIL) 
 				ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
 										WALDIFFWriterGetErrMsg(writer)));
-
-			if (XLogRecGetInfo(reader_state) == XLOG_CHECKPOINT_SHUTDOWN ||
-          		XLogRecGetInfo(reader_state) == XLOG_CHECKPOINT_ONLINE)
-            	last_checkpoint = writer->waldiff_seg.last_processed_record + writer->first_page_addr;
+			
+			if (XLogRecGetRmid(reader_state)== RM_XLOG_ID)
+			{
+				if (XLogRecGetInfo(reader_state) == XLOG_CHECKPOINT_SHUTDOWN ||
+					XLogRecGetInfo(reader_state) == XLOG_CHECKPOINT_ONLINE)
+						last_checkpoint = writer->waldiff_seg.last_processed_record + writer->first_page_addr;
+			}
 		}
 	}
 
@@ -525,6 +528,10 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 	constructWALDIFFs();
 
 	ereport(LOG, errmsg("finishing WALDIFF segment"));
+	
+	/* Questionable */
+	/* End the segment with SWITCH record */
+	finishWALDIFFSegment();
 	
 	ControlFile = (ControlFileData*) palloc0(sizeof(ControlFileData));
 	ereport(LOG, errmsg("write new last checkpoint location : %X/%X", LSN_FORMAT_ARGS(last_checkpoint)));
@@ -544,13 +551,6 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
     LWLockRelease(ControlFileLock);
 
 	ereport(LOG, errmsg("archived WAL file: %s", WALpath));
-
-	ereport(LOG, errmsg("last record location before noops : %X/%X", LSN_FORMAT_ARGS(writer->waldiff_seg.last_processed_record + writer->first_page_addr)));
-
-	/* Questionable */
-	finishWALDIFFSegment();
-
-	ereport(LOG, errmsg("last record location noops: %X/%X", LSN_FORMAT_ARGS(writer->waldiff_seg.last_processed_record + writer->first_page_addr)));
 
 	return true;
 }
@@ -1290,31 +1290,6 @@ overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
 		}
 	}
 
-    char *prev_tup_bitmap = (char *) (prev_tup_block_data - prev_tup_bitmap_len);
-    char *curr_tup_bitmap = (char *) (curr_tup_block_data - curr_tup_bitmap_len);
-    char *result_bitmap = (char *) palloc0(sizeof(char) * prev_tup_bitmap_len);
-
-    for (int i = 0; i < prev_tup_bitmap_len; i++)
-    {
-		int result_bit = 0;
-		int bit1       = 0;
-		int bit2       = 0;
-		int bit        = 0;
-
-		for (bit = 0; bit < 8; bit++)
-		{
-			bit1 = (prev_tup_bitmap[i] >> bit) & 1;
-			bit2 = (curr_tup_bitmap[i] >> bit) & 1;
-		}
-
-		if (bit1 == 1 && bit2 == 1)
-			result_bitmap[i] |= (1 << bit);
-      	else
-			result_bitmap[i] &= ~(1 << bit);
-    }
-
-    memcpy(prev_tup_bitmap, result_bitmap, prev_tup_bitmap_len);
-
 	return 0;
 }
 
@@ -1553,12 +1528,10 @@ void
 finishWALDIFFSegment(void)
 {
 	XLogRecord noop_rec = {0};
-
-	noop_rec.xl_tot_len = SizeOfXLogRecord;
+    noop_rec.xl_tot_len = SizeOfXLogRecord;    
 	noop_rec.xl_info = XLOG_NOOP;
-	noop_rec.xl_rmid = RM_XLOG_ID;
-
-	while (writer->waldiff_seg.segsize - writer->already_written 
-		   >= SizeOfXLogRecord)
-		WALDIFFWriteRecord(writer,(char *) (&noop_rec));
+    noop_rec.xl_rmid = RM_XLOG_ID;
+    while (writer->waldiff_seg.segsize - writer->already_written >= SizeOfXLogRecord)
+        WALDIFFWriteRecord(writer, (char*) (&noop_rec));
 }
+    
