@@ -42,6 +42,7 @@
 
 
 #define MAX_ERRORMSG_LEN 1024
+#define MAX_COLUMNS_NUM  1600 /* maximum number of columns in postgresql table */
 
 /* Structure with old and new contexts */
 typedef struct MemoryContextStorage

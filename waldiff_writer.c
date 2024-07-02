@@ -1,6 +1,30 @@
 #include "waldiff_writer.h"
 #include "wal_raw_reader.h"
 
+// pring record to stdout
+static void
+XLogDisplayRecord(WALDIFFWriterState *writer, XLogRecord *record)
+{
+	const char *id;
+	const RmgrData desc = GetRmgr(record->xl_rmid);
+	uint32		rec_len = record->xl_tot_len;
+	uint8		info = record->xl_info;
+	XLogRecPtr	xl_prev = record->xl_prev;
+
+	ereport(LOG, errmsg("rmgr: %-11s \nlen_tot: %6u, \ntx: %10u, \nprev %X/%08X, \nlsn %X/%08X",
+		   desc.rm_name,
+		   rec_len,
+		   record->xl_xid,
+		   LSN_FORMAT_ARGS(xl_prev),
+		   LSN_FORMAT_ARGS(writer->waldiff_seg.last_processed_record)));
+
+	id = desc.rm_identify(info);
+	if (id == NULL)
+		ereport(LOG, errmsg("desc: UNKNOWN (%x) ", info & ~XLR_INFO_MASK));
+	else
+		ereport(LOG, errmsg("desc: %s \n\n", id));
+}
+
 WALDIFFWriterState *
 WALDIFFWriterAllocate(int wal_segment_size,
 					  char *waldiff_dir,
@@ -206,6 +230,8 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 						return WALDIFFWRITE_EOF;
 				}
 
+				XLogDisplayRecord(writer, record_hdr);
+
 				return WALDIFFWRITE_SUCCESS;
 			}
 		}
@@ -263,6 +289,9 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 				if (nbytes == 0)
 					return WALDIFFWRITE_EOF;
 			}
+
+			XLogDisplayRecord(writer, record_hdr);
+
 			return WALDIFFWRITE_SUCCESS;
 		}
 	}
