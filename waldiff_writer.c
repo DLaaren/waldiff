@@ -48,6 +48,7 @@ WALDIFFWriterAllocate(int wal_segment_size,
 	writer->waldiff_seg.last_processed_record = InvalidXLogRecPtr;
 
 	writer->waldiff_seg.segsize= wal_segment_size;
+	writer->waldiff_seg.last_checkpoint = InvalidXLogRecPtr;
 
 	if (waldiff_dir)
 	{
@@ -244,6 +245,20 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 
 
 		writer->waldiff_seg.last_processed_record = writer->already_written;
+
+		if (record_hdr->xl_rmid == RM_XLOG_ID)
+		{
+			if (record_hdr->xl_info == XLOG_CHECKPOINT_SHUTDOWN ||
+			   record_hdr->xl_info == XLOG_CHECKPOINT_ONLINE)
+			{
+				// CheckPoint* checkpoint_record = (CheckPoint*) (record + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderShort);
+
+				writer->waldiff_seg.last_checkpoint = writer->waldiff_seg.last_processed_record + writer->first_page_addr;
+				memcpy(record + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderShort, (void*)& writer->waldiff_seg.last_checkpoint, sizeof(XLogRecPtr));
+
+				ereport(LOG, errmsg("NEW LAST CHECKPOINT : %X/%X", LSN_FORMAT_ARGS(writer->waldiff_seg.last_checkpoint)));
+			}
+		}
 
 		memset(((char*) record_hdr) + 18, 0, 2); /* padding in struct must be set to zero */
 

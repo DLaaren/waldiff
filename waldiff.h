@@ -66,6 +66,7 @@ typedef struct WALSegment
 	 * Address of last read (if it wal segment) or written (if it waldiff segment) record
 	 */
 	XLogRecPtr last_processed_record;
+	XLogRecPtr last_checkpoint;
 } WALSegment;
 
 /* Structure representing XLogRecord block data */
