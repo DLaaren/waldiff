@@ -64,7 +64,7 @@ static int getWALsegsize(const char *WALpath);
 static void constructWALDIFFs(WALDIFFWriterState* writer);
 // do we need this?
 // need to check how postgres deal with not full WAL segment
-static void finishWALDIFFSegment(void);
+static void finishWALDIFFSegment(WALDIFFWriterState* writer, char* switch_record);
 
 static void ReadControlFile(void);
 static void WriteControlFile(void);
@@ -243,6 +243,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 	XLogReaderPrivate reader_private = {0};
 	XLogSegNo 		  segno;
 	XLogRecPtr	  	  last_checkpoint = InvalidXLogRecPtr;
+	char*			  switch_record = NULL; /* we will store SWITCH record and write it in the end */
 
 	ereport(LOG, errmsg("WAL segment is being archived"));
 
@@ -509,6 +510,22 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 			if (read_res == WALREAD_FAIL)
 				ereport(ERROR, errmsg("error during reading raw record from WAL segment: %s", 
 										WALDIFFWriterGetErrMsg(writer)));
+
+			/*
+			 * Save SWITCH record. We will write it after all records from hashmap
+			 */
+			if (XLogRecGetRmid(reader_state) == RM_XLOG_ID &&
+				XLogRecGetInfo(reader_state) == XLOG_SWITCH)
+			{
+				if (switch_record != NULL)
+					ereport(ERROR, errmsg("meet second SWITCH record in wal segment"));
+				
+				ereport(LOG, errmsg("meet SWITCH record at position %X/%X", LSN_FORMAT_ARGS(raw_reader->wal_seg.last_processed_record)));
+
+				switch_record = (char*) palloc0(SizeOfXLogRecord);
+				memcpy(switch_record, WALRawReaderGetLastRecordRead(raw_reader), SizeOfXLogRecord);
+				continue;
+			}
 			
 			write_res = writer->routine.write_record(writer, WALRawReaderGetLastRecordRead(raw_reader));
 			if (write_res == WALDIFFWRITE_FAIL) 
@@ -533,7 +550,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 	
 	/* Questionable */
 	/* End the segment with SWITCH record */
-	finishWALDIFFSegment();
+	finishWALDIFFSegment(writer, switch_record);
 	
 	ControlFile = (ControlFileData*) palloc0(sizeof(ControlFileData));
 	ereport(LOG, errmsg("write new last checkpoint location : %X/%X", LSN_FORMAT_ARGS(last_checkpoint)));
@@ -1567,16 +1584,26 @@ constructWALDIFFs(WALDIFFWriterState* writer)
 	}
 }
 
+/*
+ * If we met SWITCH record before, we must store it in the end of waldiff file
+ */
 void 
-finishWALDIFFSegment(void)
+finishWALDIFFSegment(WALDIFFWriterState* writer, char* switch_record)
 {
 	XLogRecord noop_rec = {0};
-    noop_rec.xl_tot_len = SizeOfXLogRecord;    
+    noop_rec.xl_tot_len = SizeOfXLogRecord;
 	noop_rec.xl_info = XLOG_NOOP;
     noop_rec.xl_rmid = RM_XLOG_ID;
+
     while (writer->waldiff_seg.segsize - writer->already_written >= SizeOfXLogRecord)
 	{
-		// ereport(DEBUG1, errmsg("writer->waldiff_seg.segsize: %lu\nalready_written: %lu\n diff: %lu", writer->waldiff_seg.segsize, writer->already_written, writer->waldiff_seg.segsize - writer->already_written));
-        writer->routine.write_record(writer, (char*) (&noop_rec));
+		if (writer->waldiff_seg.segsize - writer->already_written < (SizeOfXLogRecord * 2) &&
+			switch_record != NULL)
+		{
+			ereport(LOG, errmsg("write SWITCH record at position : %X/%X",  LSN_FORMAT_ARGS(writer->already_written)));
+			writer->routine.write_record(writer, switch_record);
+		}
+		else
+			writer->routine.write_record(writer, (char*) &noop_rec);
 	}
 }
