@@ -50,8 +50,8 @@ void
 WALRawReaderFree(WALRawReaderState *reader)
 {
 	if (reader->buffer_fullness > 0)
-		ereport(LOG, errmsg("WALRawReader still has some data in buffer. Remain data length : %ld", reader->buffer_fullness));
-	
+		ereport(WARNING, errmsg("WALRawReader still has some data in buffer. Remain data length : %ld", reader->buffer_fullness));
+
 	if (reader->wal_seg.fd != -1)
 		reader->routine.segment_close(&(reader->wal_seg));
 
@@ -91,8 +91,8 @@ append_to_buff(WALRawReaderState* raw_reader, uint64 size)
 	if (size > WALRawReaderGetRestBufferCapacity(raw_reader))
 	{
 		ereport(ERROR, 
-				errmsg("cannot read %ld bytes from WAL file to buffer with rest capacity %ld", 
-						size, WALRawReaderGetRestBufferCapacity(raw_reader)));
+				errmsg("append_to_buf():\ncannot read %lu bytes from WAL file to buffer with rest capacity %lu\nbuffer_capacity: %lu\nbuffer_fullness: %lu", 
+						size, WALRawReaderGetRestBufferCapacity(raw_reader), raw_reader->buffer_capacity, raw_reader->buffer_fullness));
 		return -1;
 	}
 
@@ -105,7 +105,7 @@ append_to_buff(WALRawReaderState* raw_reader, uint64 size)
 			(errcode_for_file_access(),
 			errmsg("could not read WAL file : %m")));
 	if (nbytes == 0)
-		ereport(WARNING,
+		ereport(DEBUG1,
 			(errcode_for_file_access(),
 			errmsg("file descriptor closed for read \"%d\": %m", raw_reader->wal_seg.fd)));
 	
@@ -139,7 +139,7 @@ append_to_tmp_buff(WALRawReaderState* raw_reader, uint64 size)
 	if (size > WALRawReaderGetRestTmpBufferCapacity(raw_reader))
 	{
 		ereport(ERROR, 
-				errmsg("cannot read %ld bytes from file to tmp buffer with rest capacity %ld", 
+				errmsg("append_to_tmp_buff():\ncannot read %lu bytes from file to tmp buffer with rest capacity %lu", 
 						size, WALRawReaderGetRestTmpBufferCapacity(raw_reader)));
 		return -1;
 	}
@@ -153,7 +153,7 @@ append_to_tmp_buff(WALRawReaderState* raw_reader, uint64 size)
 			(errcode_for_file_access(),
 			errmsg("could not read WAL file : %m")));
 	if (nbytes == 0)
-		ereport(WARNING,
+		ereport(DEBUG1,
 			(errcode_for_file_access(),
 			errmsg("file descriptor closed for read \"%d\": %m", raw_reader->wal_seg.fd)));
 
@@ -391,13 +391,21 @@ WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 			record = (XLogRecord*) raw_reader->tmp_buffer;
 			raw_reader->wal_seg.last_processed_record = raw_reader->already_read;
 
+			Assert(record->xl_tot_len >= 0);
+
+			if (record->xl_tot_len == 0)
+			{
+				ereport(DEBUG1, errmsg("WALReadRawRecord(): read record with xl_tot_len = 0"));
+				return WALREAD_EOF;
+			}
+
 			/*
 			 * avoid OOM
 			 */
 			if (SizeOfXLogRecord > WALRawReaderGetRestBufferCapacity(raw_reader))
 			{
 				ereport(WARNING, 
-						errmsg("cannot write xlog header to buffer with rest capacity %ld", 
+						errmsg("WALReadRawRecord():\ncannot write xlog header to buffer with rest capacity %ld", 
 								WALRawReaderGetRestBufferCapacity(raw_reader)));
 				return WALREAD_FAIL;
 			}
@@ -412,10 +420,14 @@ WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 			 * Record may not fit on the rest of the current page
 			 */
 			if (! XlogRecFitsOnPage(raw_reader->already_read, record->xl_tot_len - SizeOfXLogRecord))
+			{
 				data_len = BLCKSZ * (1 + (raw_reader->already_read) / BLCKSZ) - raw_reader->already_read; /* rest of current page */
+			}
 			else
+			{
 				data_len = record->xl_tot_len - SizeOfXLogRecord;
-			
+			}
+
 			nbytes = append_to_buff(raw_reader, data_len);
 			if (nbytes == 0)
 				return WALREAD_EOF;

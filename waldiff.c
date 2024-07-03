@@ -1413,7 +1413,8 @@ constructWALDIFFs(WALDIFFWriterState* writer)
 			switch(WDrec->type)
 			{
 				/* 
-				 * Contains XLogRecord + XLogRecordBlockHeader_0 +  
+				 * Contains XLogRecord + XLogRecordDataHeader[Short|Long] +
+				 * XLogRecordBlockHeader_0 +  
 				 * RelFileLocator_0 + BlockNumber_0 + 
 				 * block_data_0(xl_heap_header + tuple data) + main_data(xl_heap_insert)
 				 */
@@ -1450,8 +1451,9 @@ constructWALDIFFs(WALDIFFWriterState* writer)
 				}
 				
 				/* 
-				 * Contains XLogRecord + XLogRecordBlockHeader_0 + 
-				 * RelFileLocator_0 + BlockNumber_0 + block_data_0 
+				 * Contains XLogRecord + XLogRecordDataHeader[Short|Long] +
+				 * XLogRecordBlockHeader_0 +  RelFileLocator_0 + 
+				 * BlockNumber_0 + block_data_0 
 				 * ((If XLH_UPDATE_PREFIX_FROM_OLD or XLH_UPDATE_SUFFIX_FROM_OLD flags are set)
  				 * prefix + suffix + xl_heap_header + tuple data) +
 				 * XLogRecordBlockHeader_1 + BlockNumber_1 +
@@ -1512,8 +1514,9 @@ constructWALDIFFs(WALDIFFWriterState* writer)
 				}
 
 				/* 
-				 * Contains XLogRecord + XLogRecordBlockHeader_0 + 
-				 * RelFileLocator_0 + BlockNumber_0 + main_data(xl_heap_delete)
+				 * Contains XLogRecord + XLogRecordDataHeader[Short|Long] +
+				 * XLogRecordBlockHeader_0 + RelFileLocator_0 + 
+				 * BlockNumber_0 + main_data(xl_heap_delete)
 				 */
 				case XLOG_HEAP_DELETE:
 				{
@@ -1572,5 +1575,8 @@ finishWALDIFFSegment(void)
 	noop_rec.xl_info = XLOG_NOOP;
     noop_rec.xl_rmid = RM_XLOG_ID;
     while (writer->waldiff_seg.segsize - writer->already_written >= SizeOfXLogRecord)
-        WALDIFFWriteRecord(writer, (char*) (&noop_rec));
+	{
+		// ereport(DEBUG1, errmsg("writer->waldiff_seg.segsize: %lu\nalready_written: %lu\n diff: %lu", writer->waldiff_seg.segsize, writer->already_written, writer->waldiff_seg.segsize - writer->already_written));
+        writer->routine.write_record(writer, (char*) (&noop_rec));
+	}
 }
