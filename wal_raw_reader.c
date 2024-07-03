@@ -346,7 +346,7 @@ WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 					data_len = hdr->xlp_rem_len;
 				
 				nbytes = append_to_buff(raw_reader, data_len);
-				if (nbytes == 0)
+				if (nbytes == 0 && data_len > 0)
 					return WALREAD_EOF;
 
 				if (data_len == hdr->xlp_rem_len) /* if record remains fit on the current page */
@@ -373,7 +373,7 @@ WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 			 * Read as much as we can. Remaining part of record will be read in next iterations
 			 */
 			nbytes = append_to_buff(raw_reader, data_len);
-			if (nbytes == 0)
+			if (nbytes == 0 && data_len > 0)
 				return WALREAD_EOF;
 			
 			continue;
@@ -417,7 +417,7 @@ WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 				data_len = record->xl_tot_len - SizeOfXLogRecord;
 			
 			nbytes = append_to_buff(raw_reader, data_len);
-			if (nbytes == 0)
+			if (nbytes == 0 && data_len > 0)
 				return WALREAD_EOF;
 			
 			if (data_len == (record->xl_tot_len - SizeOfXLogRecord)) /* If record fit on the current page */

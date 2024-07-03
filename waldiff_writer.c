@@ -211,7 +211,11 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 			if (! XlogRecFitsOnPage(writer->already_written, rem_data_len))
 			{
 				uint64 data_len = BLCKSZ * (1 + (writer->already_written / BLCKSZ)) - writer->already_written; /* rest of current page */
+
 				nbytes = write_data_to_file(writer, record_copy, data_len);
+				if (nbytes == 0 && data_len > 0)
+					return WALDIFFWRITE_EOF;
+
 				rem_data_len = rem_data_len - data_len;
 				record_copy += data_len; /* we don't need this part of record anymore */
 
@@ -220,6 +224,8 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 			else
 			{
 				nbytes = write_data_to_file(writer, record_copy, rem_data_len);
+				if (nbytes == 0 && rem_data_len > 0)
+					return WALDIFFWRITE_EOF;
 
 				/*
 				 * Records are maxaligned, so we must write all padding too
@@ -281,7 +287,7 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 			rem_data_len = record_hdr->xl_tot_len - data_len;
 
 			nbytes = write_data_to_file(writer, record_copy, data_len); /* write to file as much as we can */
-			if (nbytes == 0)
+			if (nbytes == 0 && data_len > 0)
 				return WALDIFFWRITE_EOF;
 			
 			record_copy += data_len;
