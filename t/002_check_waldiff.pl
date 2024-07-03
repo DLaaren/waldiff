@@ -26,7 +26,7 @@ $node->append_conf(
         archive_library = 'waldiff'
         waldiff.waldiff_dir = 'waldiff'
         max_wal_senders = 2
-        log_min_messages = 'DEBUG1'
+        log_min_messages = 'LOG'
     }
 );
 
@@ -34,13 +34,14 @@ $node->append_conf(
 $node->start();
 
 $node->safe_psql('postgres', 'create table test(num int)');
-$node->safe_psql('postgres', 'insert into test values(12345)');
-$node->safe_psql('postgres', 'insert into test values(123456)');
+$node->safe_psql('postgres', 'insert into test(num) values(12345)');
+$node->safe_psql('postgres', 'update test set num = 12445 where num = 12345');
+$node->safe_psql('postgres', 'delete from test where num = 12445');
+$node->safe_psql('postgres', 'insert into test(num) values(33333)');
 
 my $table_oid= $node->safe_psql('postgres', 'SELECT oid FROM pg_class WHERE relname = \'test\' AND relkind = \'r\';');
 
-diag("table oid :");
-diag($table_oid);
+diag("\ntable oid: $table_oid");
 
 # sleep(3600);
 
@@ -66,12 +67,12 @@ sleep(5);
 
 my $stdout1= $node->safe_psql('postgres', 'select * from test');
 
-diag("stdout");
-diag($stdout1);
+diag("stdout: $stdout1");
 
-ok($stdout1 == 12345, 'copy was successful');
+ok($stdout1 == 33333, 'copy was successful');
 
 # Stop the server
 $node->stop('immediate');
 
+sleep(3024032);
 done_testing();

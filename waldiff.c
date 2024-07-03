@@ -1417,8 +1417,6 @@ constructWALDIFFs(WALDIFFWriterState* writer)
 	{
 		WALDIFFRecord WDrec = entry->data;
 
-		// ereport(LOG, errmsg("SOME RECORD PARAMS: TOT LEN = %d, PREV LSN = %X/%X", WDrec->rec_hdr.xl_tot_len, LSN_FORMAT_ARGS(WDrec->rec_hdr.xl_prev)));
-
 		if (WDrec->rec_hdr.xl_rmid == RM_HEAP_ID)
 		{
 			uint32 rec_tot_len = 0;
@@ -1441,6 +1439,8 @@ constructWALDIFFs(WALDIFFWriterState* writer)
 
 					Assert(WDrec->max_block_id >= 0);
 					block_0 = WDrec->blocks[0];
+
+					Assert(WDrec->blocks[0].blk_hdr.id == 0);
 
 					/* XLogRecordBlockHeader */
 					memcpy(record + rec_tot_len, &(block_0.blk_hdr), SizeOfXLogRecordBlockHeader);
@@ -1546,9 +1546,6 @@ constructWALDIFFs(WALDIFFWriterState* writer)
 					memcpy(record + rec_tot_len, &(block_0.blk_hdr), SizeOfXLogRecordBlockHeader);
 					rec_tot_len += SizeOfXLogRecordBlockHeader;
 
-					/* XLogRecordDataHeader[Short|Long] */
-					write_main_data_hdr(record, WDrec->main_data_len, &rec_tot_len);
-
 					if (!(block_0.blk_hdr.fork_flags & BKPBLOCK_SAME_REL))
 					{
 						/* RelFileLocator */
@@ -1559,6 +1556,9 @@ constructWALDIFFs(WALDIFFWriterState* writer)
 					/* BlockNumber */
 					memcpy(record + rec_tot_len, &(block_0.blknum), sizeof(BlockNumber));
 					rec_tot_len += sizeof(BlockNumber);
+
+					/* XLogRecordDataHeader[Short|Long] */
+					write_main_data_hdr(record, WDrec->main_data_len, &rec_tot_len);
 
 					break;
 				}
@@ -1572,7 +1572,7 @@ constructWALDIFFs(WALDIFFWriterState* writer)
 			rec_tot_len += WDrec->main_data_len;
 
 			Assert(WDrec->rec_hdr.xl_tot_len == rec_tot_len);
-			
+						
 			write_res = writer->routine.write_record(writer, record);
 
 			if (write_res == WALDIFFWRITE_FAIL) 
