@@ -26,6 +26,7 @@ $node->append_conf(
         archive_library = 'waldiff'
         waldiff.waldiff_dir = 'waldiff'
         max_wal_senders = 2
+        log_min_messages = 'LOG'
     }
 );
 

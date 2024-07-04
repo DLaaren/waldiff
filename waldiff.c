@@ -1466,10 +1466,6 @@ constructWALDIFF(WALDIFFRecord *WDrec)
 	{
 		WALDIFFRecord WDrec = entry->data;
 
-		// ereport(WARNING, errmsg("DELETE: offnum = %u", ((xl_heap_delete *)(WDrec->main_data))->offnum));
-
-		// ereport(LOG, errmsg("SOME RECORD PARAMS: TOT LEN = %d, PREV LSN = %X/%X", WDrec->rec_hdr.xl_tot_len, LSN_FORMAT_ARGS(WDrec->rec_hdr.xl_prev)));
-
 		if (WDrec->rec_hdr.xl_rmid == RM_HEAP_ID)
 		{
 			uint32 rec_tot_len = 0;
@@ -1493,6 +1489,8 @@ constructWALDIFF(WALDIFFRecord *WDrec)
 
 					Assert(WDrec->max_block_id == 0);
 					block_0 = WDrec->blocks[0];
+
+					Assert(WDrec->blocks[0].blk_hdr.id == 0);
 
 					/* XLogRecordBlockHeader */
 					memcpy(record + rec_tot_len, &(block_0.blk_hdr), SizeOfXLogRecordBlockHeader);
@@ -1626,7 +1624,7 @@ constructWALDIFF(WALDIFFRecord *WDrec)
 			rec_tot_len += WDrec->main_data_len;
 
 			Assert(WDrec->rec_hdr.xl_tot_len == rec_tot_len);
-			
+						
 			write_res = writer->routine.write_record(writer, record);
 
 			if (write_res == WALDIFFWRITE_FAIL) 

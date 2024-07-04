@@ -14,6 +14,29 @@
 
 typedef struct WALRawReaderState WALRawReaderState;
 
+typedef struct NeedlessLsnList {
+	char* list;
+	size_t ptr; /* pointer (sequence number) to first record in list, that was not accessed */
+
+	size_t capacity;
+	size_t fullness;
+} NeedlessLsnList;
+
+extern NeedlessLsnList* NeedlessLsnListAllocate(size_t list_capacity);
+
+extern void NeedlessLsnListPush(NeedlessLsnList* needless_lsn_list, XLogRecPtr new_elem);
+
+extern void NeedlessLsnListIncrease(NeedlessLsnList* needless_lsn_list);
+
+/*
+ * Checks whether given element is presented in list
+ */
+extern bool NeedlessLsnListFind(NeedlessLsnList* needless_lsn_list, XLogRecPtr elem);
+
+extern void NeedlessLsnListFree(NeedlessLsnList* needless_lsn_list);
+
+#define NeedlessLsnListGetRestListCapacity(list) ((list)->capacity - (list)->fullness)
+
 /* Return values from WALRecordReadCB. */
 typedef enum WALRawRecordReadResult
 {
@@ -70,6 +93,11 @@ struct WALRawReaderState
 	 */
     WALRawReaderRoutine routine;
 
+	/*
+	 * LSNs, that we should skip during second passing through WAL
+	 */
+	NeedlessLsnList		needless_lsn;
+
     /*
      * Segment context
      */
@@ -113,6 +141,7 @@ struct WALRawReaderState
 #define WALRawReaderGetRestTmpBufferCapacity(reader) (TMP_BUFFER_CAPACITY - (reader)->tmp_buffer_fullness)
 #define WALRawReaderGetErrMsg(reader) ((reader)->errormsg_buf)
 #define WALRawReaderGetLastRecordRead(reader) ((reader)->buffer)
+#define WALRawReaderGetNextRecord(reader) ((reader)->already_read + (reader)->first_page_addr)
 
 /*
  * Whether XLogRecord fits on the page with given offset from start of 
