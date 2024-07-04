@@ -89,8 +89,6 @@ _hash_combine(uint32_t seed, uint32_t value)
     key = _hash_combine(key, (record)->current_t_ctid.ip_blkid.bi_hi); \
     key = _hash_combine(key, (record)->current_t_ctid.ip_blkid.bi_lo); \
     key = _hash_combine(key, (record)->current_t_ctid.ip_posid); \
-    key = _hash_combine(key, (record)->lsn); \
-    key = _hash_combine(key, (record)->type); \
     key; \
 })
 
@@ -103,8 +101,6 @@ _hash_combine(uint32_t seed, uint32_t value)
     key = _hash_combine(key, (record)->prev_t_ctid.ip_blkid.bi_hi); \
     key = _hash_combine(key, (record)->prev_t_ctid.ip_blkid.bi_lo); \
     key = _hash_combine(key, (record)->prev_t_ctid.ip_posid); \
-    key = _hash_combine(key, (record)->lsn); \
-    key = _hash_combine(key, (record)->type); \
     key; \
 })
 
@@ -439,12 +435,14 @@ first_passage(int wal_segment_size, XLogReaderPrivate *reader_private)
 					{
 						entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
 						free_waldiff_record(entry->data);
+						entry->data = NULL;
 					}
 
 					entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
 					entry->data = NULL;
 					copy_waldiff_record(&(entry->data), WDrec);
 					free_waldiff_record(WDrec);
+
 					Assert(entry->key == hash_key);
 					break;
 
@@ -481,6 +479,7 @@ first_passage(int wal_segment_size, XLogReaderPrivate *reader_private)
 						{
 							WALDIFFRecord tmp = entry->data;
 							entry = (HTABElem *) hash_search(hash_table, (void*) &prev_hash_key, HASH_REMOVE, NULL);
+							entry->data = NULL;
 							entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
 
 							/*
@@ -522,6 +521,7 @@ first_passage(int wal_segment_size, XLogReaderPrivate *reader_private)
 						/* if prev WDrec is presented in the HTAB it is deleted by this delete record */
 						entry = (HTABElem *) hash_search(hash_table, (void*) &prev_hash_key, HASH_REMOVE, NULL);
 						free_waldiff_record(entry->data);
+						entry->data = NULL;
 					}
 
 					/* insert/update (the prev record) is in another WAL segment */
@@ -577,18 +577,20 @@ find_hash_key_from_raw_record(XLogRecord *WALrec)
 		}
 		else 
 		{
-			XLogRecordBlockHeader *blk;
+			XLogRecordBlockHeader *blk_hdr;
 			Assert(block_id <= XLR_MAX_BLOCK_ID);
 
-			blk = (XLogRecordBlockHeader *)curr_ptr;
+			blk_hdr = (XLogRecordBlockHeader *)curr_ptr;
+			ereport(LOG, errmsg("BLOCK ID : %u TYPE = %u DATA LEN = %u FLAGS = %u", block_id, WDrec->type, blk_hdr->data_length, blk_hdr->fork_flags));
 
 			/* otherwise no hash key */
-			Assert(! (blk->fork_flags & BKPBLOCK_SAME_REL));
-			if (! (blk->fork_flags & BKPBLOCK_SAME_REL))
+			Assert(! (blk_hdr->fork_flags & BKPBLOCK_SAME_REL));
+
+			if (! (blk_hdr->fork_flags & BKPBLOCK_SAME_REL))
 				curr_ptr += sizeof(RelFileLocator);
 
 			curr_ptr += (SizeOfXLogRecordBlockHeader + sizeof(BlockNumber));
-			block_data_len_sum += blk->data_length;
+			block_data_len_sum += blk_hdr->data_length;
 		}
 	}
 
@@ -675,7 +677,10 @@ second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
 		/* Now we reckon that hash_table contains only HEAP records (INSERT, UPDATE, DELETE)
 		   without image */
 		/* firstly check in hash map*/
-		if (WALrec->xl_rmid == RM_HEAP_ID)
+		if (WALrec->xl_rmid == RM_HEAP_ID &&
+		   ( (WALrec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_INSERT || 
+			 (WALrec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_UPDATE ||
+			 (WALrec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_DELETE))
 		{
 			HTABElem *entry;
 			/* Get necessary data for hash_key from raw record */
@@ -717,12 +722,18 @@ second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
 				* what means that it is already a part of a WALDIFF,
 				* then just skip this record */
 			}
+
+			continue;
 		}
 
-		if (read_res == WALREAD_EOF) /* if we just read last record in WAL segment */
-			break;
+		write_res = writer->routine.write_record(writer, WALRawReaderGetLastRecordRead(raw_reader));
+		if (write_res == WALDIFFWRITE_FAIL) 
+			ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
+									WALDIFFWriterGetErrMsg(writer)));
 
-	} /* Main reading & writing */
+		else if (read_res == WALREAD_EOF) /* if we just read last record in WAL segment */
+			break;
+	}
 }
 
 static void 

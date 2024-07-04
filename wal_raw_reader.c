@@ -41,7 +41,7 @@ WALRawReaderAllocate(int wal_segment_size,
 	else
 		reader->wal_seg.dir = NULL;
 
-	reader->needless_lsn_list = NeedlessLsnListAllocate(2e16 * sizeof(XLogRecPtr));
+	reader->needless_lsn_list = NeedlessLsnListAllocate(65536 * sizeof(XLogRecPtr));
 
 	reader->errormsg_buf = palloc0(MAX_ERRORMSG_LEN + 1);
 
