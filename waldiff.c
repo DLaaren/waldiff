@@ -628,20 +628,16 @@ find_hash_key_from_raw_record(XLogRecord *WALrec)
 	return hash_key;
 }
 
-static bool
-IsHashTableContainsCurrLsn(HTAB *hash_table, XLogRecPtr curr_lsn)
-{
-
-	return true;
-}
-
 static void 
 second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
 {
 	WALDIFFRecordWriteResult write_res;
 	WALRawRecordReadResult   read_res;
 	XLogRecord *WALrec;
+	WALDIFFRecord WDrec;
 	XLogRecPtr curr_lsn;
+	uint32_t hash_key;
+	bool isFound;
 	
 	for (;;) /* Main reading & writing */
 	{
@@ -656,7 +652,6 @@ second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
 		WALrec = (XLogRecord *) WALRawReaderGetLastRecordRead(raw_reader);
 		curr_lsn = raw_reader->wal_seg.last_processed_record;
 
-		WALrec = (XLogRecord*) WALRawReaderGetLastRecordRead(raw_reader);
 		if (WALrec->xl_rmid == RM_XLOG_ID)
 		{
 			if (WALrec->xl_info == XLOG_CHECKPOINT_SHUTDOWN ||
@@ -673,52 +668,60 @@ second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
 
 				switch_record = (char*) palloc0(SizeOfXLogRecord);
 				memcpy(switch_record, WALRawReaderGetLastRecordRead(raw_reader), SizeOfXLogRecord);
-				break;;
+				break;
 			}
 		}
 
+		/* Now we reckon that hash_table contains only HEAP records (INSERT, UPDATE, DELETE)
+		   without image */
 		/* firstly check in hash map*/
-		if (IsHashTableContainsCurrLsn(hash_table, curr_lsn))
+		if (WALrec->xl_rmid == RM_HEAP_ID)
 		{
-			char *construcred_record;
-			WALDIFFRecord WDrec;
+			HTABElem *entry;
 			/* Get necessary data for hash_key from raw record */
-			/* Now we reckon that hash_table contains only HEAP records (INSERT, UPDATE, DELETE)
-			   without image */
-			uint32_t hash_key = find_hash_key_from_raw_record(WALrec);
+			hash_key = find_hash_key_from_raw_record(WALrec);
+			/* try finding in hash table record with this lsn */
+			entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_FIND, &isFound);
 
-			/* find in hash table record with this lsn */
-			HTABElem *entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_FIND, NULL);
-			WDrec = entry->data;
+			if (isFound)
+			{
+				char *construcred_record;
+				WDrec = entry->data;
 
-			Assert(WDrec != NULL);
+				Assert(WDrec != NULL);
 
-			/* construct WALDIFF */
-			construcred_record = constructWALDIFF(WDrec);
+				/* construct WALDIFF */
+				construcred_record = constructWALDIFF(WDrec);
 
-			/* write it */
-			write_res = writer->routine.write_record(writer, construcred_record);
-			if (write_res == WALDIFFWRITE_FAIL) 
-				ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
-										WALDIFFWriterGetErrMsg(writer)));
-		}
-		/* secondly check in NeedlessLsnList */
-		else if (! NeedlessLsnListFind(raw_reader->needless_lsn_list, curr_lsn))
-		{
-			/* Just write it down unchanged */
-			write_res = writer->routine.write_record(writer, WALRawReaderGetLastRecordRead(raw_reader));
-			if (write_res == WALDIFFWRITE_FAIL) 
-				ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
-										WALDIFFWriterGetErrMsg(writer)));
-		}
-		else if (read_res == WALREAD_EOF) /* if we just read last record in WAL segment */
-			break;
-		/* If record's lsn is in NeedlessLsnList, 
-		 * what means that it is already a part of a WALDIFF,
-		 * then just skip this record */
-		else 
-			continue;
+				/* write it */
+				write_res = writer->routine.write_record(writer, construcred_record);
+				if (write_res == WALDIFFWRITE_FAIL) 
+					ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
+											WALDIFFWriterGetErrMsg(writer)));
+				else if (read_res == WALREAD_EOF) /* if we just read last record in WAL segment */
+					break;
+			}
+
+			/* secondly check in NeedlessLsnList */
+			else if (! NeedlessLsnListFind(raw_reader->needless_lsn_list, curr_lsn))
+			{
+				/* Just write it down unchanged */
+				write_res = writer->routine.write_record(writer, WALRawReaderGetLastRecordRead(raw_reader));
+				if (write_res == WALDIFFWRITE_FAIL) 
+					ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
+											WALDIFFWriterGetErrMsg(writer)));
 		
+				else if (read_res == WALREAD_EOF) /* if we just read last record in WAL segment */
+					break;
+				/* If record's lsn is in NeedlessLsnList, 
+				* what means that it is already a part of a WALDIFF,
+				* then just skip this record */
+			}
+		}
+
+		if (read_res == WALREAD_EOF) /* if we just read last record in WAL segment */
+			break;
+
 	} /* Main reading & writing */
 }
 
