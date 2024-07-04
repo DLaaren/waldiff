@@ -65,7 +65,7 @@ static void second_passage(void);
 
 static void write_main_data_hdr(char* record, uint32 total_rec_len, uint32* current_rec_len);
 static int getWALsegsize(const char *WALpath);											 
-static void constructWALDIFF(WALDIFFRecord *WDrec);
+static char *constructWALDIFF(WALDIFFRecord *WDrec);
 // do we need this?
 // need to check how postgres deal with not full WAL segment
 static void finishWALDIFFSegment(WALDIFFWriterState* writer, char* switch_record);
@@ -337,10 +337,6 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 	ereport(LOG, errmsg("second passage"));
 	second_passage();
 
-	// ereport(LOG, errmsg("constructing WALDIFFs"));
-	/* Constructing and writing WALDIFFs to WALDIFF segment */
-	// constructWALDIFF(writer);
-
 	ereport(LOG, errmsg("finishing WALDIFF segment"));
 	
 	/* Questionable */
@@ -568,38 +564,120 @@ first_passage(int wal_segment_size, XLogReaderPrivate *reader_private,
 
 }
 
+static uint16
+find_hash_key_from_raw_record(XLogRecord *WALrec, WALDIFFRecord WDrec)
+{
+	RelFileLocator rel_file_loc;
+	BlockNumber blk_num;
+	OffsetNumber offnum;
+	uint8 block_id;
+	size_t block_data_len_sum = 0; 
+	char *curr_ptr = (char *)WALrec + SizeOfXLogRecord;
+
+	Assert(WALrec->xl_rmid == RM_HEAP_ID);
+
+	WDrec->type = WALrec->xl_info & XLOG_HEAP_OPMASK;
+
+	Assert(WDrec->type == XLOG_HEAP_INSERT || 
+			WDrec->type == XLOG_HEAP_UPDATE ||
+			WDrec->type == XLOG_HEAP_DELETE);
+
+	while(true) {
+		memcpy(&block_id, curr_ptr, sizeof(uint8));
+		/* curr_ptr points to data hdr */
+		if (block_id == XLR_BLOCK_ID_DATA_SHORT)
+		{
+			curr_ptr += SizeOfXLogRecordDataHeaderShort;
+			break;
+		}
+		else if (block_id == XLR_BLOCK_ID_DATA_LONG)
+		{
+			curr_ptr += SizeOfXLogRecordDataHeaderLong;
+			break;
+		}
+		else 
+		{
+			XLogRecordBlockHeader *blk;
+			Assert(block_id <= XLR_MAX_BLOCK_ID);
+
+			blk = (XLogRecordBlockHeader *)curr_ptr;
+
+			/* otherwise no hash key */
+			Assert(! (blk->fork_flags & BKPBLOCK_SAME_REL));
+			if (! (blk->fork_flags & BKPBLOCK_SAME_REL))
+				curr_ptr += sizeof(RelFileLocator);
+
+			curr_ptr += (SizeOfXLogRecordBlockHeader + sizeof(BlockNumber));
+			block_data_len_sum += blk->data_length;
+		}
+	}
+
+	curr_ptr += block_data_len_sum;
+
+	switch(WDrec->type)
+	{
+		case XLOG_HEAP_INSERT:
+		{
+			xl_heap_insert *main_data = (xl_heap_insert *) curr_ptr;
+			offnum = main_data->offnum;
+		}
+		case XLOG_HEAP_UPDATE:
+		{
+			xl_heap_update *main_data = (xl_heap_update *) curr_ptr;
+			offnum = main_data->new_offnum;
+		}
+		case XLOG_HEAP_DELETE:
+		{
+			xl_heap_delete *main_data = (xl_heap_delete *) curr_ptr;
+			offnum = main_data->offnum;
+		}
+		default:
+			ereport(ERROR, errmsg("unproccessed XLOG_HEAP type"));
+	}
+}
+
 static void 
 second_passage(void)
 {
 	WALDIFFRecordWriteResult write_res;
 	WALRawRecordReadResult   read_res;
 	XLogRecord *WALrec;
+	WALDIFFRecord WDrec = palloc0(SizeOfWALDIFFRecord);
+	char *record = NULL;
 	XLogRecPtr curr_lsn;
-	
-
-	reset_buff(raw_reader);
-	reset_tmp_buff(raw_reader);
 
 	for (;;) /* Main reading & writing */
 	{
+		reset_buff(raw_reader);
+		reset_tmp_buff(raw_reader);
+
 		read_res = raw_reader->routine.read_record(raw_reader, NULL);
 		if (read_res == WALREAD_FAIL)
 			ereport(ERROR, errmsg("error during reading raw record from WAL segment: %s", 
 									WALDIFFWriterGetErrMsg(writer)));
 
+		WALrec = WALRawReaderGetLastRecordRead(raw_reader);
 		curr_lsn = raw_reader->wal_seg.last_processed_record;
 
 		/* firstly check in hash map*/
 		if (IsHashTableContainsCurrLsn(hash_table, curr_lsn))
 		{
+			/* Get necessary data for hash_key from raw record */
+			/* Now we reckon that hash_table contains only HEAP records (INSERT, UPDATE, DELETE)
+			   without image */
+			uint32_t hash_key = find_hash_key_from_raw_record(WALrec, WDrec);
+
 			/* find in hash table record with this lsn */
-			WALDIFFRecord *WDrec = hash_table...
-			
+			WALDIFFRecord *WDrec = hash_search(hash_table, (void*) &hash_key, HASH_FIND, NULL);
+			Assert(WDrec != NULL);
+
 			/* construct WALDIFF */
-			constructWALDIFF(WDRec);
+			record = constructWALDIFF(WDrec);
+
+			Assert(record != NULL);
 
 			/* write it */
-			write_res = writer->routine.write_record(writer, WALRawReaderGetLastRecordRead(raw_reader));
+			write_res = writer->routine.write_record(writer, record);
 			if (write_res == WALDIFFWRITE_FAIL) 
 				ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
 										WALDIFFWriterGetErrMsg(writer)));
@@ -1447,7 +1525,7 @@ write_main_data_hdr(char* record, uint32 main_data_len, uint32* current_rec_len)
  * [ I reckon We should remain RMGR records' structure ]
  */
 // TODO rewrite a bit
-void 
+char *
 constructWALDIFF(WALDIFFRecord *WDrec)
 {
 	HTABElem *entry;
@@ -1479,8 +1557,8 @@ constructWALDIFF(WALDIFFRecord *WDrec)
 				/* 
 				 * Contains XLogRecord +
 				 * XLogRecordBlockHeader_0 +  
-				 * XLogRecordDataHeader[Short|Long] +
 				 * RelFileLocator_0 + BlockNumber_0 + 
+				 * XLogRecordDataHeader[Short|Long] +
 				 * block_data_0(xl_heap_header + tuple data) + main_data(xl_heap_insert)
 				 */
 				case XLOG_HEAP_INSERT:
@@ -1518,20 +1596,20 @@ constructWALDIFF(WALDIFFRecord *WDrec)
 				}
 				
 				/* 
-				 * Contains XLogRecord +
-				 * XLogRecordBlockHeader_0 + RelFileLocator_0 + 
-				 * BlockNumber_0 + 
-				 * ((If XLH_UPDATE_PREFIX_FROM_OLD or XLH_UPDATE_SUFFIX_FROM_OLD flags are set)
- 				 * prefix + suffix + xl_heap_header + tuple data) +
-				 * XLogRecordBlockHeader_1 + BlockNumber_1 +
-				 * XLogRecordDataHeader[Short|Long] +
-				 * block_data_0 + main_data(xl_heap_update)
-				 * 
-				 * block 0: new page
-				 * block 1: old page, if different. (no data, just a reference to the blk)
-				 * [ As I got it, block 1 = header1 + blockNo1, and main_data contains offset to
-				 * old tuple in this blockNo1 ]
-				 */
+		         * Contains XLogRecord +
+		         * XLogRecordBlockHeader_0 + RelFileLocator_0 + 
+		         * BlockNumber_0 + 
+		         * ((If XLH_UPDATE_PREFIX_FROM_OLD or XLH_UPDATE_SUFFIX_FROM_OLD flags are set)
+		         * prefix + suffix + xl_heap_header + tuple data) +
+		         * XLogRecordBlockHeader_1 + BlockNumber_1 +
+		         * XLogRecordDataHeader[Short|Long] +
+		         * block_data_0 + main_data(xl_heap_update)
+		         * 
+		         * block 0: new page
+		         * block 1: old page, if different. (no data, just a reference to the blk)
+		         * [ As I got it, block 1 = header1 + blockNo1, and main_data contains offset to
+		         * old tuple in this blockNo1 ]
+		         */
 				case XLOG_HEAP_UPDATE:
 				{
 					WALDIFFBlock block_0;
@@ -1583,9 +1661,9 @@ constructWALDIFF(WALDIFFRecord *WDrec)
 
 				/* 
 				 * Contains XLogRecord +
-				 * XLogRecordBlockHeader_0 + XLogRecordDataHeader[Short|Long] +
-				 * RelFileLocator_0 + 
-				 * BlockNumber_0 + main_data(xl_heap_delete)
+				 * XLogRecordBlockHeader_0 +
+				 * RelFileLocator_0 + BlockNumber_0 + 
+				 * XLogRecordDataHeader[Short|Long] + main_data(xl_heap_delete)
 				 */
 				case XLOG_HEAP_DELETE:
 				{
@@ -1624,16 +1702,12 @@ constructWALDIFF(WALDIFFRecord *WDrec)
 			rec_tot_len += WDrec->main_data_len;
 
 			Assert(WDrec->rec_hdr.xl_tot_len == rec_tot_len);
-						
-			write_res = writer->routine.write_record(writer, record);
-
-			if (write_res == WALDIFFWRITE_FAIL) 
-					ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
-											WALDIFFWriterGetErrMsg(writer)));
 		}
 		else 
 			ereport(ERROR, errmsg("WALDIFF cannot contains not XLOG_HEAP types"));
 	}
+
+	return record;
 }
 
 /*
