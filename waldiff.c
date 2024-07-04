@@ -64,10 +64,10 @@ static void second_passage(char *switch_record, XLogRecPtr *last_checkpoint);
 
 static void write_main_data_hdr(char* record, uint32 total_rec_len, uint32* current_rec_len);
 static int getWALsegsize(const char *WALpath);											 
-static char *constructWALDIFF(WALDIFFRecord *WDrec);
+static char *constructWALDIFF(WALDIFFRecord WDrec);
 // do we need this?
 // need to check how postgres deal with not full WAL segment
-static void finishWALDIFFSegment(WALDIFFWriterState* writer, char* switch_record);
+static void finishWALDIFFSegment(WALDIFFWriterState *writer, char *switch_record);
 
 static void ReadControlFile(void);
 static void WriteControlFile(void);
@@ -545,10 +545,10 @@ first_passage(int wal_segment_size, XLogReaderPrivate *reader_private)
 }
 
 static uint16
-find_hash_key_from_raw_record(XLogRecord *WALrec, WALDIFFRecord WDrec)
+find_hash_key_from_raw_record(XLogRecord *WALrec)
 {
-	RelFileLocator rel_file_loc;
-	BlockNumber blk_num;
+	WALDIFFRecord WDrec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord);
+	uint32_t hash_key;
 	OffsetNumber offnum;
 	uint8 block_id;
 	size_t block_data_len_sum = 0; 
@@ -600,20 +600,39 @@ find_hash_key_from_raw_record(XLogRecord *WALrec, WALDIFFRecord WDrec)
 		{
 			xl_heap_insert *main_data = (xl_heap_insert *) curr_ptr;
 			offnum = main_data->offnum;
+			break;
 		}
 		case XLOG_HEAP_UPDATE:
 		{
 			xl_heap_update *main_data = (xl_heap_update *) curr_ptr;
 			offnum = main_data->new_offnum;
+			break;
 		}
 		case XLOG_HEAP_DELETE:
 		{
 			xl_heap_delete *main_data = (xl_heap_delete *) curr_ptr;
 			offnum = main_data->offnum;
+			break;
 		}
 		default:
 			ereport(ERROR, errmsg("unproccessed XLOG_HEAP type"));
+			break;
 	}
+
+	WDrec->current_t_ctid.ip_posid = offnum;
+
+	hash_key = GetHashKeyOfWALDIFFRecord(WDrec);
+
+	pfree(WDrec);
+
+	return hash_key;
+}
+
+static bool
+IsHashTableContainsCurrLsn(HTAB *hash_table, XLogRecPtr curr_lsn)
+{
+
+	return true;
 }
 
 static void 
@@ -622,8 +641,6 @@ second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
 	WALDIFFRecordWriteResult write_res;
 	WALRawRecordReadResult   read_res;
 	XLogRecord *WALrec;
-	WALDIFFRecord WDrec = palloc0(SizeOfWALDIFFRecord);
-	char *record = NULL;
 	XLogRecPtr curr_lsn;
 	
 	for (;;) /* Main reading & writing */
@@ -636,7 +653,7 @@ second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
 			ereport(ERROR, errmsg("error during reading raw record from WAL segment: %s", 
 									WALDIFFWriterGetErrMsg(writer)));
 
-		WALrec = WALRawReaderGetLastRecordRead(raw_reader);
+		WALrec = (XLogRecord *) WALRawReaderGetLastRecordRead(raw_reader);
 		curr_lsn = raw_reader->wal_seg.last_processed_record;
 
 		WALrec = (XLogRecord*) WALRawReaderGetLastRecordRead(raw_reader);
@@ -645,7 +662,7 @@ second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
 			if (WALrec->xl_info == XLOG_CHECKPOINT_SHUTDOWN ||
 				WALrec->xl_info == XLOG_CHECKPOINT_ONLINE)
 			{
-				last_checkpoint = writer->already_written + writer->first_page_addr;
+				*last_checkpoint = writer->already_written + writer->first_page_addr;
 			}
 			else if (WALrec->xl_info == XLOG_SWITCH)
 			{
@@ -663,17 +680,21 @@ second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
 		/* firstly check in hash map*/
 		if (IsHashTableContainsCurrLsn(hash_table, curr_lsn))
 		{
+			char *construcred_record;
+			WALDIFFRecord WDrec;
 			/* Get necessary data for hash_key from raw record */
 			/* Now we reckon that hash_table contains only HEAP records (INSERT, UPDATE, DELETE)
 			   without image */
-			uint32_t hash_key = find_hash_key_from_raw_record(WALrec, WDrec);
+			uint32_t hash_key = find_hash_key_from_raw_record(WALrec);
 
 			/* find in hash table record with this lsn */
-			WALDIFFRecord *WDrec = hash_search(hash_table, (void*) &hash_key, HASH_FIND, NULL);
+			HTABElem *entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_FIND, NULL);
+			WDrec = entry->data;
+
 			Assert(WDrec != NULL);
 
 			/* construct WALDIFF */
-			char* construcred_record = constructWALDIFF(WDRec);
+			construcred_record = constructWALDIFF(WDrec);
 
 			/* write it */
 			write_res = writer->routine.write_record(writer, construcred_record);

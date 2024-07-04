@@ -474,7 +474,7 @@ NeedlessLsnListPush(NeedlessLsnList* needless_lsn_list, XLogRecPtr new_elem)
 	if (NeedlessLsnListGetRestListCapacity(needless_lsn_list) < sizeof(new_elem))
 		NeedlessLsnListIncrease(needless_lsn_list);
 
-	memcpy(needless_lsn_list->list + needless_lsn_list->fullness, new_elem, sizeof(XLogRecPtr));
+	memcpy(needless_lsn_list->list + needless_lsn_list->fullness, &new_elem, sizeof(XLogRecPtr));
 
 	needless_lsn_list->fullness += sizeof(XLogRecPtr);
 }
