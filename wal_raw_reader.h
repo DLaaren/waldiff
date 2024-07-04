@@ -90,7 +90,7 @@ struct WALRawReaderState
 	/*
 	 * Buffer for internal logic
 	 */
-	char* tmp_buffer;
+	char *tmp_buffer;
 	Size  tmp_buffer_fullness;
 	
 	/*
@@ -136,18 +136,18 @@ struct WALRawReaderState
 
 /* Get a new WALReader */
 extern WALRawReaderState *WALRawReaderAllocate(int wal_segment_size,
-										  char* wal_dir,
-										  WALRawReaderRoutine *routine,
-										  Size buffer_capacity);
+										  	   char* wal_dir,
+										       WALRawReaderRoutine *routine,
+										       Size buffer_capacity);
 
 /* Free a WALReader */
 extern void WALRawReaderFree(WALRawReaderState *state);
 
 /* Position the WALReader to the beginning */
 extern void WALRawBeginRead(WALRawReaderState *state, 
-							  XLogSegNo segNo, 
-							  TimeLineID tli,
-							  int flags);
+							XLogSegNo segNo, 
+							TimeLineID tli,
+							int flags);
 
 extern int  append_to_buff(WALRawReaderState* raw_reader, uint64 size);
 extern void reset_buff(WALRawReaderState* raw_reader);

@@ -432,7 +432,7 @@ WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 			if (nbytes == 0 && data_len > 0)
 				return WALREAD_EOF;
 			
-			if (data_len == (record->xl_tot_len - SizeOfXLogRecord)) /* If record fit on the current page */
+			if (data_len == (record->xl_tot_len - SizeOfXLogRecord)) /* If record fits on the current page */
 			{
 				lseek(raw_reader->wal_seg.fd, MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord - data_len, SEEK_CUR); /* Records and maxaligned, so skip padding */
 				raw_reader->already_read += MAXALIGN(record->xl_tot_len) - SizeOfXLogRecord - data_len;
