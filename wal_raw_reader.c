@@ -41,6 +41,8 @@ WALRawReaderAllocate(int wal_segment_size,
 	else
 		reader->wal_seg.dir = NULL;
 
+	reader->needless_lsn_list = NeedlessLsnListAllocate(2e16 * sizeof(XLogRecPtr));
+
 	reader->errormsg_buf = palloc0(MAX_ERRORMSG_LEN + 1);
 
 	return reader;						
@@ -57,6 +59,9 @@ WALRawReaderFree(WALRawReaderState *reader)
 
 	if (reader->wal_seg.dir != NULL)
 		pfree(reader->wal_seg.dir);
+
+	if (reader->needless_lsn_list != NULL)
+		NeedlessLsnListFree(reader->needless_lsn_list);
 
 	pfree(reader->errormsg_buf);
 	pfree(reader->buffer);
@@ -456,6 +461,8 @@ NeedlessLsnListAllocate(size_t list_capacity)
 
 	needless_lsn_list->list = (char*) palloc0(sizeof(char) * list_capacity);
 	needless_lsn_list->ptr = 0;
+
+	return needless_lsn_list;
 }
 
 /*
@@ -467,8 +474,7 @@ NeedlessLsnListPush(NeedlessLsnList* needless_lsn_list, XLogRecPtr new_elem)
 	if (NeedlessLsnListGetRestListCapacity(needless_lsn_list) < sizeof(new_elem))
 		NeedlessLsnListIncrease(needless_lsn_list);
 
-	memcpy(needless_lsn_list->list + needless_lsn_list->fullness * sizeof(XLogRecPtr), 
-		   new_elem, sizeof(XLogRecPtr));
+	memcpy(needless_lsn_list->list + needless_lsn_list->fullness, new_elem, sizeof(XLogRecPtr));
 
 	needless_lsn_list->fullness += sizeof(XLogRecPtr);
 }
@@ -487,19 +493,14 @@ NeedlessLsnListIncrease(NeedlessLsnList* needless_lsn_list)
 bool 
 NeedlessLsnListFind(NeedlessLsnList* needless_lsn_list, XLogRecPtr elem)
 {
-	while (true)
+	XLogRecPtr* target = (XLogRecPtr*) (needless_lsn_list->list + needless_lsn_list->ptr * sizeof(XLogRecPtr));
+	if (*target == elem)
 	{
-		if (needless_lsn_list->ptr > needless_lsn_list->fullness)
-			return false;
-		
-		XLogRecPtr* current_elem = (XLogRecPtr*) (needless_lsn_list->list + needless_lsn_list->ptr * sizeof(XLogRecPtr));
 		needless_lsn_list->ptr += 1;
-
-		if (*current_elem == elem)
-			break;
+		return true;
 	}
-
-	return true;
+	else
+		return false;
 }
 
 void 
