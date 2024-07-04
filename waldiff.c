@@ -1461,7 +1461,7 @@ constructWALDIFFs(WALDIFFWriterState* writer)
 					write_main_data_hdr(record, WDrec->main_data_len, &rec_tot_len);
 
 					/* block data */
-					memcpy(record + rec_tot_len, &(block_0.block_data), block_0.block_data_len);
+					memcpy(record + rec_tot_len, block_0.block_data, block_0.block_data_len);
 					rec_tot_len += block_0.block_data_len;
 
 					break;
@@ -1524,7 +1524,7 @@ constructWALDIFFs(WALDIFFWriterState* writer)
 					write_main_data_hdr(record, WDrec->main_data_len, &rec_tot_len);
 
 					/* block data 0 */
-					memcpy(record + rec_tot_len, &(block_0.block_data), block_0.block_data_len);
+					memcpy(record + rec_tot_len, block_0.block_data, block_0.block_data_len);
 					rec_tot_len += block_0.block_data_len;
 
 					break;

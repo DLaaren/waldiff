@@ -445,3 +445,66 @@ WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 	}
 	return WALREAD_FAIL;
 }
+
+NeedlessLsnList* 
+NeedlessLsnListAllocate(size_t list_capacity)
+{
+	NeedlessLsnList* needless_lsn_list = (NeedlessLsnList*) palloc0(sizeof(NeedlessLsnList));
+
+	needless_lsn_list->capacity = list_capacity;
+	needless_lsn_list->fullness = 0;
+
+	needless_lsn_list->list = (char*) palloc0(sizeof(char) * list_capacity);
+	needless_lsn_list->ptr = 0;
+}
+
+/*
+ * Add new element to end of list
+ */
+void 
+NeedlessLsnListPush(NeedlessLsnList* needless_lsn_list, XLogRecPtr new_elem)
+{
+	if (NeedlessLsnListGetRestListCapacity(needless_lsn_list) < sizeof(new_elem))
+		NeedlessLsnListIncrease(needless_lsn_list);
+
+	memcpy(needless_lsn_list->list + needless_lsn_list->fullness * sizeof(XLogRecPtr), 
+		   new_elem, sizeof(XLogRecPtr));
+
+	needless_lsn_list->fullness += sizeof(XLogRecPtr);
+}
+
+/*
+ * In case there is not enough memory in list to push new element, 
+ * list will be increased by 1.5 times
+ */
+void 
+NeedlessLsnListIncrease(NeedlessLsnList* needless_lsn_list)
+{
+	needless_lsn_list->capacity *= 1.5;
+	needless_lsn_list->list = (char*) repalloc(needless_lsn_list->list, needless_lsn_list->capacity);
+}
+
+bool 
+NeedlessLsnListFind(NeedlessLsnList* needless_lsn_list, XLogRecPtr elem)
+{
+	while (true)
+	{
+		if (needless_lsn_list->ptr > needless_lsn_list->fullness)
+			return false;
+		
+		XLogRecPtr* current_elem = (XLogRecPtr*) (needless_lsn_list->list + needless_lsn_list->ptr * sizeof(XLogRecPtr));
+		needless_lsn_list->ptr += 1;
+
+		if (*current_elem == elem)
+			break;
+	}
+
+	return true;
+}
+
+void 
+NeedlessLsnListFree(NeedlessLsnList* needless_lsn_list)
+{
+	pfree(needless_lsn_list->list);
+	pfree(needless_lsn_list);
+}
