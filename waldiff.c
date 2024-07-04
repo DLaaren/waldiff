@@ -59,9 +59,8 @@ static void copy_waldiff_record(WALDIFFRecord* dest, WALDIFFRecord src);
 
 static int overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup);
 
-static void first_passage(int wal_segment_size, XLogReaderPrivate *reader_private, 
-						  char *switch_record, XLogRecPtr *last_checkpoint);
-static void second_passage(void);
+static void first_passage(int wal_segment_size, XLogReaderPrivate *reader_private);
+static void second_passage(char *switch_record, XLogRecPtr *last_checkpoint);
 
 static void write_main_data_hdr(char* record, uint32 total_rec_len, uint32* current_rec_len);
 static int getWALsegsize(const char *WALpath);											 
@@ -332,10 +331,10 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 	 */
 
 	ereport(LOG, errmsg("first passage"));
-	first_passage(wal_segment_size, &reader_private, switch_record, &last_checkpoint);
+	first_passage(wal_segment_size, &reader_private);
 
 	ereport(LOG, errmsg("second passage"));
-	second_passage();
+	second_passage(switch_record, &last_checkpoint);
 
 	// ereport(LOG, errmsg("constructing WALDIFFs"));
 	/* Constructing and writing WALDIFFs to WALDIFF segment */
@@ -370,8 +369,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 }
 
 static void 
-first_passage(int wal_segment_size, XLogReaderPrivate *reader_private,
-			  char *switch_record, XLogRecPtr *last_checkpoint)
+first_passage(int wal_segment_size, XLogReaderPrivate *reader_private)
 {
 	/* Some pre-work */
 	XLogLongPageHeader page_hdr;
@@ -430,6 +428,11 @@ first_passage(int wal_segment_size, XLogReaderPrivate *reader_private,
 					if (WDrec == NULL)
 						ereport(ERROR, errmsg("fetch_insert failed"));
 
+					/*
+					 * Inform raw_reader, that this lsn must be skipped in second passage
+					 */
+					NeedlessLsnListPush(raw_reader->needless_lsn_list, WDrec->lsn);
+
 					hash_key = GetHashKeyOfWALDIFFRecord(WDrec);
 					hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
 					if (is_found)
@@ -449,6 +452,11 @@ first_passage(int wal_segment_size, XLogReaderPrivate *reader_private,
 					WDrec = fetch_update(reader_state);
 					if (WDrec == NULL)
 						ereport(ERROR, errmsg("fetch_update failed"));
+
+					/*
+					 * Inform raw_reader, that this lsn must be skipped in second passage
+					 */
+					NeedlessLsnListPush(raw_reader->needless_lsn_list, WDrec->lsn);
 
 					prev_hash_key = GetHashKeyOfPrevWALDIFFRecord(WDrec);
 					hash_key = GetHashKeyOfWALDIFFRecord(WDrec);
@@ -500,6 +508,11 @@ first_passage(int wal_segment_size, XLogReaderPrivate *reader_private,
 					if (WDrec == NULL)
 						ereport(ERROR, errmsg("fetch_delete failed"));
 
+					/*
+					 * Inform raw_reader, that this lsn must be skipped in second passage
+					 */
+					NeedlessLsnListPush(raw_reader->needless_lsn_list, WDrec->lsn);
+
 					prev_hash_key = GetHashKeyOfPrevWALDIFFRecord(WDrec);
 					hash_key = GetHashKeyOfWALDIFFRecord(WDrec);
 
@@ -526,68 +539,51 @@ first_passage(int wal_segment_size, XLogReaderPrivate *reader_private,
 				/* unprocessed record type */
 				default:
 					break;
-			}
-
-			/* Insert WDrec's lsn in NeedlessLsnList */
-			if (WDrec->rec_hdr.xl_tot_len > 0) // check if we fetched smth 'cause otherwise it is nulled
-			{
-				Assert(WDrec->rec_hdr.xl_tot_len >= SizeOfXLogRecord);
-				// WDrec->lsn
-			}
-			
+			}			
 		} 
-		
-		/*
-		 * Save last CHECKPOINT record.
-		 */
-		if (XLogRecGetRmid(reader_state)== RM_XLOG_ID)
-		{
-			if (XLogRecGetInfo(reader_state) == XLOG_CHECKPOINT_SHUTDOWN ||
-				XLogRecGetInfo(reader_state) == XLOG_CHECKPOINT_ONLINE)
-					last_checkpoint = writer->waldiff_seg.last_processed_record + writer->first_page_addr;
-		}
-
-
-		/*
-		 * Save SWITCH record. We will write it after all records from hashmap
-		 */
-		if (XLogRecGetRmid(reader_state) == RM_XLOG_ID &&
-			XLogRecGetInfo(reader_state) == XLOG_SWITCH)
-		{
-			if (switch_record != NULL)
-				ereport(ERROR, errmsg("meet second SWITCH record in wal segment"));
-			
-			ereport(LOG, errmsg("meet SWITCH record at position %X/%X", LSN_FORMAT_ARGS(raw_reader->wal_seg.last_processed_record)));
-
-			switch_record = (char*) palloc0(SizeOfXLogRecord);
-			memcpy(switch_record, WALRawReaderGetLastRecordRead(raw_reader), SizeOfXLogRecord);
-			continue;
-		}
-
-	} /* Main reading & constructing */
-
+	}
 }
 
 static void 
-second_passage(void)
+second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
 {
 	WALDIFFRecordWriteResult write_res;
 	WALRawRecordReadResult   read_res;
 	XLogRecord *WALrec;
 	XLogRecPtr curr_lsn;
 	
-
-	reset_buff(raw_reader);
-	reset_tmp_buff(raw_reader);
-
 	for (;;) /* Main reading & writing */
 	{
+		reset_buff(raw_reader);
+		reset_tmp_buff(raw_reader);
+
 		read_res = raw_reader->routine.read_record(raw_reader, NULL);
 		if (read_res == WALREAD_FAIL)
 			ereport(ERROR, errmsg("error during reading raw record from WAL segment: %s", 
 									WALDIFFWriterGetErrMsg(writer)));
 
 		curr_lsn = raw_reader->wal_seg.last_processed_record;
+
+		WALrec = (XLogRecord*) WALRawReaderGetLastRecordRead(raw_reader);
+		if (WALrec->xl_rmid == RM_XLOG_ID)
+		{
+			if (WALrec->xl_info == XLOG_CHECKPOINT_SHUTDOWN ||
+				WALrec->xl_info == XLOG_CHECKPOINT_ONLINE)
+			{
+				last_checkpoint = writer->already_written + writer->first_page_addr;
+			}
+			else if (WALrec->xl_info == XLOG_SWITCH)
+			{
+				if (switch_record != NULL)
+					ereport(ERROR, errmsg("meet second SWITCH record in wal segment"));
+				
+				ereport(LOG, errmsg("meet SWITCH record at position %X/%X", LSN_FORMAT_ARGS(raw_reader->wal_seg.last_processed_record)));
+
+				switch_record = (char*) palloc0(SizeOfXLogRecord);
+				memcpy(switch_record, WALRawReaderGetLastRecordRead(raw_reader), SizeOfXLogRecord);
+				break;;
+			}
+		}
 
 		/* firstly check in hash map*/
 		if (IsHashTableContainsCurrLsn(hash_table, curr_lsn))
@@ -605,7 +601,7 @@ second_passage(void)
 										WALDIFFWriterGetErrMsg(writer)));
 		}
 		/* secondly check in NeedlessLsnList */
-		else if (! IsNeedlessLsnListContainsCurrLsn(raw_reader->ABOBA, curr_lsn))
+		else if (! NeedlessLsnListFind(raw_reader->needless_lsn_list, curr_lsn))
 		{
 			/* Just write it down unchanged */
 			write_res = writer->routine.write_record(writer, WALRawReaderGetLastRecordRead(raw_reader));
@@ -613,6 +609,8 @@ second_passage(void)
 				ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
 										WALDIFFWriterGetErrMsg(writer)));
 		}
+		else if (read_res == WALREAD_EOF) /* if we just read last record in WAL segment */
+			break;
 		/* If record's lsn is in NeedlessLsnList, 
 		 * what means that it is already a part of a WALDIFF,
 		 * then just skip this record */

@@ -96,7 +96,7 @@ struct WALRawReaderState
 	/*
 	 * LSNs, that we should skip during second passing through WAL
 	 */
-	NeedlessLsnList		needless_lsn;
+	NeedlessLsnList*	needless_lsn_list;
 
     /*
      * Segment context
