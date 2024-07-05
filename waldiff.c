@@ -89,7 +89,7 @@ _hash_combine(uint32_t seed, uint32_t value)
     key = _hash_combine(key, (record)->current_t_ctid.ip_blkid.bi_hi); \
     key = _hash_combine(key, (record)->current_t_ctid.ip_blkid.bi_lo); \
     key = _hash_combine(key, (record)->current_t_ctid.ip_posid); \
-    key; \
+    key + 1; \
 })
 
 #define GetHashKeyOfPrevWALDIFFRecord(record) \
@@ -101,7 +101,7 @@ _hash_combine(uint32_t seed, uint32_t value)
     key = _hash_combine(key, (record)->prev_t_ctid.ip_blkid.bi_hi); \
     key = _hash_combine(key, (record)->prev_t_ctid.ip_blkid.bi_lo); \
     key = _hash_combine(key, (record)->prev_t_ctid.ip_posid); \
-    key; \
+    key + 1; \
 })
 
 /*
@@ -547,7 +547,7 @@ first_passage(int wal_segment_size, XLogReaderPrivate *reader_private)
 static uint16
 find_hash_key_from_raw_record(XLogRecord *WALrec)
 {
-	WALDIFFRecord WDrec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord);
+	WALDIFFRecord WDrec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord + 2 * sizeof(WALDIFFBlock));
 	uint32_t hash_key;
 	OffsetNumber offnum;
 	uint8 block_id;
@@ -562,7 +562,8 @@ find_hash_key_from_raw_record(XLogRecord *WALrec)
 			WDrec->type == XLOG_HEAP_UPDATE ||
 			WDrec->type == XLOG_HEAP_DELETE);
 
-	while(true) {
+	while(true) 
+	{
 		memcpy(&block_id, curr_ptr, sizeof(uint8));
 		/* curr_ptr points to data hdr */
 		if (block_id == XLR_BLOCK_ID_DATA_SHORT)
@@ -581,10 +582,15 @@ find_hash_key_from_raw_record(XLogRecord *WALrec)
 			Assert(block_id <= XLR_MAX_BLOCK_ID);
 
 			blk_hdr = (XLogRecordBlockHeader *)curr_ptr;
-			ereport(LOG, errmsg("BLOCK ID : %u TYPE = %u DATA LEN = %u FLAGS = %u", block_id, WDrec->type, blk_hdr->data_length, blk_hdr->fork_flags));
 
-			/* otherwise no hash key */
-			Assert(! (blk_hdr->fork_flags & BKPBLOCK_SAME_REL));
+			/*
+			 * For now, we not working with FPW
+			 */
+			if (blk_hdr->fork_flags & BKPBLOCK_HAS_IMAGE)
+			{
+				pfree(WDrec);
+				return 0;
+			}
 
 			if (! (blk_hdr->fork_flags & BKPBLOCK_SAME_REL))
 				curr_ptr += sizeof(RelFileLocator);
@@ -680,11 +686,21 @@ second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
 		if (WALrec->xl_rmid == RM_HEAP_ID &&
 		   ( (WALrec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_INSERT || 
 			 (WALrec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_UPDATE ||
-			 (WALrec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_DELETE))
+			 (WALrec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_DELETE ) &&
+			WALrec->xl_info )
 		{
 			HTABElem *entry;
 			/* Get necessary data for hash_key from raw record */
 			hash_key = find_hash_key_from_raw_record(WALrec);
+
+			/*
+			 * If hash key is not found, it means that we are not working
+			 * with this record (because of FPW, for example), so just write it
+			 * to WALDIFF segment
+			 */
+			if (hash_key == 0)
+				goto write;
+			
 			/* try finding in hash table record with this lsn */
 			entry = (HTABElem *) hash_search(hash_table, (void*) &hash_key, HASH_FIND, &isFound);
 
@@ -725,7 +741,7 @@ second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
 
 			continue;
 		}
-
+write:
 		write_res = writer->routine.write_record(writer, WALRawReaderGetLastRecordRead(raw_reader));
 		if (write_res == WALDIFFWRITE_FAIL) 
 			ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 

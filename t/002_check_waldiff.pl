@@ -75,6 +75,6 @@ diag("stdout: $stdout1");
 # Stop the server
 $node->stop('immediate');
 
-diag("sleeeeeeeeeeeeeeep");
-sleep(3024032);
+# diag("sleeeeeeeeeeeeeeep");
+# sleep(3024032);
 done_testing();
