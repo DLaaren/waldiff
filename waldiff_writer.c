@@ -120,6 +120,21 @@ write_data_to_file(WALDIFFWriterState* writer, char* data, uint64 data_size)
 	return nbytes;
 }
 
+void 
+WALDIFFFinishWithZeros(void)
+{
+	WALDIFFRecordWriteResult write_res;
+	if (writer->waldiff_seg.segsize - writer->already_written > 0)
+	{
+		XLogRecord zero_rec;
+		zero_rec.xl_tot_len = writer->waldiff_seg.segsize - writer->already_written;
+		write_res = writer->routine.write_record(writer, (char *)&zero_rec);
+			if (write_res == WALDIFFWRITE_FAIL) 
+				ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
+								      WALDIFFWriterGetErrMsg(writer)));
+	}
+}
+
 /* 
  * Writes given record to WAL segment. Prameter record must contain only
  * record's data, without page headers

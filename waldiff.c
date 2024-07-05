@@ -60,14 +60,14 @@ static void copy_waldiff_record(WALDIFFRecord* dest, WALDIFFRecord src);
 static int overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup);
 
 static void first_passage(int wal_segment_size, XLogReaderPrivate *reader_private);
-static void second_passage(char *switch_record, XLogRecPtr *last_checkpoint);
+static void second_passage(XLogRecPtr *last_checkpoint);
 
 static void write_main_data_hdr(char* record, uint32 total_rec_len, uint32* current_rec_len);
 static int getWALsegsize(const char *WALpath);											 
 static char *constructWALDIFF(WALDIFFRecord WDrec);
 // do we need this?
 // need to check how postgres deal with not full WAL segment
-static void finishWALDIFFSegment(WALDIFFWriterState *writer, char *switch_record);
+static void finishWALDIFFSegment(WALDIFFWriterState *writer);
 
 static void ReadControlFile(void);
 static void WriteControlFile(void);
@@ -242,7 +242,6 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 	XLogReaderPrivate reader_private = {0};
 	XLogSegNo 		  segno;
 	XLogRecPtr	  	  last_checkpoint = InvalidXLogRecPtr;
-	char			  *switch_record = NULL; /* we will store SWITCH record and write it in the end */
 
 	ereport(LOG, errmsg("WAL segment is being archived"));
 
@@ -330,7 +329,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 	first_passage(wal_segment_size, &reader_private);
 
 	ereport(LOG, errmsg("second passage"));
-	second_passage(switch_record, &last_checkpoint);
+	second_passage(&last_checkpoint);
 
 	// ereport(LOG, errmsg("constructing WALDIFFs"));
 	/* Constructing and writing WALDIFFs to WALDIFF segment */
@@ -340,7 +339,7 @@ waldiff_archive(ArchiveModuleState *reader, const char *WALfile, const char *WAL
 	
 	/* Questionable */
 	/* End the segment with SWITCH record */
-	finishWALDIFFSegment(writer, switch_record);
+	finishWALDIFFSegment(writer);
 	
 	ControlFile = (ControlFileData*) palloc0(sizeof(ControlFileData));
 	ereport(LOG, errmsg("write new last checkpoint location : %X/%X", LSN_FORMAT_ARGS(last_checkpoint)));
@@ -637,7 +636,7 @@ find_hash_key_from_raw_record(XLogRecord *WALrec)
 }
 
 static void 
-second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
+second_passage(XLogRecPtr *last_checkpoint)
 {
 	WALDIFFRecordWriteResult write_res;
 	WALRawRecordReadResult   read_res;
@@ -668,16 +667,7 @@ second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
 				*last_checkpoint = writer->already_written + writer->first_page_addr;
 			}
 			else if (WALrec->xl_info == XLOG_SWITCH)
-			{
-				if (switch_record != NULL)
-					ereport(ERROR, errmsg("meet second SWITCH record in wal segment"));
-				
-				ereport(LOG, errmsg("meet SWITCH record at position %X/%X", LSN_FORMAT_ARGS(raw_reader->wal_seg.last_processed_record)));
-
-				switch_record = (char*) palloc0(SizeOfXLogRecord);
-				memcpy(switch_record, WALRawReaderGetLastRecordRead(raw_reader), SizeOfXLogRecord);
-				break;
-			}
+				ereport(LOG, errmsg("meet SWITCH record at position %X/%X", LSN_FORMAT_ARGS(raw_reader->first_page_addr + raw_reader->wal_seg.last_processed_record)));
 		}
 
 		/* Now we reckon that hash_table contains only HEAP records (INSERT, UPDATE, DELETE)
@@ -706,7 +696,7 @@ second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
 
 			if (isFound)
 			{
-				char *construcred_record;
+				char *construcred_record = NULL;
 				WDrec = entry->data;
 
 				Assert(WDrec != NULL);
@@ -715,25 +705,14 @@ second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
 				construcred_record = constructWALDIFF(WDrec);
 
 				/* write it */
-				write_res = writer->routine.write_record(writer, construcred_record);
-				if (write_res == WALDIFFWRITE_FAIL) 
-					ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
-											WALDIFFWriterGetErrMsg(writer)));
-				else if (read_res == WALREAD_EOF) /* if we just read last record in WAL segment */
-					break;
+				goto write;
 			}
 
 			/* secondly check in NeedlessLsnList */
 			else if (! NeedlessLsnListFind(raw_reader->needless_lsn_list, curr_lsn))
 			{
 				/* Just write it down unchanged */
-				write_res = writer->routine.write_record(writer, WALRawReaderGetLastRecordRead(raw_reader));
-				if (write_res == WALDIFFWRITE_FAIL) 
-					ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
-											WALDIFFWriterGetErrMsg(writer)));
-		
-				else if (read_res == WALREAD_EOF) /* if we just read last record in WAL segment */
-					break;
+				goto write;
 				/* If record's lsn is in NeedlessLsnList, 
 				* what means that it is already a part of a WALDIFF,
 				* then just skip this record */
@@ -741,12 +720,14 @@ second_passage(char *switch_record, XLogRecPtr *last_checkpoint)
 
 			continue;
 		}
+
 write:
 		write_res = writer->routine.write_record(writer, WALRawReaderGetLastRecordRead(raw_reader));
 		if (write_res == WALDIFFWRITE_FAIL) 
 			ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
 									WALDIFFWriterGetErrMsg(writer)));
 
+		//TODO что ето
 		else if (read_res == WALREAD_EOF) /* if we just read last record in WAL segment */
 			break;
 	}
@@ -1757,22 +1738,39 @@ constructWALDIFF(WALDIFFRecord WDrec)
  * If we met SWITCH record before, we must store it in the end of waldiff file
  */
 void 
-finishWALDIFFSegment(WALDIFFWriterState* writer, char* switch_record)
+finishWALDIFFSegment(WALDIFFWriterState *writer)
 {
 	XLogRecord noop_rec = {0};
+	XLogRecord switch_rec = {0};
+
+	WALDIFFRecordWriteResult write_res;	
+
     noop_rec.xl_tot_len = SizeOfXLogRecord;
 	noop_rec.xl_info = XLOG_NOOP;
     noop_rec.xl_rmid = RM_XLOG_ID;
 
+	switch_rec.xl_tot_len = SizeOfXLogRecord;
+	switch_rec.xl_info = XLOG_SWITCH;
+    switch_rec.xl_rmid = RM_XLOG_ID;
+
     while (writer->waldiff_seg.segsize - writer->already_written >= SizeOfXLogRecord)
 	{
-		if (writer->waldiff_seg.segsize - writer->already_written < (SizeOfXLogRecord * 2) &&
-			switch_record != NULL)
+		if ((writer->waldiff_seg.segsize - writer->already_written < (SizeOfXLogRecord * 2)))
 		{
-			ereport(LOG, errmsg("write SWITCH record at position : %X/%X",  LSN_FORMAT_ARGS(writer->already_written)));
-			writer->routine.write_record(writer, switch_record);
+			ereport(LOG, errmsg("write SWITCH record at position : %X/%08X",  LSN_FORMAT_ARGS(writer->first_page_addr + writer->already_written)));
+			write_res = writer->routine.write_record(writer, (char *) &switch_rec);
+			if (write_res == WALDIFFWRITE_FAIL) 
+				ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
+								      WALDIFFWriterGetErrMsg(writer)));
 		}
 		else
-			writer->routine.write_record(writer, (char*) &noop_rec);
+		{
+			write_res = writer->routine.write_record(writer, (char*) &noop_rec);
+			if (write_res == WALDIFFWRITE_FAIL) 
+				ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
+								      WALDIFFWriterGetErrMsg(writer)));
+		}
 	}
+
+	WALDIFFFinishWithZeros();
 }

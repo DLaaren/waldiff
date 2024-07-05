@@ -100,6 +100,7 @@ extern void WALDIFFBeginWrite(WALDIFFWriterState *state,
 							  int flags);
 
 extern int write_data_to_file(WALDIFFWriterState* writer, char* data, uint64 data_size);
+void WALDIFFFinishWithZeros(void);
 
 /*
  * Declaration of WALDIFFWriterState routine implementations
