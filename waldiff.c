@@ -693,8 +693,7 @@ second_passage(XLogRecPtr *last_checkpoint)
 		if (WALrec->xl_rmid == RM_HEAP_ID &&
 		   ( (WALrec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_INSERT || 
 			 (WALrec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_UPDATE ||
-			 (WALrec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_DELETE ) &&
-			WALrec->xl_info )
+			 (WALrec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_DELETE ))
 		{
 			HTABElem *entry;
 			/* Get necessary data for hash_key from raw record */
