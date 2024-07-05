@@ -548,6 +548,8 @@ find_hash_key_from_raw_record(XLogRecord *WALrec)
 {
 	WALDIFFRecord WDrec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord + 2 * sizeof(WALDIFFBlock));
 	uint32_t hash_key;
+	RelFileLocator file_loc;
+	BlockNumber blk_num;
 	OffsetNumber offnum;
 	uint8 block_id;
 	size_t block_data_len_sum = 0; 
@@ -591,10 +593,23 @@ find_hash_key_from_raw_record(XLogRecord *WALrec)
 				return 0;
 			}
 
-			if (! (blk_hdr->fork_flags & BKPBLOCK_SAME_REL))
-				curr_ptr += sizeof(RelFileLocator);
+			curr_ptr += SizeOfXLogRecordBlockHeader;
 
-			curr_ptr += (SizeOfXLogRecordBlockHeader + sizeof(BlockNumber));
+			if (! (blk_hdr->fork_flags & BKPBLOCK_SAME_REL))
+			{
+				/* save rel file loc */
+				if (block_id == 0)
+					memcpy(&file_loc, curr_ptr, sizeof(RelFileLocator));
+				
+				curr_ptr += sizeof(RelFileLocator);
+			}
+
+			/* save rel file loc */
+			if (block_id == 0)
+				memcpy(&blk_num, curr_ptr, sizeof(BlockNumber));
+
+			curr_ptr += sizeof(BlockNumber);
+
 			block_data_len_sum += blk_hdr->data_length;
 		}
 	}
@@ -626,7 +641,9 @@ find_hash_key_from_raw_record(XLogRecord *WALrec)
 			break;
 	}
 
-	WDrec->current_t_ctid.ip_posid = offnum;
+	WDrec->blocks[0].file_loc = file_loc;
+	BlockIdSet(&(WDrec->current_t_ctid.ip_blkid), blk_num);
+  	WDrec->current_t_ctid.ip_posid = offnum;
 
 	hash_key = GetHashKeyOfWALDIFFRecord(WDrec);
 
@@ -705,7 +722,12 @@ second_passage(XLogRecPtr *last_checkpoint)
 				construcred_record = constructWALDIFF(WDrec);
 
 				/* write it */
-				goto write;
+				write_res = writer->routine.write_record(writer, construcred_record);
+				if (write_res == WALDIFFWRITE_FAIL) 
+					ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
+											WALDIFFWriterGetErrMsg(writer)));
+				else if (read_res == WALREAD_EOF) /* if we just read last record in WAL segment */
+					break;
 			}
 
 			/* secondly check in NeedlessLsnList */
@@ -727,7 +749,6 @@ write:
 			ereport(ERROR, errmsg("error during writing WALDIFF records in waldiff_archive: %s", 
 									WALDIFFWriterGetErrMsg(writer)));
 
-		//TODO что ето
 		else if (read_res == WALREAD_EOF) /* if we just read last record in WAL segment */
 			break;
 	}
@@ -1772,5 +1793,5 @@ finishWALDIFFSegment(WALDIFFWriterState *writer)
 		}
 	}
 
-	WALDIFFFinishWithZeros();
+	WALDIFFFinishWithZeros(writer);
 }

@@ -121,7 +121,7 @@ write_data_to_file(WALDIFFWriterState* writer, char* data, uint64 data_size)
 }
 
 void 
-WALDIFFFinishWithZeros(void)
+WALDIFFFinishWithZeros(WALDIFFWriterState *writer)
 {
 	WALDIFFRecordWriteResult write_res;
 	if (writer->waldiff_seg.segsize - writer->already_written > 0)

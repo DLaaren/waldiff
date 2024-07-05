@@ -477,6 +477,8 @@ NeedlessLsnListPush(NeedlessLsnList* needless_lsn_list, XLogRecPtr new_elem)
 	memcpy(needless_lsn_list->list + needless_lsn_list->fullness, &new_elem, sizeof(XLogRecPtr));
 
 	needless_lsn_list->fullness += sizeof(XLogRecPtr);
+
+	ereport(LOG, errmsg("PUSHED LSN: %X/%08X", LSN_FORMAT_ARGS(new_elem)));
 }
 
 /*
@@ -493,13 +495,18 @@ NeedlessLsnListIncrease(NeedlessLsnList* needless_lsn_list)
 bool 
 NeedlessLsnListFind(NeedlessLsnList* needless_lsn_list, XLogRecPtr elem)
 {
-	XLogRecPtr* target = (XLogRecPtr*) (needless_lsn_list->list + needless_lsn_list->ptr * sizeof(XLogRecPtr));
+	XLogRecPtr *target = (XLogRecPtr*) (needless_lsn_list->list + needless_lsn_list->ptr * sizeof(XLogRecPtr));
+
+	ereport(LOG, errmsg("TRYING TO FIND LSN: %X/%08X\nFOUND: %X/%08X", LSN_FORMAT_ARGS(elem), LSN_FORMAT_ARGS(*target)));
+
 	if (*target == elem)
-	{
-		needless_lsn_list->ptr += 1;
+	// {
+		// needless_lsn_list->ptr += 1;
 		return true;
-	}
-	else
+	// }
+	else if (*target < elem)
+		needless_lsn_list->ptr += 1;
+	// else
 		return false;
 }
 
