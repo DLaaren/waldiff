@@ -543,13 +543,13 @@ first_passage(int wal_segment_size, XLogReaderPrivate *reader_private)
 	}
 }
 
-static uint16
+static uint32_t
 find_hash_key_from_raw_record(XLogRecord *WALrec)
 {
 	WALDIFFRecord WDrec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord + 2 * sizeof(WALDIFFBlock));
 	uint32_t hash_key;
 	RelFileLocator file_loc;
-	BlockNumber blk_num;
+	BlockNumber blk_num = 0;
 	OffsetNumber offnum;
 	uint8 block_id;
 	size_t block_data_len_sum = 0; 
@@ -642,7 +642,7 @@ find_hash_key_from_raw_record(XLogRecord *WALrec)
 	}
 
 	WDrec->blocks[0].file_loc = file_loc;
-	BlockIdSet(&(WDrec->current_t_ctid.ip_blkid), blk_num);
+	memcpy(&(WDrec->current_t_ctid.ip_blkid), &blk_num, sizeof(BlockNumber));
   	WDrec->current_t_ctid.ip_posid = offnum;
 
 	hash_key = GetHashKeyOfWALDIFFRecord(WDrec);
@@ -684,7 +684,7 @@ second_passage(XLogRecPtr *last_checkpoint)
 				*last_checkpoint = writer->already_written + writer->first_page_addr;
 			}
 			else if (WALrec->xl_info == XLOG_SWITCH)
-				ereport(LOG, errmsg("meet SWITCH record at position %X/%X", LSN_FORMAT_ARGS(raw_reader->first_page_addr + raw_reader->wal_seg.last_processed_record)));
+				ereport(LOG, errmsg("meet SWITCH record at position %X/%X", LSN_FORMAT_ARGS(raw_reader->wal_seg.last_processed_record)));
 		}
 
 		/* Now we reckon that hash_table contains only HEAP records (INSERT, UPDATE, DELETE)

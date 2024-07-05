@@ -262,10 +262,10 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 		if (writer->already_written == SizeOfXLogLongPHD && writer->waldiff_seg.segno == 1)
 			record_hdr->xl_prev = 0;
 		else
-			record_hdr->xl_prev = writer->waldiff_seg.last_processed_record + writer->first_page_addr;
+			record_hdr->xl_prev = writer->waldiff_seg.last_processed_record;
 
 
-		writer->waldiff_seg.last_processed_record = writer->already_written;
+		writer->waldiff_seg.last_processed_record = writer->already_written + writer->first_page_addr;
 
 		if (record_hdr->xl_rmid == RM_XLOG_ID)
 		{
@@ -274,7 +274,7 @@ WALDIFFWriteRecord(WALDIFFWriterState *writer, char *record)
 			{
 				// CheckPoint* checkpoint_record = (CheckPoint*) (record + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderShort);
 
-				writer->waldiff_seg.last_checkpoint = writer->waldiff_seg.last_processed_record + writer->first_page_addr;
+				writer->waldiff_seg.last_checkpoint = writer->waldiff_seg.last_processed_record;
 				memcpy(record + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderShort, (void*)& writer->waldiff_seg.last_checkpoint, sizeof(XLogRecPtr));
 
 				ereport(LOG, errmsg("NEW LAST CHECKPOINT : %X/%X", LSN_FORMAT_ARGS(writer->waldiff_seg.last_checkpoint)));

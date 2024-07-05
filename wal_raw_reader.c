@@ -266,7 +266,7 @@ WALSkipRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 				return WALSKIP_EOF;
 			
 			record = (XLogRecord*) raw_reader->tmp_buffer;
-			raw_reader->wal_seg.last_processed_record = raw_reader->already_read;
+			raw_reader->wal_seg.last_processed_record = raw_reader->already_read + raw_reader->first_page_addr - SizeOfXLogRecord;
 
 			/*
 			 * Record may not fit on the rest of the current page
@@ -394,7 +394,7 @@ WALReadRawRecord(WALRawReaderState *raw_reader, XLogRecord *target)
 				return WALREAD_EOF;
 			
 			record = (XLogRecord*) raw_reader->tmp_buffer;
-			raw_reader->wal_seg.last_processed_record = raw_reader->already_read;
+			raw_reader->wal_seg.last_processed_record = raw_reader->already_read + raw_reader->first_page_addr - SizeOfXLogRecord;
 
 			Assert(record->xl_tot_len >= 0);
 
