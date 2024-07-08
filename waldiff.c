@@ -51,7 +51,7 @@ void WalCloseSegment(XLogReaderState *reader);
 
 /* This three fuctions returns palloced struct */
 static WALDIFFRecord fetch_insert(XLogReaderState *record);
-static WALDIFFRecord fetch_update(XLogReaderState *record);
+static WALDIFFRecord fetch_hot_update(XLogReaderState *record);
 static WALDIFFRecord fetch_delete(XLogReaderState *record);
 
 static void free_waldiff_record(WALDIFFRecord record);
@@ -445,10 +445,10 @@ first_passage(int wal_segment_size, XLogReaderPrivate *reader_private)
 					Assert(entry->key == hash_key);
 					break;
 
-				case XLOG_HEAP_UPDATE:
-					WDrec = fetch_update(reader_state);
+				case XLOG_HEAP_HOT_UPDATE:
+					WDrec = fetch_hot_update(reader_state);
 					if (WDrec == NULL)
-						ereport(ERROR, errmsg("fetch_update failed"));
+						ereport(ERROR, errmsg("fetch_hot_update failed"));
 
 					/*
 					 * Inform raw_reader, that this lsn must be skipped in second passage
@@ -560,7 +560,7 @@ find_hash_key_from_raw_record(XLogRecord *WALrec)
 	WDrec->type = WALrec->xl_info & XLOG_HEAP_OPMASK;
 
 	Assert(WDrec->type == XLOG_HEAP_INSERT || 
-			WDrec->type == XLOG_HEAP_UPDATE ||
+			WDrec->type == XLOG_HEAP_HOT_UPDATE ||
 			WDrec->type == XLOG_HEAP_DELETE);
 
 	while(true) 
@@ -624,7 +624,7 @@ find_hash_key_from_raw_record(XLogRecord *WALrec)
 			offnum = main_data->offnum;
 			break;
 		}
-		case XLOG_HEAP_UPDATE:
+		case XLOG_HEAP_HOT_UPDATE:
 		{
 			xl_heap_update *main_data = (xl_heap_update *) curr_ptr;
 			offnum = main_data->new_offnum;
@@ -692,7 +692,7 @@ second_passage(XLogRecPtr *last_checkpoint)
 		/* firstly check in hash map*/
 		if (WALrec->xl_rmid == RM_HEAP_ID &&
 		   ( (WALrec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_INSERT || 
-			 (WALrec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_UPDATE ||
+			 (WALrec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_HOT_UPDATE ||
 			 (WALrec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_DELETE ))
 		{
 			HTABElem *entry;
@@ -996,7 +996,7 @@ fetch_insert(XLogReaderState *record)
 }
 
 /*
- * fetch_update
+ * fetch_hot_update
  * 
  * Backup blk 0: new page
  *
@@ -1009,14 +1009,12 @@ fetch_insert(XLogReaderState *record)
  *
  * If XLH_UPDATE_CONTAINS_NEW_TUPLE flag is given, the tuple data is
  * included even if a full-page image was taken.
- *
- * Backup blk 1: old page, if different. (no data, just a reference to the blk)
  */
 WALDIFFRecord 
-fetch_update(XLogReaderState *record)
+fetch_hot_update(XLogReaderState *record)
 {
-	/* HEAP_UPDATE contains two blocks */
-	WALDIFFRecord WDrec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord + 2 * sizeof(WALDIFFBlock));
+	/* HEAP_HOT_UPDATE contains two blocks */
+	WALDIFFRecord WDrec = (WALDIFFRecord) palloc0(SizeOfWALDIFFRecord + sizeof(WALDIFFBlock));
 	XLogRecordBlockHeader blk_hdr;
 	char *block_data;
 	Size block_data_len;
@@ -1026,7 +1024,7 @@ fetch_update(XLogReaderState *record)
 				old_blknum;
 	xl_heap_update *main_data = (xl_heap_update *) XLogRecGetData(record);
 
-	WDrec->type = XLOG_HEAP_UPDATE;
+	WDrec->type = XLOG_HEAP_HOT_UPDATE;
 
 	/* Copy lsn */
 	WDrec->lsn = record->record->lsn;
@@ -1040,15 +1038,16 @@ fetch_update(XLogReaderState *record)
 	WDrec->t_cid = FirstCommandId;
 
 	XLogRecGetBlockTag(record, 0, &rel_file_locator, &forknum, &new_blknum);
-	if (!XLogRecGetBlockTagExtended(record, 1, NULL, NULL, &old_blknum, NULL))
-		old_blknum = new_blknum;
+	Assert(! XLogRecHasBlockRef(record, 1));
+	Assert(! XLogRecGetBlockTagExtended(record, 1, NULL, NULL, &old_blknum, NULL));
+	old_blknum = new_blknum;
 
 	/* 
 	 * Copy tuple's version pointers
 	 */
 	ItemPointerSetBlockNumber(&(WDrec->current_t_ctid), new_blknum);
     ItemPointerSetOffsetNumber(&(WDrec->current_t_ctid), main_data->new_offnum);
-	ItemPointerSetBlockNumber(&(WDrec->prev_t_ctid), old_blknum);
+	ItemPointerSetBlockNumber(&(WDrec->prev_t_ctid), old_blknum); /* old_blknum = new_blknum */
     ItemPointerSetOffsetNumber(&(WDrec->prev_t_ctid), main_data->old_offnum);
 
 	/* Copy main data */
@@ -1059,7 +1058,7 @@ fetch_update(XLogReaderState *record)
 	/* Copy block data */
 	block_data = XLogRecGetBlockData(record, 0, &block_data_len);
 
-	WDrec->max_block_id = 1;
+	WDrec->max_block_id = 0;
 
 	/* Block 0 */
 	blk_hdr.id = 0;
@@ -1076,17 +1075,6 @@ fetch_update(XLogReaderState *record)
 	WDrec->blocks[0].block_data = (char*) palloc0(block_data_len);
 	memcpy(WDrec->blocks[0].block_data, block_data, block_data_len);
 	WDrec->blocks[0].block_data_len = block_data_len;
-
-	/* Block 1 */
-	memset((void*)&blk_hdr, 0, SizeOfXLogRecordBlockHeader);
-	blk_hdr.id = 1;
-	blk_hdr.fork_flags = record->record->blocks[1].flags;
-	blk_hdr.data_length = 0;
-
-	WDrec->blocks[1].blk_hdr = blk_hdr;
-	WDrec->blocks[1].blknum = old_blknum;
-	WDrec->blocks[1].has_data = false;
-	Assert(!XLogRecHasBlockData(record, 1));
 
 	if (main_data->flags & XLH_UPDATE_PREFIX_FROM_OLD || main_data->flags & XLH_UPDATE_SUFFIX_FROM_OLD)
 		Assert(new_blknum == old_blknum);
@@ -1159,7 +1147,7 @@ fetch_delete(XLogReaderState *record)
 
 static void free_waldiff_record(WALDIFFRecord record)
 {
-	if (record->type == XLOG_HEAP_INSERT || record->type == XLOG_HEAP_UPDATE)
+	if (record->type == XLOG_HEAP_INSERT || record->type == XLOG_HEAP_HOT_UPDATE)
 		pfree(record->blocks[0].block_data);
 
 	pfree(record->main_data);
@@ -1178,10 +1166,8 @@ static void copy_waldiff_record(WALDIFFRecord* dest, WALDIFFRecord src)
 	Assert(*dest == NULL);
 	Assert(src != NULL);
 
-	if (src->type == XLOG_HEAP_INSERT || src->type == XLOG_HEAP_DELETE)
+	if (src->type == XLOG_HEAP_INSERT || src->type == XLOG_HEAP_DELETE || src->type == XLOG_HEAP_HOT_UPDATE)
 		num_blocks = 1;
-	else if (src->type == XLOG_HEAP_UPDATE)
-		num_blocks = 2;
 
 	Assert(num_blocks != 0);
 
@@ -1196,7 +1182,7 @@ static void copy_waldiff_record(WALDIFFRecord* dest, WALDIFFRecord src)
 		memcpy((void*)& (*dest)->blocks[i], (void*)&src->blocks[i], sizeof(WALDIFFBlock));
 		
 		if (src->type == XLOG_HEAP_DELETE || 
-			(src->type == XLOG_HEAP_UPDATE && (i > 0) ) )
+			src->type == XLOG_HEAP_HOT_UPDATE)
 			continue;
 
 		(*dest)->blocks[i].block_data = (char*) palloc0(sizeof(char) * src->blocks[i].block_data_len);
@@ -1237,8 +1223,8 @@ overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
 	char* 			prev_tup_block_data 	  = (char*) prev_tup->blocks[0].block_data;
 	xl_heap_header* prev_tup_xl_hdr;
 
-	Assert(curr_tup->type == XLOG_HEAP_UPDATE);
-	Assert(prev_tup->type == XLOG_HEAP_UPDATE || prev_tup->type == XLOG_HEAP_INSERT);
+	Assert(curr_tup->type == XLOG_HEAP_HOT_UPDATE);
+	Assert(prev_tup->type == XLOG_HEAP_HOT_UPDATE || prev_tup->type == XLOG_HEAP_INSERT);
 
 	/*
 	 * block 0 data of update tuple looks like this : 
@@ -1289,7 +1275,7 @@ overlay_update(WALDIFFRecord prev_tup, WALDIFFRecord curr_tup)
 
 		memcpy(prev_tup_block_data + curr_tup_prefix_len, curr_tup_block_data, curr_tup_user_data_len);
 	}
-	else if (prev_tup->type == XLOG_HEAP_UPDATE)
+	else if (prev_tup->type == XLOG_HEAP_HOT_UPDATE)
 	{
 		uint16 			prev_tup_prefix_len  	  = 0;
 		uint16 			prev_tup_suffix_len 	  = 0;
@@ -1642,23 +1628,17 @@ constructWALDIFF(WALDIFFRecord WDrec)
 			 * BlockNumber_0 + 
 			 * ((If XLH_UPDATE_PREFIX_FROM_OLD or XLH_UPDATE_SUFFIX_FROM_OLD flags are set)
 			 * prefix + suffix + xl_heap_header + tuple data) +
-			 * XLogRecordBlockHeader_1 + BlockNumber_1 +
 			 * XLogRecordDataHeader[Short|Long] +
 			 * block_data_0 + main_data(xl_heap_update)
 			 * 
-			 * block 0: new page
-			 * block 1: old page, if different. (no data, just a reference to the blk)
-			 * [ As I got it, block 1 = header1 + blockNo1, and main_data contains offset to
-			 * old tuple in this blockNo1 ]
+			 * [ main_data contains offset to the old tuple in this blockNo0 ]
 			 */
-			case XLOG_HEAP_UPDATE:
+			case XLOG_HEAP_HOT_UPDATE:
 			{
 				WALDIFFBlock block_0;
-				WALDIFFBlock block_1;
 				
-				Assert(WDrec->max_block_id == 1);
+				Assert(WDrec->max_block_id == 0);
 				block_0 = WDrec->blocks[0];
-				block_1 = WDrec->blocks[1];
 
 				/* XLogRecordBlockHeader 0 */
 				memcpy(record + rec_tot_len, &(block_0.blk_hdr), SizeOfXLogRecordBlockHeader);
@@ -1673,21 +1653,6 @@ constructWALDIFF(WALDIFFRecord WDrec)
 
 				/* BlockNumber 0 */
 				memcpy(record + rec_tot_len, &(block_0.blknum), sizeof(BlockNumber));
-				rec_tot_len += sizeof(BlockNumber);
-
-				/* XLogRecordBlockHeader 1 */
-				memcpy(record + rec_tot_len, &(block_1.blk_hdr), SizeOfXLogRecordBlockHeader);
-				rec_tot_len += SizeOfXLogRecordBlockHeader;
-
-				if (!(block_1.blk_hdr.fork_flags & BKPBLOCK_SAME_REL))
-				{
-					/* RelFileLocator 1 */
-					memcpy(record + rec_tot_len, &(block_1.file_loc), sizeof(RelFileLocator));
-					rec_tot_len +=  sizeof(RelFileLocator);
-				}
-
-				/* BlockNumber 1 */
-				memcpy(record + rec_tot_len, &(block_1.blknum), sizeof(BlockNumber));
 				rec_tot_len += sizeof(BlockNumber);
 
 				/* XLogRecordDataHeader[Short|Long] */
