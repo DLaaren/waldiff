@@ -23,8 +23,6 @@
 #define PLUG_REDIRECT       0x01
 #define XLOG_TEST_CUSTOM_RMGRS_MESSAGE	0x00
 
-extern RmgrData waldiff_rmgr;
-
 extern void 		waldiff_rmgr_redo(XLogReaderState *record);
 extern void 		waldiff_rmgr_desc(StringInfo buf, XLogReaderState *record);
 extern const char* 	waldiff_rmgr_identify(uint8 info);

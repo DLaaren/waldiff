@@ -2,10 +2,12 @@
 
 MODULE_big = waldiff
 OBJS = \
+	waldiff_rmgr.o \
 	waldiff.o \
 	waldiff_writer.o \
 	wal_raw_reader.o \
-	waldiff_test.o
+	waldiff_test.o 
+	
 PGFILEDESC = "waldiff - archive module with compressing"
 
 NO_INSTALLCHECK = 1

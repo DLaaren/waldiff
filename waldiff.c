@@ -2,6 +2,7 @@
 #include "waldiff_writer.h"
 #include "wal_raw_reader.h"
 #include "waldiff_test.h"
+#include "waldiff_rmgr.h"
 
 PG_MODULE_MAGIC;
 
@@ -1737,47 +1738,47 @@ constructWALDIFF(WALDIFFRecord WDrec)
  * 		[XLogRecord] + [XLogRecordBlockHeader] + 
  * 		[RelFileLocator] + [BlockNumber] + [block_data = waldiff_rmgr_plug]
  */
-char *
-construct_plug(char *record, bool isFirst) /* TODO определиться где вызывается и дописать как надо*/
-{
-	XLogRecord *replaced_rec = (XLogRecord *)record;
-	XLogRecord *plug_rec = palloc0(SizeOfXLogRecord + SizeOfXLogRecordBlockHeader +
-								   sizeof(RelFileLocator) + sizeof(BlockNumber) +
-								   sizeof(waldiff_rmgr_plug));
-	XLogRecordBlockHeader *block = (XLogRecordBlockHeader *) ((char *)plug_rec + SizeOfXLogRecordBlockHeader);
-	RelFileLocator *rel_file_loc = (RelFileLocator *) ((char *)block + SizeOfXLogRecordBlockHeader);
-	BlockNumber *blknum = (BlockNumber *) ((char *)rel_file_loc + sizeof(RelFileLocator));
-	waldiff_rmgr_plug *block_data = (waldiff_rmgr_plug *) ((char *)blknum + sizeof(BlockNumber));
-	Size rec_tot_len = 0;
+// char *
+// construct_plug(char *record, bool isFirst) /* TODO определиться где вызывается и дописать как надо*/
+// {
+// 	XLogRecord *replaced_rec = (XLogRecord *)record;
+// 	XLogRecord *plug_rec = palloc0(SizeOfXLogRecord + SizeOfXLogRecordBlockHeader +
+// 								   sizeof(RelFileLocator) + sizeof(BlockNumber) +
+// 								   sizeof(waldiff_rmgr_plug));
+// 	XLogRecordBlockHeader *block = (XLogRecordBlockHeader *) ((char *)plug_rec + SizeOfXLogRecordBlockHeader);
+// 	RelFileLocator *rel_file_loc = (RelFileLocator *) ((char *)block + SizeOfXLogRecordBlockHeader);
+// 	BlockNumber *blknum = (BlockNumber *) ((char *)rel_file_loc + sizeof(RelFileLocator));
+// 	waldiff_rmgr_plug *block_data = (waldiff_rmgr_plug *) ((char *)blknum + sizeof(BlockNumber));
+// 	Size rec_tot_len = 0;
 
-	Assert(replaced_rec->xl_rmid == RM_HEAP_ID);
-	Assert(replaced_rec);
+// 	Assert(replaced_rec->xl_rmid == RM_HEAP_ID);
+// 	Assert(replaced_rec);
 
-	plug_rec->xl_info = WALDIFF_RMGR_PLUG;
-	plug_rec->xl_rmid = WALDIFF_RM_ID;
-	plug_rec->xl_tot_len =  SizeOfXLogRecord + SizeOfXLogRecordBlockHeader +
-							sizeof(RelFileLocator) + sizeof(BlockNumber) +
-							sizeof(waldiff_rmgr_plug);
-	rec_tot_len += SizeOfXLogRecord;
+// 	plug_rec->xl_info = WALDIFF_RMGR_PLUG;
+// 	plug_rec->xl_rmid = WALDIFF_RM_ID;
+// 	plug_rec->xl_tot_len =  SizeOfXLogRecord + SizeOfXLogRecordBlockHeader +
+// 							sizeof(RelFileLocator) + sizeof(BlockNumber) +
+// 							sizeof(waldiff_rmgr_plug);
+// 	rec_tot_len += SizeOfXLogRecord;
 
-	block->id = 0;
-	block->data_length = sizeof(waldiff_rmgr_plug);
-	rec_tot_len += SizeOfXLogRecordBlockHeader;
+// 	block->id = 0;
+// 	block->data_length = sizeof(waldiff_rmgr_plug);
+// 	rec_tot_len += SizeOfXLogRecordBlockHeader;
 
-	rel_file_loc = ;
-	rec_tot_len += sizeof(RelFileLocator);
+// 	rel_file_loc = ;
+// 	rec_tot_len += sizeof(RelFileLocator);
 
-	blknum = ;
-	rec_tot_len += sizeof(BlockNumber);
+// 	blknum = ;
+// 	rec_tot_len += sizeof(BlockNumber);
 
-	block_data->offset = ;
-	block_data->flag = ;
-	rec_tot_len += sizeof(waldiff_rmgr_plug);
+// 	block_data->offset = ;
+// 	block_data->flag = ;
+// 	rec_tot_len += sizeof(waldiff_rmgr_plug);
 
-	Assert(plug_rec->xl_tot_len == rec_tot_len);
+// 	Assert(plug_rec->xl_tot_len == rec_tot_len);
 
-	return (char *) plug_rec;
-}
+// 	return (char *) plug_rec;
+// }
 
 
 /*

@@ -1,6 +1,6 @@
 #include "waldiff_rmgr.h"
 
-OffsetNumber
+static OffsetNumber
 PageAddPlugExtended(Page page,
 					waldiff_rmgr_plug *plug,
 					Size size,
@@ -105,7 +105,7 @@ PageAddPlugExtended(Page page,
 	return offsetNumber;
 }
 
-void
+static void
 waldiff_redo_plug(XLogReaderState *record)
 {   
     Buffer            buffer;

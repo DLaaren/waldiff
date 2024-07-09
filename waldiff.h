@@ -40,8 +40,6 @@
 #include "utils/hsearch.h"
 #include "utils/wait_event.h"
 
-#include "waldiff_rmgr.h"
-
 #define MAX_ERRORMSG_LEN 1024
 #define MAX_COLUMNS_NUM  1600 /* maximum number of columns in postgresql table */
 

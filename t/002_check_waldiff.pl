@@ -21,6 +21,7 @@ $node->init();
 $node->append_conf(
     'postgresql.conf', 
     q{
+        shared_preload_libraries = 'waldiff'
         wal_level = 'replica'
         archive_mode = 'on'
         archive_library = 'waldiff'

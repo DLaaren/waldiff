@@ -19,12 +19,13 @@ $node->init;
 
 $node->append_conf(
     'postgresql.conf', 
-    q{
+    q(
+        shared_preload_libraries = 'waldiff'
         wal_level = replica
         archive_mode = on
         archive_library = 'waldiff'
         waldiff.waldiff_dir = 'waldiff'
-    }
+    )
 );
 
 # Start the PostgreSQL server
