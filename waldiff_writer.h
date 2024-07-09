@@ -99,8 +99,8 @@ extern void WALDIFFBeginWrite(WALDIFFWriterState *state,
 							  TimeLineID tli,
 							  int flags);
 
-extern int write_data_to_file(WALDIFFWriterState* writer, char* data, uint64 data_size);
-void WALDIFFFinishWithZeros(WALDIFFWriterState *writer);
+extern int write_data_to_file(WALDIFFWriterState *writer, char *data, uint64 data_size);
+extern void WALDIFFFinishWithZeros(WALDIFFWriterState *writer);
 
 /*
  * Declaration of WALDIFFWriterState routine implementations

@@ -45,17 +45,6 @@
 #define MAX_ERRORMSG_LEN 1024
 #define MAX_COLUMNS_NUM  1600 /* maximum number of columns in postgresql table */
 
-RmgrData waldiff_rmgr = {
-	.rm_name = WALDIFF_RM_NAME,
-	.rm_redo = waldiff_rmgr_redo,
-	.rm_desc = waldiff_rmgr_desc,
-	.rm_identify = waldiff_rmgr_identify,
-	.rm_startup = NULL,
-	.rm_cleanup = NULL,
-	.rm_mask = NULL,
-	.rm_decode = NULL
-};
-
 /* Structure with old and new contexts */
 typedef struct MemoryContextStorage
 {

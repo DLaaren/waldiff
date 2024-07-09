@@ -2,7 +2,7 @@
 
 OffsetNumber
 PageAddPlugExtended(Page page,
-					Item item,
+					waldiff_rmgr_plug *plug,
 					Size size,
 					OffsetNumber offsetNumber,
 					int flags)
@@ -86,8 +86,17 @@ PageAddPlugExtended(Page page,
 		memmove(itemId + 1, itemId,
 				(limit - offsetNumber) * sizeof(ItemIdData));
 
-	/* set the line pointer */
-	ItemIdSetNormal(itemId, upper, size);
+	itemId->lp_flags = flags;
+	if (itemId->lp_flags == LP_REDIRECT)
+	{
+		itemId->lp_len = 0;
+		itemId->lp_off = plug->offset;
+	}
+	else if (itemId->lp_flags == LP_NORMAL)
+	{
+		itemId->lp_len = 0;
+		itemId->lp_off = 0;
+	}
 
     /* adjust page header */
 	phdr->pd_lower = (LocationIndex) lower;
@@ -106,6 +115,7 @@ waldiff_redo_plug(XLogReaderState *record)
 	BlockNumber       blkno;
 	waldiff_rmgr_plug *block_data;
     Size              block_data_len;
+	int 			  flag;
     ItemPointerData   target_tid;
 	XLogRedoAction    action;
     Size		      freespace = 0;
@@ -118,6 +128,7 @@ waldiff_redo_plug(XLogReaderState *record)
 
 	ItemPointerSetBlockNumber(&target_tid, blkno);
 	ItemPointerSetOffsetNumber(&target_tid, block_data->offset);
+	flag = block_data->flag;
 
     action = XLogReadBufferForRedo(record, 0, &buffer);
     if (action == BLK_NEEDS_REDO)
@@ -127,9 +138,19 @@ waldiff_redo_plug(XLogReaderState *record)
         if (PageGetMaxOffsetNumber(page) + 1 <  block_data->offset)
 			elog(PANIC, "invalid max offset number");
 
-        if (PageAddPlugExtended(page, block_data, sizeof(waldiff_rmgr_plug), 
-                                block_data->offset, 0) == InvalidOffsetNumber)
-			elog(PANIC, "failed to add tuple");
+		if (flag == PLUG_NORMAL)
+		{
+			if (PageAddPlugExtended(page, block_data, sizeof(waldiff_rmgr_plug), 
+									block_data->offset, LP_NORMAL) == InvalidOffsetNumber)
+				elog(PANIC, "failed to add tuple");
+		}
+		else if (flag == PLUG_REDIRECT)
+		{
+			if (PageAddPlugExtended(page, block_data, sizeof(waldiff_rmgr_plug), 
+									block_data->offset, LP_REDIRECT) == InvalidOffsetNumber)
+				elog(PANIC, "failed to add tuple");
+		}
+
 
         PageSetLSN(page, lsn);
 

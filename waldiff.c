@@ -34,6 +34,16 @@ typedef struct XLogReaderPrivate
 	bool		endptr_reached;
 } XLogReaderPrivate;
 
+RmgrData waldiff_rmgr = {
+	.rm_name = WALDIFF_RM_NAME,
+	.rm_redo = waldiff_rmgr_redo,
+	.rm_desc = waldiff_rmgr_desc,
+	.rm_identify = waldiff_rmgr_identify,
+	.rm_startup = NULL,
+	.rm_cleanup = NULL,
+	.rm_mask = NULL,
+	.rm_decode = NULL
+};
 
 /* Forward declaration */
 static void waldiff_startup(ArchiveModuleState *reader);
@@ -65,6 +75,7 @@ static void second_passage(XLogRecPtr *last_checkpoint);
 static void write_main_data_hdr(char* record, uint32 total_rec_len, uint32* current_rec_len);
 static int getWALsegsize(const char *WALpath);											 
 static char *constructWALDIFF(WALDIFFRecord WDrec);
+static char *construct_plug();
 // do we need this?
 // need to check how postgres deal with not full WAL segment
 static void finishWALDIFFSegment(WALDIFFWriterState *writer);
@@ -1720,6 +1731,54 @@ constructWALDIFF(WALDIFFRecord WDrec)
 
 	return record;
 }
+
+/*
+ * PLUG record =
+ * 		[XLogRecord] + [XLogRecordBlockHeader] + 
+ * 		[RelFileLocator] + [BlockNumber] + [block_data = waldiff_rmgr_plug]
+ */
+char *
+construct_plug(char *record, bool isFirst) /* TODO определиться где вызывается и дописать как надо*/
+{
+	XLogRecord *replaced_rec = (XLogRecord *)record;
+	XLogRecord *plug_rec = palloc0(SizeOfXLogRecord + SizeOfXLogRecordBlockHeader +
+								   sizeof(RelFileLocator) + sizeof(BlockNumber) +
+								   sizeof(waldiff_rmgr_plug));
+	XLogRecordBlockHeader *block = (XLogRecordBlockHeader *) ((char *)plug_rec + SizeOfXLogRecordBlockHeader);
+	RelFileLocator *rel_file_loc = (RelFileLocator *) ((char *)block + SizeOfXLogRecordBlockHeader);
+	BlockNumber *blknum = (BlockNumber *) ((char *)rel_file_loc + sizeof(RelFileLocator));
+	waldiff_rmgr_plug *block_data = (waldiff_rmgr_plug *) ((char *)blknum + sizeof(BlockNumber));
+	Size rec_tot_len = 0;
+
+	Assert(replaced_rec->xl_rmid == RM_HEAP_ID);
+	Assert(replaced_rec);
+
+	plug_rec->xl_info = WALDIFF_RMGR_PLUG;
+	plug_rec->xl_rmid = WALDIFF_RM_ID;
+	plug_rec->xl_tot_len =  SizeOfXLogRecord + SizeOfXLogRecordBlockHeader +
+							sizeof(RelFileLocator) + sizeof(BlockNumber) +
+							sizeof(waldiff_rmgr_plug);
+	rec_tot_len += SizeOfXLogRecord;
+
+	block->id = 0;
+	block->data_length = sizeof(waldiff_rmgr_plug);
+	rec_tot_len += SizeOfXLogRecordBlockHeader;
+
+	rel_file_loc = ;
+	rec_tot_len += sizeof(RelFileLocator);
+
+	blknum = ;
+	rec_tot_len += sizeof(BlockNumber);
+
+	block_data->offset = ;
+	block_data->flag = ;
+	rec_tot_len += sizeof(waldiff_rmgr_plug);
+
+	Assert(plug_rec->xl_tot_len == rec_tot_len);
+
+	return (char *) plug_rec;
+}
+
 
 /*
  * If we met SWITCH record before, we must store it in the end of waldiff file

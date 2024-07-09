@@ -18,7 +18,9 @@
 
 #define WALDIFF_RM_ID       RM_EXPERIMENTAL_ID
 #define WALDIFF_RM_NAME     "waldiff_rmgr"
-#define WALDIFF_RMGR_PLUG   0x00
+#define WALDIFF_RMGR_PLUG   0x01
+#define PLUG_NORMAL         0x00
+#define PLUG_REDIRECT       0x01
 #define XLOG_TEST_CUSTOM_RMGRS_MESSAGE	0x00
 
 extern RmgrData waldiff_rmgr;
