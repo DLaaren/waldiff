@@ -113,6 +113,8 @@ _hash_combine(uint32_t seed, uint32_t value)
 void 
 _PG_init(void)
 {
+	RegisterCustomRmgr(WALDIFF_RM_ID, &waldiff_rmgr);
+	
 	DefineCustomStringVariable("waldiff.waldiff_dir",
 							   "WALDIFF destination directory",
 							   NULL,
