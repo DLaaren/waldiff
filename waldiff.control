@@ -1,6 +1,0 @@
-# waldiff extension
-comment = 'creates waldiff segment based on wal segment'
-default_version = '1.0'
-module_pathname = '$libdir/waldiff'
-relocatable = true
-trusted = true

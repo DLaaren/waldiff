@@ -1,8 +1,5 @@
 waldiff_sources = files(
   'waldiff.c',
-  'waldiff.c',
-	'waldiff_writer.c',
-	'waldiff_test.c',
 )
 
 if host_system == 'windows'
