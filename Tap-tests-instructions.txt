@@ -1,5 +1,0 @@
-Небольшая инструкция как запускать tap тесты
-
-./configure --enable-tap-tests
-sudo make && sudo make install
-make check PROVE_TESTS='t/<name>.pl'
