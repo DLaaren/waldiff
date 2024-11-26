@@ -3,11 +3,13 @@
 MODULE_big = waldiff
 OBJS = \
 	$(WIN32RES) \
-	waldiff.o
+	waldiff.o	\
+	waldiff_writer.o
 	
 PGFILEDESC = "waldiff - archive module with compressing"
 
-HEADERS = waldiff.h
+HEADERS = waldiff.h \
+		  waldiff_writer.h
 
 TAP_TESTS = 1
 

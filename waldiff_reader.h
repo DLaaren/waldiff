@@ -1,12 +1,12 @@
 /*-------------------------------------------------------------------------
  *
- * waldiff_writer.h
- *	  Definitions for the WALDIFF writing facility
+ * waldiff_reader.h
+ *	  Definitions for the WALDIFF reading facility
  * 
  *-------------------------------------------------------------------------
  */
-#ifndef _WALDIFF_WRITER_H_
-#define _WALDIFF_WRITER_H_
+#ifndef _WALDIFF_READER_H_
+#define _WALDIFF_READER_H_
 
 #include "postgres.h"
 
@@ -48,35 +48,31 @@
 #include "commands/dbcommands.h"
 #include "postmaster/bgworker.h"
 
-typedef struct WaldiffWriter {
+#include "waldiff.h"
+
+typedef struct WaldiffReader {
 	WALOpenSegment seg;
 	WALSegmentContext segcxt;
-	uint64 sysid;
 
-	XLogRecPtr	WriteRecPtr;		/* end+1 of last written record */
+	XLogRecPtr	ReadRecPtr;		/* end+1 of last read record */
 
-	char *writeBuf;
-	Offset writeBufSize;
+	char *readBuf;
+	Offset readBufSize;
 
-	char	   *writeRestRecordBuf;		/* used when a record crosses a page boundary*/
-	uint32		writeRestRecordBufSize;
-} WaldiffWriter;
+	char	   *readRestRecordBuf;		/* used when a record crosses a page boundary*/
+	uint32		readRestRecordBufSize;
+} WaldiffReader;
 
 
-extern WaldiffWriter *
-WaldiffWriterAllocate(int wal_segment_size, char *waldiff_dir);
+extern WaldiffReader *WaldiffReaderAllocate(char *wal_dir, 
+											int wal_segment_size);
 
-extern void 
-WaldiffWriterFree(WaldiffWriter *writer);
+extern void WaldiffReaderFree(WaldiffReader *reader);
 
 extern void 
-WaldiffBeginWriting(WaldiffWriter *writer, uint64 sysid, 
-					XLogSegNo segNo, TimeLineID tli);
+WaldiffBeginReading(WaldiffReader *reader, XLogSegNo segNo, TimeLineID tli);
 
 extern void 
-WaldiffWriterWrite(WaldiffWriter *writer, XLogRecord *record);
+WaldiffReaderRead(WaldiffReader *reader);
 
-// TODO
-#define WaldiffWriterFinishedSegment(writer) ()
-
-#endif /* _WALDIFF_WRITER_H_ */
+#endif /* _WALDIFF_READER_H_ */

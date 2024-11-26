@@ -48,32 +48,27 @@
 #include "commands/dbcommands.h"
 #include "postmaster/bgworker.h"
 
-#define WALDIFF_DEBUG
+#include "waldiff_writer.h"
+#include "waldiff_reader.h"
+#include "waldiff_decoding_encoding.h"
 
-/* Structure representing XLogRecord block data */
-typedef struct WALDIFFBlock {
-	
+/*--------------------------Public defines-------------------------*/
+typedef struct WaldiffBlock 
+{
 	XLogRecordBlockHeader blk_hdr;
 
-	/* Identify the block this refers to */
 	RelFileLocator file_loc;
 	ForkNumber	   forknum;
 	BlockNumber    blknum;
 
-	/* we are not working with images */
-
-	/* Buffer holding the rmgr-specific data associated with this block */
 	bool		has_data;
 	char	   *block_data;
 	uint16		block_data_len;
+} WaldiffBlock;
 
-} WALDIFFBlock;
-
-/* Structure representing folded WAL records */
-typedef struct WALDIFFRecordData
+typedef struct WaldiffRecordData
 {
-	uint32   		chain_length;
-	uint8 			type;
+	uint32   		chain_length; // for debug and test purposes
 
 	XLogRecPtr	    lsn;
 	XLogRecord      rec_hdr;	
@@ -84,27 +79,28 @@ typedef struct WALDIFFRecordData
 	 */
 	TransactionId   t_xmin;
 	TransactionId   t_xmax;
-	// TODO get t_cid from decoded record 
-	CommandId		t_cid;
 
 	/* Pointer to latest tuple version */
 	ItemPointerData current_t_ctid;
 	/* In delete/update case this is the pointer on deleted tuple version */
 	ItemPointerData prev_t_ctid;	
 
+	bool	has_main_data;
+	bool	is_long_header;
 	char   *main_data;
-	uint32 main_data_len;
+	uint32  main_data_len;
 
 	/* highest block_id (-1 if none) */
 	int          max_block_id;
-	WALDIFFBlock blocks[FLEXIBLE_ARRAY_MEMBER];
+	WaldiffBlock blocks[FLEXIBLE_ARRAY_MEMBER];
 
-} WALDIFFRecordData;
+} WaldiffRecordData;
 
-typedef WALDIFFRecordData *WALDIFFRecord;
+typedef WaldiffRecordData *WaldiffRecord;
 
-#define SizeOfWALDIFFRecord offsetof(WALDIFFRecordData, blocks)
-
+#define SizeOfWaldiffRecord offsetof(WaldiffRecordData, blocks)
+#define GetRecordLength(WaldiffRec) ((WaldiffRec)->rec_hdr.xl_tot_len)
+#define GetRecordType(WaldiffRec) ((WaldiffRec)->rec_hdr.xl_info & XLOG_HEAP_OPMASK)
 
 /*-------------------Functionality for hash keys-------------------*/
 #define ROTL32(x, y) ((x << y) | (x >> (32 - y)))
@@ -115,7 +111,7 @@ _hash_combine(uint32_t seed, uint32_t value)
     return seed ^ (ROTL32(value, 15) + 0x9e3779b9 + (seed << 6) + (seed >> 2));
 }
 
-#define GetHashKeyOfWALDIFFRecord(record) 													\
+#define GetHashKeyOfWaldiffRecord(record) 													\
 ({ 																							\
     uint32_t key = 0; 																		\
     key = _hash_combine(key, (record)->blocks[0].file_loc.spcOid); 							\
@@ -126,7 +122,7 @@ _hash_combine(uint32_t seed, uint32_t value)
     key + 1; 																				\
 })
 
-#define GetHashKeyOfPrevWALDIFFRecord(record) 											\
+#define GetHashKeyOfPrevWaldiffRecord(record) 											\
 ({ 																						\
     uint32_t key = 0; 																	\
     key = _hash_combine(key, (record)->blocks[0].file_loc.spcOid); 						\
@@ -135,28 +131,6 @@ _hash_combine(uint32_t seed, uint32_t value)
     key = _hash_combine(key, BlockIdGetBlockNumber(&((record)->prev_t_ctid.ip_blkid)));	\
     key = _hash_combine(key, (record)->prev_t_ctid.ip_posid); 							\
     key + 1; 																			\
-})
-
-#define GetHashKeyOfWALRecord(record) 															\
-({ 																								\
-    uint32_t key = 0; 																			\
-    key = _hash_combine(key, (record)->blocks[0].rlocator.spcOid); 								\
-    key = _hash_combine(key, (record)->blocks[0].rlocator.dbOid); 								\
-    key = _hash_combine(key, (record)->blocks[0].rlocator.relNumber); 							\
-    key = _hash_combine(key, (((record)->blocks[0].blkno)));									\
-	switch (record->header.xl_info & XLOG_HEAP_OPMASK)											\
-	{																							\
-		case XLOG_HEAP_INSERT:																	\
-			key = _hash_combine(key, ((xl_heap_insert *)((record)->main_data))->offnum); 	 	\
-			break;																				\
-		case XLOG_HEAP_HOT_UPDATE:																\
-			key = _hash_combine(key, ((xl_heap_update *)((record)->main_data))->new_offnum);	\
-			break;																				\
-		default:																				\
-			ereport(ERROR, errmsg("Unknown record type"));										\
-			break;																				\
-	}																							\
-    key + 1; 																					\
 })
 
 #endif /* _WALDIFF_H_ */
