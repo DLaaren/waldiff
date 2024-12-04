@@ -1,18 +1,18 @@
 #include "waldiff_reader.h"
 
-WaldiffReader *WaldiffReaderAllocate(char *wal_dir, 
-									 int wal_segment_size);
+static void 
+WaldiffOpenSegment(WaldiffReader *reader,
+			       XLogSegNo nextSegNo,
+			       TimeLineID *tli_p);
 
-void WaldiffReaderFree(WaldiffReader *reader);
+static void 
+WaldiffCloseSegment(WaldiffReader *reader);
 
-void 
-WaldiffBeginReading(WaldiffReader *reader, XLogSegNo segNo, TimeLineID tli);
+static void
+WaldiffReadToBuffer(WaldiffReader *reader);
 
-void 
-WaldiffReaderRead(WaldiffReader *reader);
-
-WALDIFFRecord
-WalDiffDecodeRecord(char *record, XLogRecPtr lsn);
+static void
+allocate_rest_record_buf(WaldiffReader *reader, uint32 reclength);
 
 
 WaldiffReader *
@@ -35,14 +35,29 @@ WaldiffReaderAllocate(char *wal_dir, int wal_segment_size)
 		return NULL;
 	}
 
+	reader->seg.ws_file = -1;
 	reader->ReadRecPtr = 0;
-	reader->readBufSize = 0;
+	reader->readBufSize = XLOG_BLCKSZ;
 	memcpy(reader->segcxt.ws_dir, wal_dir, strlen(wal_dir));
 	reader->segcxt.ws_segsize = wal_segment_size;  
 
 	allocate_rest_record_buf(reader, 0);
 	reader->readRestRecordBufSize = 0;
 	return reader;
+}
+
+static void
+allocate_rest_record_buf(WaldiffReader *reader, uint32 reclength)
+{
+	uint32		newSize = reclength;
+
+	newSize += XLOG_BLCKSZ - (newSize % XLOG_BLCKSZ);
+	newSize = Max(newSize, 5 * Max(BLCKSZ, XLOG_BLCKSZ));
+
+	if (reader->readRestRecordBuf)
+		pfree(reader->readRestRecordBuf);
+	reader->readRestRecordBuf = (char *) palloc(newSize);
+	reader->readRestRecordBufSize = newSize;
 }
 
 void 
@@ -56,31 +71,208 @@ WaldiffReaderFree(WaldiffReader *reader)
 }
 
 void 
-WaldiffBeginReading(WaldiffReader *reader, XLogSegNo segNo, TimeLineID tli)
+WaldiffBeginReading(WaldiffReader *reader, uint64 sysid, XLogSegNo segNo, TimeLineID tli)
 {
-    if (reader->seg.ws_file != -1)
-		WaldiffCloseSegment(reader);
+	WaldiffCloseSegment(reader);
 
-	Assert(reader->readBufSize == 0);
+	Assert(reader->readBufSize == XLOG_BLCKSZ);
 
 	XLogSegNoOffsetToRecPtr(segNo, 0, reader->segcxt.ws_segsize, reader->ReadRecPtr);
+	reader->sysid = sysid;
 
 	WaldiffOpenSegment(reader, segNo, &tli);
+	WaldiffReadToBuffer(reader);
 }
 
-void 
+/* Before the first reading WaldiffBeginReading() must be called
+   Returned record must be freed one day */
+XLogRecord * 
 WaldiffReaderRead(WaldiffReader *reader)
 {
-    
+    XLogRecord *record = NULL;
+	Offset currPos = 0;
+	XLogRecord  rec_hdr;
+	uint32 record_len = 0;
+	uint32 rest_rec_len = 0;
+	long int non_read_space;
+
 	// add validation of crc
+
+	while (true)
+	{
+		non_read_space = XLOG_BLCKSZ - MAXALIGN(reader->readBufSize);
+
+		// ereport(LOG, errmsg("curr lsn = %08X/%08X", LSN_FORMAT_ARGS(reader->ReadRecPtr + reader->readBufSize - DEFAULT_XLOG_SEG_SIZE)));
+
+		// if (reader->ReadRecPtr + reader->readBufSize - DEFAULT_XLOG_SEG_SIZE > 0x002E4000)
+			// ereport(ERROR, errmsg("READ function is called"));
+
+		// ereport(LOG, errmsg("non_read_space = %lu", non_read_space));
+		// ereport(LOG, errmsg("rest buf postion = %lu", reader->readRestRecordBufSize));
+
+		if (non_read_space == 0) 
+		{
+			WaldiffReadToBuffer(reader);
+			continue;
+		}
+
+		// ereport(LOG, errmsg("non_read_space = %lu", non_read_space));
+		// ereport(LOG, errmsg("rest buf postion = %lu", reader->readRestRecordBufSize));
+
+		if (reader->readBufSize == 0)
+		{
+			XLogPageHeader page_hdr = palloc(sizeof(XLogPageHeaderData));
+
+			memcpy(page_hdr, reader->readBuf, sizeof(XLogPageHeaderData));
+			
+			if (page_hdr->xlp_info & XLP_LONG_HEADER)
+			{
+				XLogLongPageHeader long_page_hdr = palloc(sizeof(XLogLongPageHeaderData));
+
+				memcpy(long_page_hdr, reader->readBuf, sizeof(XLogLongPageHeaderData));
+				reader->readBufSize += SizeOfXLogLongPHD;
+
+				Assert(long_page_hdr->xlp_seg_size == reader->segcxt.ws_segsize);
+				Assert(long_page_hdr->xlp_sysid == reader->sysid);
+
+				page_hdr = &(long_page_hdr->std);
+				// ereport(LOG, errmsg("LONG HDR"));
+				// ereport(LOG, errmsg("non_read_space = %lu", XLOG_BLCKSZ - MAXALIGN(reader->readBufSize)));
+			}
+			else
+			{
+				reader->readBufSize += SizeOfXLogShortPHD;
+				// ereport(LOG, errmsg("SHORT HDR"));
+				// ereport(LOG, errmsg("non_read_space = %lu", XLOG_BLCKSZ - MAXALIGN(reader->readBufSize)));
+			}
+
+			Assert(page_hdr->xlp_magic == XLOG_PAGE_MAGIC);
+			Assert(reader->seg.ws_tli == page_hdr->xlp_tli);
+			Assert(reader->ReadRecPtr - XLOG_BLCKSZ == page_hdr->xlp_pageaddr);
+
+			if (page_hdr->xlp_info & XLP_FIRST_IS_CONTRECORD)
+				rest_rec_len = page_hdr->xlp_rem_len;
+
+			Assert((page_hdr->xlp_info & XLP_FIRST_IS_CONTRECORD && rest_rec_len > 0) ||
+				   (!(page_hdr->xlp_info & XLP_FIRST_IS_CONTRECORD) && rest_rec_len == 0));
+		}
+
+		if (rest_rec_len > 0)
+		{
+			// ereport(LOG, errmsg("GOT the rest record from prev page: %u", rest_rec_len));
+
+			if (reader->readRestRecordBufSize == 0)
+			{
+				// пока забей, это возможно если мы начали читать не с самого налача вал сегменты
+				return NULL;
+			}
+
+			non_read_space = XLOG_BLCKSZ - MAXALIGN(reader->readBufSize);
+			if (rest_rec_len > non_read_space)
+			{
+				reader->readRestRecordBuf = 
+					repalloc_array(reader->readRestRecordBuf, 
+								   char, 
+								   reader->readRestRecordBufSize + non_read_space);
+
+				memcpy(reader->readRestRecordBuf + reader->readRestRecordBufSize,
+					   reader->readBuf + reader->readBufSize,
+					   non_read_space);
+				reader->readRestRecordBufSize += non_read_space;
+				reader->readBufSize +=	non_read_space;
+
+				rest_rec_len -= non_read_space;		
+
+				WaldiffReadToBuffer(reader);
+				// ereport(LOG, errmsg("First several bytes of the rest: %x", *((long *) (reader->readBuf + 24 + 4))));
+
+				continue;
+			}
+			else 
+			{
+				Assert(record != NULL);
+
+				memcpy((char *) record + currPos,  
+					   reader->readRestRecordBuf, 
+					   reader->readRestRecordBufSize);
+				currPos += reader->readRestRecordBufSize;
+
+				// for (int i = 0; i < record_len; i++)
+				// {
+				// 	ereport(LOG, errmsg("%x", (reader->readBuf + reader->readBufSize)[i]));
+				// }
+				// ereport(ERROR, errmsg("bye"));
+
+				// ereport(LOG, errmsg("currPos = %lu; readRestBufSize = %lu and rest_rec_len = %lu; record_len = %lu; readBufSize = %lu",
+									// currPos, reader->readRestRecordBufSize, rest_rec_len, record_len, reader->readBufSize));
+
+
+				// char a = *((char *) record + currPos);
+				// char b = *(reader->readBuf + reader->readBufSize);
+
+				memcpy((char *) record + currPos,  reader->readBuf + reader->readBufSize, rest_rec_len);
+				currPos += rest_rec_len;
+				
+				reader->readRestRecordBufSize = 0;
+				reader->readBufSize += MAXALIGN(rest_rec_len);
+
+				// ereport(LOG, errmsg("AGAIN: currPos = %lu; readBufSize = %lu and rest_rec_len = %lu; record_len = %lu; readBufSize = %lu",
+									// currPos, reader->readRestRecordBufSize, rest_rec_len, record_len, reader->readBufSize));
+
+				break;
+			}
+		}
+
+		if (record == NULL)
+		{
+			memcpy(&rec_hdr, reader->readBuf + reader->readBufSize, SizeOfXLogRecord);
+
+			// ereport(LOG, errmsg("curr lsn = %08X/%08X", LSN_FORMAT_ARGS(reader->ReadRecPtr + reader->readBufSize - XLOG_BLCKSZ)));
+
+			// ereport(LOG, errmsg("rec_hdr.tot_len %lx; rec_hdr.prev %08X/%08X", rec_hdr.xl_tot_len, LSN_FORMAT_ARGS(rec_hdr.xl_prev)));
+
+
+			record_len = rec_hdr.xl_tot_len;
+			if (record_len == 0)
+				return NULL;
+			record = palloc0(record_len);
+			// ereport(LOG, errmsg("RECORD LEN = %lu", record_len));
+		}
+
+		if (record_len > non_read_space)
+		{
+			long int rest_record_len = record_len - non_read_space;
+			
+			allocate_rest_record_buf(reader, non_read_space);
+			memcpy(reader->readRestRecordBuf, reader->readBuf + reader->readBufSize, non_read_space);
+			reader->readBufSize += non_read_space;
+			reader->readRestRecordBufSize = non_read_space; 
+			record_len = rest_record_len;
+
+			WaldiffReadToBuffer(reader);
+
+			// ereport(LOG, errmsg("record does not fit into a page; rec_len = %u", record_len));	
+
+			continue;
+		}
+		else
+		{
+			memcpy((char *) record + currPos,  reader->readBuf + reader->readBufSize, record_len);
+			currPos += record_len;
+			reader->readBufSize += MAXALIGN(record_len);
+			// ereport(LOG, errmsg("just read: %u aligned: %u", record_len, MAXALIGN(record_len)));
+			
+			break;
+		}
+	}
+
+	return record;
 }
 
-
-
-void 
-WalOpenSegment(XLogReaderState *reader,
-			   XLogSegNo nextSegNo,
-			   TimeLineID *tli_p)
+static void 
+WaldiffOpenSegment(WaldiffReader *reader,
+			       XLogSegNo nextSegNo,
+			       TimeLineID *tli_p)
 {
 	TimeLineID tli = *tli_p;
     char fname[XLOG_FNAME_LEN];
@@ -97,51 +289,46 @@ WalOpenSegment(XLogReaderState *reader,
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("WALDIFF: could not open WAL segment \"%s\": %m", fpath)));
+
+	ereport(LOG, errmsg("READER: openning file"));
+	
+	reader->seg.ws_tli = tli;
+	reader->seg.ws_segno = nextSegNo;
 }
 
-int 
-WalReadPage(XLogReaderState *reader, XLogRecPtr targetPagePtr, int reqLen,
-			XLogRecPtr targetPtr, char *readBuff)
+static void 
+WaldiffCloseSegment(WaldiffReader *reader)
 {
-	XLogReaderPrivate *private = reader->private_data;
-	int				  count = XLOG_BLCKSZ;
-	WALReadError 	  errinfo;
+	ereport(LOG, errmsg("READER: closing file"));
+	if (reader->seg.ws_file != -1)
+		close(reader->seg.ws_file);
+	reader->seg.ws_file = -1;
+}
 
-	if (private->endptr != InvalidXLogRecPtr)
-	{
-		if (targetPagePtr + XLOG_BLCKSZ <= private->endptr)
-			count = XLOG_BLCKSZ;
-		else if (targetPagePtr + reqLen <= private->endptr)
-			count = private->endptr - targetPagePtr;
-		else
-		{
-			private->endptr_reached = true;
-			return -1;
-		}
-	}
+static void
+WaldiffReadToBuffer(WaldiffReader *reader)
+{
+	int read_bytes;
 
-	if (!WALRead(reader, readBuff, targetPagePtr, count, private->timeline,
-				 &errinfo))
-	{
-		WALOpenSegment *seg = &errinfo.wre_seg;
-		char		   fname[MAXPGPATH];
+	Assert(reader->seg.ws_file != -1);
+	// ereport(LOG, errmsg("WALDIFF: READ PAGE: %lu / %lu", reader->ReadRecPtr % DEFAULT_XLOG_SEG_SIZE, DEFAULT_XLOG_SEG_SIZE));
 
-		XLogFileName(fname, seg->ws_tli, seg->ws_segno,
-					 reader->segcxt.ws_segsize);
+	pgstat_report_wait_start(WAIT_EVENT_COPY_FILE_READ);
+	read_bytes = pg_pread(reader->seg.ws_file, 
+						  (void*) reader->readBuf, 
+						  XLOG_BLCKSZ, 
+						  reader->ReadRecPtr % reader->segcxt.ws_segsize);
+	pgstat_report_wait_end();
 
-		if (errinfo.wre_errno != 0)
-		{
-			errno = errinfo.wre_errno;
-			ereport(ERROR, 
-					errmsg("WALDIFF: could not read from file %s, offset %d: %m",
-					fname, errinfo.wre_off));
-		}
-		else
-			ereport(ERROR,
-					errmsg("WALDIFF: could not read from file %s, offset %d: read %d of %d",
-					fname, errinfo.wre_off, errinfo.wre_read,
-					errinfo.wre_req));
-	}
+	if (read_bytes != XLOG_BLCKSZ)
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			errmsg("read %d of %d bytes from file \"%d\": %m", read_bytes, XLOG_BLCKSZ, reader->seg.ws_file)));
+	else if (read_bytes == 0)
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			 errmsg("file descriptor closed for read \"%d\": %m", reader->seg.ws_file)));
 
-	return count;
+	reader->ReadRecPtr += read_bytes;
+	reader->readBufSize = 0;
 }

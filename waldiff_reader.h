@@ -53,6 +53,7 @@
 typedef struct WaldiffReader {
 	WALOpenSegment seg;
 	WALSegmentContext segcxt;
+	uint64 sysid;
 
 	XLogRecPtr	ReadRecPtr;		/* end+1 of last read record */
 
@@ -70,9 +71,9 @@ extern WaldiffReader *WaldiffReaderAllocate(char *wal_dir,
 extern void WaldiffReaderFree(WaldiffReader *reader);
 
 extern void 
-WaldiffBeginReading(WaldiffReader *reader, XLogSegNo segNo, TimeLineID tli);
+WaldiffBeginReading(WaldiffReader *reader, uint64 sysid, XLogSegNo segNo, TimeLineID tli);
 
-extern void 
+extern XLogRecord * 
 WaldiffReaderRead(WaldiffReader *reader);
 
 #endif /* _WALDIFF_READER_H_ */

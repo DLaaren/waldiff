@@ -64,7 +64,7 @@ typedef struct WaldiffWriter {
 
 
 extern WaldiffWriter *
-WaldiffWriterAllocate(int wal_segment_size, char *waldiff_dir);
+WaldiffWriterAllocate(char *waldiff_dir, int wal_segment_size);
 
 extern void 
 WaldiffWriterFree(WaldiffWriter *writer);
@@ -76,7 +76,11 @@ WaldiffBeginWriting(WaldiffWriter *writer, uint64 sysid,
 extern void 
 WaldiffWriterWrite(WaldiffWriter *writer, XLogRecord *record);
 
-// TODO
-#define WaldiffWriterFinishedSegment(writer) ()
+
+#define DoesWaldiffWriterFinishedSegment(writer) 					\
+({																	\
+	((writer)->WriteRecPtr % (writer)->segcxt.ws_segsize == 0) ?	\
+		true : false;												\
+})
 
 #endif /* _WALDIFF_WRITER_H_ */
