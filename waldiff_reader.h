@@ -58,7 +58,7 @@ typedef struct WaldiffReader {
 	XLogRecPtr	ReadRecPtr;		/* end+1 of last read record */
 
 	char *readBuf;
-	Offset readBufSize;
+	uint32 readBufSize;
 
 	char	   *readRestRecordBuf;		/* used when a record crosses a page boundary*/
 	uint32		readRestRecordBufSize;

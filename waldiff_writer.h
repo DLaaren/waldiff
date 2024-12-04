@@ -56,7 +56,7 @@ typedef struct WaldiffWriter {
 	XLogRecPtr	WriteRecPtr;		/* end+1 of last written record */
 
 	char *writeBuf;
-	Offset writeBufSize;
+	uint32 writeBufSize;
 
 	char	   *writeRestRecordBuf;		/* used when a record crosses a page boundary*/
 	uint32		writeRestRecordBufSize;

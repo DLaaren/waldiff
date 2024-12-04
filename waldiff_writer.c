@@ -11,11 +11,8 @@ WaldiffCloseSegment(WaldiffWriter *writer);
 static void
 WaldiffWriteBufferToDisk(WaldiffWriter *writer);
 
-static void
-allocate_rest_record_buf(WaldiffWriter *writer, uint32 reclength);
-
 void static
-write_aligned(char *dest, Offset *dest_offset, char *src, Size size);
+write_aligned(char *dest, uint32 *dest_offset, char *src, Size size);
 
 
 WaldiffWriter *
@@ -46,7 +43,6 @@ WaldiffWriterAllocate(char *waldiff_dir,
 	memcpy(writer->segcxt.ws_dir, waldiff_dir, strlen(waldiff_dir));
 	writer->segcxt.ws_segsize = wal_segment_size;  
 
-	allocate_rest_record_buf(writer, 0);
 	writer->writeRestRecordBufSize = 0;
 	return writer;
 }
@@ -59,20 +55,6 @@ WaldiffWriterFree(WaldiffWriter *writer)
 
 	pfree(writer->writeBuf);
 	pfree(writer);
-}
-
-static void
-allocate_rest_record_buf(WaldiffWriter *writer, uint32 reclength)
-{
-	uint32		newSize = reclength;
-
-	newSize += XLOG_BLCKSZ - (newSize % XLOG_BLCKSZ);
-	newSize = Max(newSize, 5 * Max(BLCKSZ, XLOG_BLCKSZ));
-
-	if (writer->writeRestRecordBuf)
-		pfree(writer->writeRestRecordBuf);
-	writer->writeRestRecordBuf = (char *) palloc(newSize);
-	writer->writeRestRecordBufSize = newSize;
 }
 
 void 
@@ -89,9 +71,9 @@ WaldiffBeginWriting(WaldiffWriter *writer, uint64 sysid, XLogSegNo segNo, TimeLi
 }
 
 void static
-write_aligned(char *dest, Offset *dest_offset, char *src, Size size) 
+write_aligned(char *dest, uint32 *dest_offset, char *src, Size size) 
 {
-	Offset padding = 0;
+	uint32 padding = 0;
 
 	memcpy(dest + *dest_offset, src, size);
 	*dest_offset += size;
@@ -111,29 +93,17 @@ WaldiffWriterWrite(WaldiffWriter *writer,
 				   XLogRecord *record)
 {
 	uint32 *record_len = &(record->xl_tot_len);
-	long int free_page_space;
-
-	// ereport(LOG, errmsg("\n\nRECORD LEN = %lu", record->xl_tot_len));
+	uint32  free_page_space = 0;
 
 	while (true) 
 	{
-
-		// if (writer->WriteRecPtr + writer->writeBufSize - DEFAULT_XLOG_SEG_SIZE > 0x002E4000)
-		// 	ereport(ERROR, errmsg("\nWRITE function is called"));
-
-		// ereport(LOG, errmsg("curr lsn = %08X/%08X", LSN_FORMAT_ARGS(writer->WriteRecPtr + writer->writeBufSize - DEFAULT_XLOG_SEG_SIZE)));
 		free_page_space = XLOG_BLCKSZ - MAXALIGN(writer->writeBufSize);
-
-		// ereport(LOG, errmsg("free page space = %lu", free_page_space));
-
-
 		if (free_page_space == 0) 
 		{
 			WaldiffWriteBufferToDisk(writer);
 			continue;
 		}
 
-		// Insert page header firstly and the rest of the record from previous page
 		if (writer->writeBufSize == 0)
 		{
 			XLogPageHeaderData page_hdr = {0};
@@ -147,7 +117,6 @@ WaldiffWriterWrite(WaldiffWriter *writer,
 			if (page_hdr.xlp_rem_len > 0)
 				page_hdr.xlp_info |= XLP_FIRST_IS_CONTRECORD;
 
-			// Check if this the very first block
 			if (writer->WriteRecPtr == writer->segcxt.ws_segsize) 
 			{
 				XLogLongPageHeaderData long_page_hdr = {0};
@@ -160,28 +129,20 @@ WaldiffWriterWrite(WaldiffWriter *writer,
 				long_page_hdr.xlp_xlog_blcksz = XLOG_BLCKSZ;
 
 				write_aligned(writer->writeBuf, &(writer->writeBufSize), (char *) &long_page_hdr, sizeof(XLogLongPageHeaderData));
-				// ereport(LOG, errmsg("just write PAGE HDR LONG: %lu %lu", MAXALIGN(sizeof(XLogLongPageHeaderData)), writer->writeBufSize));
 			}
 			else {
 				write_aligned(writer->writeBuf, &(writer->writeBufSize), (char *) &page_hdr, sizeof(XLogPageHeaderData));
-				// ereport(LOG, errmsg("just write PAGE HDR SHORT: %lu %lu", MAXALIGN(sizeof(XLogPageHeaderData)), writer->writeBufSize));
 			}
 
 		}
 
 		if (writer->writeRestRecordBufSize > 0) 
 		{
-			int rest_record_len = writer->writeRestRecordBufSize;
-
-			// ereport(LOG, errmsg("rest of a record from previous page; len = %u", rest_record_len));
+			uint32 rest_record_len = writer->writeRestRecordBufSize;
 
 			free_page_space = XLOG_BLCKSZ - MAXALIGN(writer->writeBufSize);
-
-			// The record does not fit on the page
 			if (rest_record_len > free_page_space) 
 			{
-				// ereport(LOG, errmsg("rest does not fit; free page space = %lu", free_page_space));
-
 				int rest_rest_record_len = rest_record_len - free_page_space;
 
 				write_aligned(writer->writeBuf, 
@@ -190,15 +151,10 @@ WaldiffWriterWrite(WaldiffWriter *writer,
 					   		  free_page_space); 
 				WaldiffWriteBufferToDisk(writer);
 
-				// allocate_rest_record_buf(writer, rest_rest_record_len);
 				memmove(writer->writeRestRecordBuf, 
 					    writer->writeRestRecordBuf + free_page_space, 
 					    rest_rest_record_len);
 				writer->writeRestRecordBufSize = rest_rest_record_len;
-
-				ereport(LOG, errmsg("First several bytes of the rest: %x", *((long *) writer->writeRestRecordBuf)));
-
-				// ereport(LOG, errmsg("CHECK: writeBufSize %lu; writeRestRecordBufSize = %lu", writer->writeBufSize, writer->writeRestRecordBufSize));
 
 				continue;
 			}
@@ -209,7 +165,6 @@ WaldiffWriterWrite(WaldiffWriter *writer,
 					   writer->writeRestRecordBuf, 
 					   rest_record_len); 
 				writer->writeRestRecordBufSize = 0;
-				// ereport(LOG, errmsg("just write the rest: %lu %lu", MAXALIGN(rest_record_len), writer->writeBufSize));
 			}
 		}
 
@@ -222,33 +177,28 @@ WaldiffWriterWrite(WaldiffWriter *writer,
 
 			Assert(writer->writeRestRecordBufSize == 0);
 
-			// ereport(LOG, errmsg("record does not fit into a page; len = %lu", *record_len));			
-
 			write_aligned(writer->writeBuf, 
 						  &(writer->writeBufSize),
 				  		  (char *) record, 
 				   		  free_page_space); 
 			WaldiffWriteBufferToDisk(writer);
 
-			allocate_rest_record_buf(writer, rest_record_len);
+			writer->writeRestRecordBuf = palloc(rest_record_len);
 			memcpy(writer->writeRestRecordBuf, 
 				   (char *) record + free_page_space, 
 				   rest_record_len);
 			writer->writeRestRecordBufSize = rest_record_len;
 			record_len = &(writer->writeRestRecordBufSize);
 
-			// ereport(LOG, errmsg("rest record len = %lu", writer->writeRestRecordBufSize));
 			continue;
 		}
 		else {
-
 			write_aligned(writer->writeBuf, 
 							&(writer->writeBufSize),
 							(char *) record, 
 							*record_len); 
 
-			// ereport(LOG, errmsg("just write: %lu bytes; currPos in buf %lu", MAXALIGN(*record_len), writer->writeBufSize));
-			break;
+			return;
 		}
 		
 	}
@@ -271,9 +221,7 @@ WaldiffOpenSegment(WaldiffWriter *writer,
 
 	writer->seg.ws_file = OpenTransientFile(fpath, PG_BINARY | O_WRONLY | O_CREAT | O_APPEND);
 	if (writer->seg.ws_file == -1)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("WALDIFF: could not open WAL segment \"%s\": %m", fpath)));
+		ereport(ERROR, errmsg("WALDIFF: could not open WAL segment \"%s\": %m", fpath)));
 
 	writer->seg.ws_tli = tli;
 	writer->seg.ws_segno = nextSegNo;
@@ -294,10 +242,7 @@ WaldiffWriteBufferToDisk(WaldiffWriter *writer)
 {
 	int written_bytes;
 
-	// ereport(LOG, errmsg("WALDIFF: FLUSHED PAGE: %lu / %lu", writer->WriteRecPtr - DEFAULT_XLOG_SEG_SIZE, DEFAULT_XLOG_SEG_SIZE));
-
 	Assert(writer->seg.ws_file != -1);
-	// Assert(writer->writeBufSize == XLOG_BLCKSZ);
 
 	pgstat_report_wait_start(WAIT_EVENT_COPY_FILE_WRITE);
 	written_bytes = pg_pwrite(writer->seg.ws_file, 
@@ -307,13 +252,9 @@ WaldiffWriteBufferToDisk(WaldiffWriter *writer)
 	pgstat_report_wait_end();
 
 	if (written_bytes != XLOG_BLCKSZ)
-		ereport(ERROR,
-			(errcode_for_file_access(),
-			errmsg("write %d of %d bytes to file \"%d\": %m", written_bytes, XLOG_BLCKSZ, writer->seg.ws_file)));
+		ereport(ERROR, errmsg("write %d of %d bytes to file \"%d\": %m", written_bytes, XLOG_BLCKSZ, writer->seg.ws_file));
 	if (written_bytes == 0)
-		ereport(ERROR,
-			(errcode_for_file_access(),
-			 errmsg("file descriptor closed for write \"%d\": %m", writer->seg.ws_file)));
+		ereport(ERROR, errmsg("file descriptor closed for write \"%d\": %m", writer->seg.ws_file));
 
 	writer->WriteRecPtr += written_bytes;
 	writer->writeBufSize = 0;
