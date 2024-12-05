@@ -48,10 +48,6 @@
 #include "commands/dbcommands.h"
 #include "postmaster/bgworker.h"
 
-#include "waldiff_writer.h"
-#include "waldiff_reader.h"
-#include "waldiff_decoding_encoding.h"
-
 /*--------------------------Public defines-------------------------*/
 typedef struct WaldiffBlock 
 {
@@ -113,7 +109,8 @@ _hash_combine(uint32_t seed, uint32_t value)
 
 #define GetHashKeyOfWaldiffRecord(record) 													\
 ({ 																							\
-    uint32_t key = 0; 																		\
+    uint32_t key = 0;																		\
+	Assert(record != NULL);																	\
     key = _hash_combine(key, (record)->blocks[0].file_loc.spcOid); 							\
     key = _hash_combine(key, (record)->blocks[0].file_loc.dbOid); 							\
     key = _hash_combine(key, (record)->blocks[0].file_loc.relNumber); 						\
@@ -125,6 +122,7 @@ _hash_combine(uint32_t seed, uint32_t value)
 #define GetHashKeyOfPrevWaldiffRecord(record) 											\
 ({ 																						\
     uint32_t key = 0; 																	\
+	Assert(record != NULL);																\
     key = _hash_combine(key, (record)->blocks[0].file_loc.spcOid); 						\
     key = _hash_combine(key, (record)->blocks[0].file_loc.dbOid); 						\
     key = _hash_combine(key, (record)->blocks[0].file_loc.relNumber); 					\

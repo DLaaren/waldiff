@@ -78,9 +78,8 @@ WaldiffWriterWrite(WaldiffWriter *writer, XLogRecord *record);
 
 
 #define DoesWaldiffWriterFinishedSegment(writer) 					\
-({																	\
-	((writer)->WriteRecPtr % (writer)->segcxt.ws_segsize == 0) ?	\
-		true : false;												\
-})
+(																	\
+	((writer)->WriteRecPtr % (writer)->segcxt.ws_segsize == 0)		\
+)
 
 #endif /* _WALDIFF_WRITER_H_ */

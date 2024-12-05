@@ -8,6 +8,10 @@ WaldiffOpenSegment(WaldiffWriter *writer,
 static void 
 WaldiffCloseSegment(WaldiffWriter *writer);
 
+// TODO write and add to CloseSegment
+static void 
+WaldiffFinishSegmentToSegmentSize(WaldiffWriter *writer);
+
 static void
 WaldiffWriteBufferToDisk(WaldiffWriter *writer);
 
@@ -221,7 +225,7 @@ WaldiffOpenSegment(WaldiffWriter *writer,
 
 	writer->seg.ws_file = OpenTransientFile(fpath, PG_BINARY | O_WRONLY | O_CREAT | O_APPEND);
 	if (writer->seg.ws_file == -1)
-		ereport(ERROR, errmsg("WALDIFF: could not open WAL segment \"%s\": %m", fpath)));
+		ereport(ERROR, errmsg("WALDIFF: could not open WAL segment \"%s\": %m", fpath));
 
 	writer->seg.ws_tli = tli;
 	writer->seg.ws_segno = nextSegNo;

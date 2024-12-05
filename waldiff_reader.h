@@ -48,8 +48,6 @@
 #include "commands/dbcommands.h"
 #include "postmaster/bgworker.h"
 
-#include "waldiff.h"
-
 typedef struct WaldiffReader {
 	WALOpenSegment seg;
 	WALSegmentContext segcxt;
@@ -74,6 +72,6 @@ extern void
 WaldiffBeginReading(WaldiffReader *reader, uint64 sysid, XLogSegNo segNo, TimeLineID tli);
 
 extern XLogRecord * 
-WaldiffReaderRead(WaldiffReader *reader);
+WaldiffReaderRead(WaldiffReader *reader, XLogRecPtr *lsn);
 
 #endif /* _WALDIFF_READER_H_ */

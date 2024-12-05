@@ -60,8 +60,6 @@ WaldiffBeginReading(WaldiffReader *reader, uint64 sysid, XLogSegNo segNo, TimeLi
 {
 	WaldiffCloseSegment(reader);
 
-	Assert(reader->readBufSize == XLOG_BLCKSZ);
-
 	XLogSegNoOffsetToRecPtr(segNo, 0, reader->segcxt.ws_segsize, reader->ReadRecPtr);
 	reader->sysid = sysid;
 
@@ -90,7 +88,7 @@ ValidXLogRecord(WaldiffReader *reader, XLogRecord *record)
 /* Before the first reading WaldiffBeginReading() must be called
    Returned record must be freed one day */
 XLogRecord * 
-WaldiffReaderRead(WaldiffReader *reader)
+WaldiffReaderRead(WaldiffReader *reader, XLogRecPtr *lsn)
 {
     XLogRecord *record 			= NULL;
 	XLogRecord  record_hdr;
@@ -186,7 +184,7 @@ WaldiffReaderRead(WaldiffReader *reader)
 				reader->readBufSize += MAXALIGN(rest_record_len);
 
 				ValidXLogRecord(reader, record);
-				return record;
+				break;
 			}
 		}
 
@@ -198,6 +196,8 @@ WaldiffReaderRead(WaldiffReader *reader)
 			if (record_len == 0)
 				return NULL;
 			record = palloc0(record_len);
+
+			*lsn = reader->ReadRecPtr - (XLOG_BLCKSZ - MAXALIGN(reader->readBufSize));
 		}
 
 		if (record_len > non_read_space)
@@ -219,7 +219,7 @@ WaldiffReaderRead(WaldiffReader *reader)
 			reader->readBufSize += MAXALIGN(record_len);
 			
 			ValidXLogRecord(reader, record);
-			return record;
+			break;
 		}
 	}
 
@@ -245,8 +245,6 @@ WaldiffOpenSegment(WaldiffReader *reader,
 	if (reader->seg.ws_file == -1)
 		ereport(ERROR, errmsg("WALDIFF: could not open WAL segment \"%s\": %m", fpath));
 
-	ereport(LOG, errmsg("READER: openning file"));
-	
 	reader->seg.ws_tli = tli;
 	reader->seg.ws_segno = nextSegNo;
 }
@@ -254,7 +252,6 @@ WaldiffOpenSegment(WaldiffReader *reader,
 static void 
 WaldiffCloseSegment(WaldiffReader *reader)
 {
-	ereport(LOG, errmsg("READER: closing file"));
 	if (reader->seg.ws_file != -1)
 		close(reader->seg.ws_file);
 	reader->seg.ws_file = -1;

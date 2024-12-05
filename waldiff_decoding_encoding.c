@@ -1,15 +1,31 @@
-// #include "waldiff_decoding_encoding.h"
+#include "waldiff_decoding_encoding.h"
 
-// WALDIFFRecord
-// WalDiffDecodeRecord(char *record, XLogRecPtr lsn);
+static WaldiffRecord decode_insert(XLogRecord *WalRec, XLogRecPtr lsn);
 
-// char *
-// WalDiffEncodeRecord(WALDIFFRecord WaldiffRecord);
+static WaldiffRecord decode_hot_update(XLogRecord *WalRec, XLogRecPtr lsn);
 
-// // returns null if contains image
-// extern WALDIFFRecord
-// WalDiffDecodeRecord(char *record, XLogRecPtr lsn)
-// {
+// returns null if contains image
+WaldiffRecord
+WalDiffDecodeRecord(XLogRecord *WalRec, XLogRecPtr lsn)
+{
+    switch (WalRec->xl_info & XLOG_HEAP_OPMASK)
+    {
+        case XLOG_HEAP_INSERT:
+            return decode_insert(WalRec, lsn);
+
+        case XLOG_HEAP_HOT_UPDATE:
+            return decode_hot_update(WalRec, lsn);
+
+		default: 
+			ereport(ERROR, 
+					errmsg("WALDIFF: uprocessed type of record in WalDiffDecodeRecord"));
+	}
+
+	ereport(LOG, errmsg("NO WAY"));
+	return NULL;
+}
+
+
 //     XLogRecord   	 	  *WALRec = (XLogRecord *) record;
 //     WALDIFFRecord 	  	   WDRec; 		// allocate after finding out the number of blocks
 // 	WALDIFFRecordData  	   WDRecTemp;
@@ -287,66 +303,6 @@
 // 	return WalRec;
 // }
 
-// static void  
-// fetch_insert(WaldiffRecord *WaldiffRec)
-// {
-// 	DecodedXLogRecord 		*decoded_record = reader_state->record;
-// 	RelFileLocator 			 rel_file_locator;
-// 	ForkNumber 				 forknum;
-// 	BlockNumber 			 blknum;
-// 	xl_heap_insert 			*main_data;
-// 	XLogRecordBlockHeader 	 block_hdr;
-// 	char 					*block_data;
-// 	Size					 block_data_len;
-	
-// 	/* HEAP_INSERT contains one block */
-// 	Assert(decoded_record->max_block_id == 0);
-	
-// 	// MemoryContextStats(memory_context_storage->current);
-
-// 	*WaldiffRec = palloc(SizeOfWALDIFFRecord + sizeof(WALDIFFBlock) * (decoded_record->max_block_id + 1));
-// 	Assert(*WaldiffRec != NULL);
-
-// 	XLogRecGetBlockTag(reader_state, 0, &rel_file_locator, &forknum, &blknum);
-// 	main_data = (xl_heap_insert *) XLogRecGetData(reader_state);
-// 	block_data = XLogRecGetBlockData(reader_state, 0, &block_data_len);
-// 	block_hdr.id = 0;
-// 	block_hdr.fork_flags = decoded_record->blocks[0].flags;
-// 	block_hdr.data_length = block_data_len;
-
-// 	Assert(XLogRecHasBlockData(reader_state, 0));
-	
-// 	(*WaldiffRec)->type = XLOG_HEAP_INSERT;
-// 	(*WaldiffRec)->lsn = decoded_record->lsn;
-// 	(*WaldiffRec)->rec_hdr = decoded_record->header;
-// 	(*WaldiffRec)->t_xmin = XLogRecGetXid(reader_state);
-// 	(*WaldiffRec)->t_xmax = 0;
-// 	/* 
-// 	 * Copy tuple's version pointers
-// 	 * At this step, t_ctid always will be point to itself,
-// 	 * because we reckon this record as first
-// 	 */
-// 	ItemPointerSetBlockNumber(&((*WaldiffRec)->current_t_ctid), blknum);
-//     ItemPointerSetOffsetNumber(&((*WaldiffRec)->current_t_ctid), main_data->offnum);
-// 	(*WaldiffRec)->prev_t_ctid = (*WaldiffRec)->current_t_ctid;
-// 	/* Copy main data */
-// 	(*WaldiffRec)->main_data = palloc(SizeOfHeapInsert);
-// 	memcpy((*WaldiffRec)->main_data, main_data, SizeOfHeapInsert);
-// 	(*WaldiffRec)->main_data_len = SizeOfHeapInsert;
-// 	/* Copy 0th block */
-// 	(*WaldiffRec)->max_block_id 				= 0;
-// 	(*WaldiffRec)->blocks[0].blk_hdr 		= block_hdr;
-// 	(*WaldiffRec)->blocks[0].file_loc 		= rel_file_locator;
-// 	(*WaldiffRec)->blocks[0].forknum			= forknum;
-// 	(*WaldiffRec)->blocks[0].blknum 			= blknum;
-// 	(*WaldiffRec)->blocks[0].has_data 		= true;
-// 	(*WaldiffRec)->blocks[0].block_data_len  = block_data_len;
-// 	(*WaldiffRec)->blocks[0].block_data 		= palloc0(block_data_len);
-// 	memcpy((*WaldiffRec)->blocks[0].block_data, block_data, block_data_len);
-
-// 	(*WaldiffRec)->chain_length = 0;
-// }
-
 // /*
 //  * fetch_hot_update
 //  * 
@@ -489,3 +445,97 @@
 
 // 	return constructed_record;
 // }
+
+/* This function returns palloced struct */
+/* Here we reckon that insert does not contain full page image */
+/* [XLogRecodr] + [BlockHeader] + [RelFileLocator] + [BlockNumber] + [MainDataHeader] + [block data] + [main data] */
+static WaldiffRecord 
+decode_insert(XLogRecord *WalRec, XLogRecPtr lsn)
+{
+	uint32					 curr_pos = 0;
+	WaldiffRecord			 WaldiffRec;	
+	uint8 					 main_data_hdr_id;	
+
+	WaldiffRec = palloc(SizeOfWaldiffRecord + sizeof(WaldiffBlock));
+	Assert(WaldiffRec != NULL);
+
+	WaldiffRec->chain_length = 1;
+	WaldiffRec->lsn = lsn;
+	WaldiffRec->has_main_data = true;
+	WaldiffRec->max_block_id = 0;
+
+	memcpy(&(WaldiffRec->rec_hdr), WalRec, SizeOfXLogRecord);
+	curr_pos += SizeOfXLogRecord;
+
+	WaldiffRec->t_xmin = WaldiffRec->rec_hdr.xl_xid;
+
+	memcpy(&(WaldiffRec->blocks[0].blk_hdr), 
+		   (char *) WalRec + curr_pos, 
+		   SizeOfXLogRecordBlockHeader);
+	curr_pos += SizeOfXLogRecordBlockHeader;
+
+	Assert(WaldiffRec->blocks[0].blk_hdr.id == 0);
+	Assert(!(WaldiffRec->blocks[0].blk_hdr.fork_flags & BKPBLOCK_HAS_IMAGE));
+	Assert(WaldiffRec->blocks[0].blk_hdr.fork_flags & BKPBLOCK_HAS_DATA);
+	WaldiffRec->blocks[0].has_data = true;
+	WaldiffRec->blocks[0].block_data_len = WaldiffRec->blocks[0].blk_hdr.data_length;
+
+	Assert(!(BKPBLOCK_SAME_REL & WaldiffRec->blocks[0].blk_hdr.fork_flags));
+	memcpy(&(WaldiffRec->blocks[0].file_loc), 
+		   (char *) WalRec + curr_pos,
+		   sizeof(RelFileLocator));
+	curr_pos += sizeof(RelFileLocator);
+
+	memcpy(&(WaldiffRec->blocks[0].blknum), 
+		   (char *) WalRec + curr_pos,
+		   sizeof(BlockNumber));
+	curr_pos += sizeof(BlockNumber);
+
+	WaldiffRec->blocks[0].forknum = WaldiffRec->blocks[0].blk_hdr.fork_flags & BKPBLOCK_FORK_MASK;
+
+	main_data_hdr_id = *((uint8 *)((char *) WalRec + curr_pos));
+	curr_pos += sizeof(uint8);
+
+	if (main_data_hdr_id == XLR_BLOCK_ID_DATA_SHORT)
+	{
+		WaldiffRec->main_data_len = *((uint8 *)((char *) WalRec + curr_pos));
+		curr_pos += sizeof(uint8);
+	}
+	else if (main_data_hdr_id == XLR_BLOCK_ID_DATA_LONG)
+	{
+		WaldiffRec->main_data_len = *((uint32 *)((char *) WalRec + curr_pos));
+		curr_pos += sizeof(uint32);
+	}
+	else 
+	{
+		ereport(ERROR, errmsg("WALDIFF: waiting for main data header but there is something else in record %08X/%08X", LSN_FORMAT_ARGS(lsn)));
+	}
+
+	WaldiffRec->blocks[0].block_data = palloc(WaldiffRec->blocks[0].block_data_len);
+	memcpy(WaldiffRec->blocks[0].block_data, 
+		   (char *) WalRec + curr_pos,
+		   WaldiffRec->blocks[0].block_data_len);
+	curr_pos += WaldiffRec->blocks[0].block_data_len;  
+
+	WaldiffRec->main_data = palloc(WaldiffRec->main_data_len);
+	memcpy(WaldiffRec->main_data, 
+		   (char *) WalRec + curr_pos,
+		   WaldiffRec->main_data_len);
+	curr_pos += WaldiffRec->main_data_len;   
+
+
+	ItemPointerSet(&(WaldiffRec->current_t_ctid), 
+				   WaldiffRec->blocks[0].blknum, 
+				   ((xl_heap_insert *)(WaldiffRec->main_data))->offnum);
+
+	Assert(curr_pos == WaldiffRec->rec_hdr.xl_tot_len);
+
+	return WaldiffRec;
+}
+
+/* This function returns palloced struct */
+static WaldiffRecord 
+decode_hot_update(XLogRecord *WalRec, XLogRecPtr lsn)
+{
+    return NULL;
+}
