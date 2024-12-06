@@ -20,8 +20,6 @@ WalDiffDecodeRecord(XLogRecord *WalRec, XLogRecPtr lsn)
 			ereport(ERROR, 
 					errmsg("WALDIFF: uprocessed type of record in WalDiffDecodeRecord"));
 	}
-
-	ereport(LOG, errmsg("NO WAY"));
 	return NULL;
 }
 
@@ -460,7 +458,7 @@ decode_insert(XLogRecord *WalRec, XLogRecPtr lsn)
 	Assert(WaldiffRec != NULL);
 
 	WaldiffRec->chain_length = 1;
-	WaldiffRec->lsn = lsn;
+	WaldiffRec->chain_start_lsn = lsn;
 	WaldiffRec->has_main_data = true;
 	WaldiffRec->max_block_id = 0;
 

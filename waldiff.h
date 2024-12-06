@@ -65,8 +65,8 @@ typedef struct WaldiffBlock
 typedef struct WaldiffRecordData
 {
 	uint32   		chain_length; // for debug and test purposes
+	XLogRecPtr	    chain_start_lsn;
 
-	XLogRecPtr	    lsn;
 	XLogRecord      rec_hdr;	
 
 	/* 

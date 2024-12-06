@@ -409,8 +409,8 @@ constructing_waldiff(XLogRecPtr *last_checkpoint)
 		   without image */
 		/* firstly check in hash map*/
 		if (WalRec->xl_rmid == RM_HEAP_ID && !WalRecordHasImage(WalRec) &&
-		   	((WalRec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_INSERT || 
-			(WalRec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_HOT_UPDATE))
+		   	((WalRec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_INSERT)) // || 
+			// (WalRec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_HOT_UPDATE))
 		{
 			uint32_t hash_key;
 			HTABEntry *entry;
