@@ -55,7 +55,7 @@ static void free_waldiff_record(WaldiffRecord record);
 // static void free_waldiff_record(WaldiffRecord record);
 
 #define WalRecordHasImage(WalRec)					\
-(													\	
+(													\
 	((((XLogRecordBlockHeader *)					\
 	(((char *) (WalRec)) + SizeOfXLogRecord))		\
 	->fork_flags & BKPBLOCK_HAS_IMAGE))				\
@@ -130,7 +130,7 @@ waldiff_startup(ArchiveModuleState *state)
 	reader = WaldiffReaderAllocate(XLOGDIR, DEFAULT_XLOG_SEG_SIZE);
 	Assert(reader != NULL);
 
-	ControlFileFd = open(XLOG_CONTROL_FILE, O_RDONLY | PG_BINARY);
+	ControlFileFd = open(XLOG_CONTROL_FILE, O_RDWR | PG_BINARY);
 	if (ControlFileFd < 0)
 		ereport(PANIC,
 				(errcode_for_file_access(),
@@ -207,11 +207,9 @@ waldiff_archive(ArchiveModuleState *state, const char *WalFile, const char *WalP
 	   Also remember the last checkpoint lsn to update info in ControlFile */
 	constructing_waldiff(&last_checkpoint);
 
-	return true;
-
 	if (last_checkpoint != InvalidXLogRecPtr) 
 	{
-		ereport(LOG, errmsg("WALDIFF: write new last checkpoint location : %X/%X", 
+		ereport(LOG, errmsg("WALDIFF: write the last checkpoint location : %X/%X", 
 							LSN_FORMAT_ARGS(last_checkpoint)));
 
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
@@ -228,6 +226,8 @@ waldiff_archive(ArchiveModuleState *state, const char *WalFile, const char *WalP
 		WriteControlFile();
 		LWLockRelease(ControlFileLock);
 	}
+	else 
+		ereport(LOG, errmsg("WALDIFF: checkpoint location isn't found"));
 
 	ereport(LOG, errmsg("WALDIFF: archived WAL file: %s", WalPath));
 
@@ -247,14 +247,6 @@ collecting_chains(void)
 		/* There is no record left */
 		if (WalRec == NULL) 
 			break;
-            // ereport(ERROR, 
-					// errmsg("WALDIFF: WaldiffReaderRead failed to read WAL record at lsn %08X/%08X", LSN_FORMAT_ARGS(lsn)));
-
-		// WaldiffWriterWrite(writer, WalRec);
-
-		// pfree(WalRec);
-
-		// ereport(LOG, errmsg("lsn = %08X/%08X", LSN_FORMAT_ARGS(lsn)));
 
 		/* Now we're processing only several HEAP type WAL records and without image */
 		if (WalRec->xl_rmid == RM_HEAP_ID && !WalRecordHasImage(WalRec))
@@ -284,9 +276,11 @@ collecting_chains(void)
 
 					Assert(entry->key == hash_key);
 
+// #define WALDIFF_DEBUG
+
 #ifdef WALDIFF_DEBUG
-					ereport(LOG, errmsg("WALDIFF: HEAP INSERT record lsn = %X/%X; hash_key = %u; blknum = %d; offnum = %u", 
-										LSN_FORMAT_ARGS(entry->data->lsn), hash_key, entry->data->blocks[0].blknum, ((xl_heap_insert *)(entry->data->main_data))->offnum));
+					ereport(LOG, errmsg("WALDIFF: HEAP INSERT record lsn = %X/%X; hash_key = %u; chain length = %u", 
+										LSN_FORMAT_ARGS(entry->data->chain_start_lsn), hash_key, entry->data->chain_length));
 #endif				
 					break;
 				}
@@ -400,11 +394,6 @@ constructing_waldiff(XLogRecPtr *last_checkpoint)
 			}
 		}
 
-		// WaldiffWriterWrite(writer, WalRec);
-		// pfree(WalRec);
-	// }
-
-
 		/* Now we reckon that hash_table contains only HEAP records (INSERT, HOT UPDATE)
 		   without image */
 		/* firstly check in hash map*/
@@ -417,49 +406,29 @@ constructing_waldiff(XLogRecPtr *last_checkpoint)
 			bool is_found;
 
 			WaldiffRec = WalDiffDecodeRecord(WalRec, lsn);
+			pfree(WalRec);
 			hash_key = GetHashKeyOfWaldiffRecord(WaldiffRec);
-			pfree(WaldiffRec);
+			free_waldiff_record(WaldiffRec);
 			
 			entry = (HTABEntry *) hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
 
 			if (entry && is_found)
 			{
-				ereport(LOG, errmsg("WALDIFF: found lol"));
-
-				XLogRecord *construcred_record;
-				int written_bytes;
-
 				WaldiffRec = entry->data;
 				Assert(WaldiffRec != NULL);
 
+				WalRec = WalDiffEncodeRecord(WaldiffRec);
+				free_waldiff_record(WaldiffRec);
+
 				WaldiffWriterWrite(writer, WalRec);
 				pfree(WalRec);
-
-				/* construct WALDIFF */
-				// construcred_record = constructWALDIFF(WaldiffRec);
-
-				// write WALDIFF record
-				// TODO need writer
-
-				// written_bytes = FileWrite(writer_state->seg.ws_file, construcred_record, construcred_record->xl_tot_len, writer_state->EndRecPtr % DEFAULT_XLOG_SEG_SIZE, WAIT_EVENT_WAL_COPY_WRITE);
-				// if (written_bytes != construcred_record->xl_tot_len)
-				// {
-				// 	if (written_bytes < 0)
-				// 		ereport(PANIC,
-				// 				(errcode_for_file_access(),
-				// 				errmsg("could not write WALDIFF: %m")));
-				// 	else
-				// 		ereport(PANIC,
-				// 				(errcode(ERRCODE_DATA_CORRUPTED),
-				// 				errmsg("could not write WALDIFF: write %d of %zu",
-				// 						written_bytes, construcred_record->xl_tot_len)));
-				// }
+				
+				hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, &is_found);
 			}
 			continue;
 		}
 		else 
 		{
-			// write regular WAL record
 			WaldiffWriterWrite(writer, WalRec);
 			pfree(WalRec);
 		}
@@ -827,15 +796,12 @@ ReadControlFile(void)
 	if (read_bytes != sizeof(ControlFileData))
 	{
 		if (read_bytes < 0)
-			ereport(PANIC,
-					(errcode_for_file_access(),
-					 errmsg("WALDIFF: could not read file \"%s\": %m",
-							XLOG_CONTROL_FILE)));
+			ereport(PANIC, 
+					errmsg("WALDIFF: could not read file \"%s\": %m", XLOG_CONTROL_FILE));
 		else
-			ereport(PANIC,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("WALDIFF: could not read file \"%s\": read %d of %zu",
-							XLOG_CONTROL_FILE, read_bytes, sizeof(ControlFileData))));
+			ereport(PANIC, 
+					errmsg("WALDIFF: could not read file \"%s\": read %d of %zu",
+							XLOG_CONTROL_FILE, read_bytes, sizeof(ControlFileData)));
 	}
 }
 
@@ -853,14 +819,10 @@ WriteControlFile(void)
 	if (written_bytes != sizeof(ControlFileData))
 	{
 		if (written_bytes < 0)
-			ereport(PANIC,
-					(errcode_for_file_access(),
-					 errmsg("WALDIFF: could not write to file \"%s\": %m",
-							XLOG_CONTROL_FILE)));
+			ereport(PANIC, errmsg("WALDIFF: could not write to file \"%s\": %m", XLOG_CONTROL_FILE));
 		else
 			ereport(PANIC,
-					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("WALDIFF: could not write to file \"%s\": write %d of %zu",
-							XLOG_CONTROL_FILE, written_bytes, sizeof(ControlFileData))));
+							XLOG_CONTROL_FILE, written_bytes, sizeof(ControlFileData)));
 	}
 }

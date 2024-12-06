@@ -46,7 +46,7 @@
 extern WaldiffRecord
 WalDiffDecodeRecord(XLogRecord *WalRec, XLogRecPtr lsn);
 
-extern char *
+extern XLogRecord *
 WalDiffEncodeRecord(WaldiffRecord WaldiffRecord);
 
 #endif /* _WALDIFF_DECODING_ENCODING_H_ */

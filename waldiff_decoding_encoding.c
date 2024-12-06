@@ -170,136 +170,80 @@ WalDiffDecodeRecord(XLogRecord *WalRec, XLogRecPtr lsn)
 // 	return WDRec;
 // }
 
-// char *
-// WalDiffEncodeRecord(WALDIFFRecord WaldiffRecord)
-// {
-    
-// }
+XLogRecord *
+WalDiffEncodeRecord(WaldiffRecord WaldiffRecord)
+{
+	char *WalRec = palloc0(WaldiffRecord->rec_hdr.xl_tot_len);
+	Offset currPos = 0;
 
+	RelFileLocator relfileloc;
+	BlockNumber blk_num;
 
-// char *
-// EncodeWalRecord(DecodedXLogRecord *WalRecDecoded)
-// {
-// 	char *WalRec = palloc0(MAXALIGN(WalRecDecoded->header.xl_tot_len));
-// 	Offset currPos = 0;
-
-// 	memcpy(WalRec + currPos, &(WalRecDecoded->header), SizeOfXLogRecord);
-// 	currPos += SizeOfXLogRecord;
+	memcpy(WalRec + currPos, &(WaldiffRecord->rec_hdr), SizeOfXLogRecord);
+	currPos += SizeOfXLogRecord;
 	
-// 	for (int block_id = 0; block_id <= WalRecDecoded->max_block_id; block_id++)
-// 	{
-// 		Assert(currPos < WalRecDecoded->header.xl_tot_len);
+	for (int id = 0; id <= WaldiffRecord->max_block_id; id++)
+	{
+		memcpy(WalRec + currPos, &(WaldiffRecord->blocks[id].blk_hdr), SizeOfXLogRecordBlockHeader);
+		currPos += SizeOfXLogRecordBlockHeader;
 
-// 		XLogRecordBlockHeader block_hdr;
-// 		block_hdr.id = block_id;
-// 		block_hdr.fork_flags = WalRecDecoded->blocks[block_id].flags;
-// 		block_hdr.data_length = WalRecDecoded->blocks[block_id].data_len;
+		Assert(!(WaldiffRecord->blocks[id].blk_hdr.fork_flags & BKPBLOCK_HAS_IMAGE));
 
-// 		// if (writer->writeBufSize == 0x000000c0)
-// 		// 	ereport(LOG, errmsg("\nBLOCK ID = %u\nFORK FLAGS = 0x%x\nDATA LEN = %u", block_hdr.id, block_hdr.fork_flags, block_hdr.data_length));
+		if (!(WaldiffRecord->blocks[id].blk_hdr.fork_flags & BKPBLOCK_SAME_REL))
+		{
+			relfileloc = WaldiffRecord->blocks[id].file_loc;
 
-// 		memcpy(WalRec + currPos, &block_hdr, SizeOfXLogRecordBlockHeader);
-// 		currPos += SizeOfXLogRecordBlockHeader;
+			memcpy(WalRec + currPos, &relfileloc, sizeof(RelFileLocator));
+			currPos += sizeof(RelFileLocator);
+		}
 
-// 		if (block_hdr.fork_flags & BKPBLOCK_HAS_IMAGE)
-// 		{
-// 			XLogRecordBlockImageHeader image_hdr;
-// 			image_hdr.length = WalRecDecoded->blocks[block_id].bimg_len;
-// 			image_hdr.hole_offset = WalRecDecoded->blocks[block_id].hole_offset;
-// 			image_hdr.bimg_info = WalRecDecoded->blocks[block_id].bimg_info;
+		blk_num = WaldiffRecord->blocks[id].blknum;
 
-// 			// if (writer->writeBufSize == 0x000000c0)
-// 			// 	ereport(LOG, errmsg("\nHAS IMAGE\nIMAGE LEN = %u\nHOLE OFFSET = %u\nBIMG INFO = 0x%x", image_hdr.length, image_hdr.hole_offset, image_hdr.bimg_info));
+		memcpy(WalRec + currPos, &blk_num, sizeof(BlockNumber));
+		currPos += sizeof(BlockNumber);
+	}
 
-// 			memcpy(WalRec + currPos, &image_hdr, SizeOfXLogRecordBlockImageHeader);
-// 			currPos += SizeOfXLogRecordBlockImageHeader;
+	if (WaldiffRecord->main_data_len > 0)
+	{
+		if (WaldiffRecord->main_data_len < 256)
+		{
+			XLogRecordDataHeaderShort main_hdr;
 
-// 			if (((image_hdr.bimg_info) & BKPIMAGE_HAS_HOLE) && (BKPIMAGE_COMPRESSED(image_hdr.bimg_info)))
-// 			{
-// 				XLogRecordBlockCompressHeader compress_hdr;
-// 				compress_hdr.hole_length = WalRecDecoded->blocks[block_id].hole_length;
+			main_hdr.id = XLR_BLOCK_ID_DATA_SHORT;
+			main_hdr.data_length = WaldiffRecord->main_data_len;
 
-// 				// if (writer->writeBufSize == 0x000000c0)
-// 				// 	ereport(LOG, errmsg("\nCOMPRESSED IMAGE\n = %u\nHOLE len = %u", compress_hdr.hole_length));
+			memcpy(WalRec + currPos, &main_hdr, SizeOfXLogRecordDataHeaderShort);
+			currPos += SizeOfXLogRecordDataHeaderShort;
+		}
+		else
+		{
+			XLogRecordDataHeaderLong main_hdr;
 
-// 				memcpy(WalRec + currPos, &compress_hdr, SizeOfXLogRecordBlockCompressHeader);
-// 				currPos += SizeOfXLogRecordBlockCompressHeader;
-// 			}
-// 		}
+			main_hdr.id = XLR_BLOCK_ID_DATA_LONG;
 
-// 		if (!(block_hdr.fork_flags & BKPBLOCK_SAME_REL))
-// 		{
-// 			RelFileLocator relfileloc;
-// 			relfileloc = WalRecDecoded->blocks[block_id].rlocator;
-// 			memcpy(WalRec + currPos, &relfileloc, sizeof(RelFileLocator));
-// 			currPos += sizeof(RelFileLocator);
+			memcpy(WalRec + currPos, &main_hdr, sizeof(uint8));
+			currPos += sizeof(uint8);
 
-// 			// if (writer->writeBufSize == 0x000000c0)
-// 			// 		ereport(LOG, errmsg("\nHAS RELFILE LOC = 0x%x 0x%x 0x%x", relfileloc.spcOid, relfileloc.dbOid, relfileloc.relNumber));
+			memcpy(WalRec + currPos, &(WaldiffRecord->main_data_len), sizeof(uint32));
+			currPos += sizeof(uint32);
+		}
+	}
 
-// 		}
-
-// 		BlockNumber blk_num = WalRecDecoded->blocks[block_id].blkno;
-// 		memcpy(WalRec + currPos, &blk_num, sizeof(BlockNumber));
-// 		currPos += sizeof(BlockNumber);
-
-// 		// if (writer->writeBufSize == 0x000000c0)
-// 		// 			ereport(LOG, errmsg("\nBLOCKNUM = %x", blk_num));
-// 	}
-
-// 	if (WalRecDecoded->main_data_len > 0)
-// 	{
-// 		if (WalRecDecoded->main_data_len < 256)
-// 		{
-// 			XLogRecordDataHeaderShort main_hdr;
-// 			main_hdr.id = XLR_BLOCK_ID_DATA_SHORT;
-// 			main_hdr.data_length = WalRecDecoded->main_data_len;
-
-// 			// if (writer->writeBufSize == 0x000000c0)
-// 			// 		ereport(LOG, errmsg("\nSHORT MAIN DATA HDR"));
-
-// 			memcpy(WalRec + currPos, &main_hdr, SizeOfXLogRecordDataHeaderShort);
-// 			currPos += SizeOfXLogRecordDataHeaderShort;
-// 		}
-// 		else
-// 		{
-// 			XLogRecordDataHeaderLong main_hdr;
-// 			main_hdr.id = XLR_BLOCK_ID_DATA_LONG;
-
-// 			// if (writer->writeBufSize == 0x000000c0)
-// 			// 		ereport(LOG, errmsg("\nLONG MAIN DATA HDR"));
-
-// 			memcpy(WalRec + currPos, &main_hdr, sizeof(uint8));
-// 			currPos += sizeof(uint8);
-
-// 			memcpy(WalRec + currPos, &(WalRecDecoded->main_data_len), sizeof(uint32));
-// 			currPos += sizeof(uint32);
-// 		}
-// 	}
-
-// 	for (int block_id = 0; block_id <= WalRecDecoded->max_block_id; block_id++)
-// 	{
-// 		Assert(currPos < WalRecDecoded->header.xl_tot_len);
-// 		if (WalRecDecoded->blocks[block_id].has_data) {
-// 			memcpy(WalRec + currPos, WalRecDecoded->blocks[block_id].data, WalRecDecoded->blocks[block_id].data_len);
-// 			currPos += WalRecDecoded->blocks[block_id].data_len;
-// 		}
-
-// 		if (WalRecDecoded->blocks[block_id].has_image)
-// 		{
-// 			memcpy(WalRec + currPos, WalRecDecoded->blocks[block_id].bkp_image, WalRecDecoded->blocks[block_id].bimg_len);
-// 			currPos += WalRecDecoded->blocks[block_id].bimg_len;
-// 		}
-// 	}
+	for (int block_id = 0; block_id <= WaldiffRecord->max_block_id; block_id++)
+	{
+		if (WaldiffRecord->blocks[block_id].has_data) {
+			memcpy(WalRec + currPos, WaldiffRecord->blocks[block_id].block_data, WaldiffRecord->blocks[block_id].block_data_len);
+			currPos += WaldiffRecord->blocks[block_id].block_data_len;
+		}
+	}
 	
-// 	memcpy(WalRec + currPos, WalRecDecoded->main_data, WalRecDecoded->main_data_len);
-// 	currPos +=  WalRecDecoded->main_data_len;
+	memcpy(WalRec + currPos, WaldiffRecord->main_data, WaldiffRecord->main_data_len);
+	currPos +=  WaldiffRecord->main_data_len;
 
-// 	ereport(LOG, errmsg("LSN = %X/%X :: currPos = %u; tot_len = %u", LSN_FORMAT_ARGS(WalRecDecoded->lsn), currPos, WalRecDecoded->header.xl_tot_len));
-// 	Assert(currPos == WalRecDecoded->header.xl_tot_len);
+	Assert(currPos == WaldiffRecord->rec_hdr.xl_tot_len);
 
-// 	return WalRec;
-// }
+	return (XLogRecord *) WalRec;
+}
 
 // /*
 //  * fetch_hot_update
