@@ -118,6 +118,8 @@ WaldiffWriterWrite(WaldiffWriter *writer,
 			page_hdr.xlp_pageaddr = writer->WriteRecPtr;
 			page_hdr.xlp_rem_len = writer->writeRestRecordBufSize;
 
+			// page_hdr.xlp_info |= XLP_BKP_REMOVABLE;
+
 			if (page_hdr.xlp_rem_len > 0)
 				page_hdr.xlp_info |= XLP_FIRST_IS_CONTRECORD;
 

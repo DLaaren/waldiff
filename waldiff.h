@@ -47,6 +47,7 @@
 #include "utils/relfilenumbermap.h"
 #include "commands/dbcommands.h"
 #include "postmaster/bgworker.h"
+#include "utils/lsyscache.h"
 
 /*--------------------------Public defines-------------------------*/
 typedef struct WaldiffBlock 
@@ -114,6 +115,7 @@ _hash_combine(uint32_t seed, uint32_t value)
     key = _hash_combine(key, (record)->blocks[0].file_loc.spcOid); 							\
     key = _hash_combine(key, (record)->blocks[0].file_loc.dbOid); 							\
     key = _hash_combine(key, (record)->blocks[0].file_loc.relNumber); 						\
+	key = _hash_combine(key, (record)->blocks[0].forknum); 									\
 	key = _hash_combine(key, BlockIdGetBlockNumber(&((record)->current_t_ctid.ip_blkid)));	\
     key = _hash_combine(key, (record)->current_t_ctid.ip_posid); 							\
     key + 1; 																				\
@@ -126,6 +128,7 @@ _hash_combine(uint32_t seed, uint32_t value)
     key = _hash_combine(key, (record)->blocks[0].file_loc.spcOid); 						\
     key = _hash_combine(key, (record)->blocks[0].file_loc.dbOid); 						\
     key = _hash_combine(key, (record)->blocks[0].file_loc.relNumber); 					\
+	key = _hash_combine(key, (record)->blocks[0].forknum); 								\
     key = _hash_combine(key, BlockIdGetBlockNumber(&((record)->prev_t_ctid.ip_blkid)));	\
     key = _hash_combine(key, (record)->prev_t_ctid.ip_posid); 							\
     key + 1; 																			\

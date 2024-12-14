@@ -43,16 +43,10 @@ static void constructing_waldiff(XLogRecPtr *last_checkpoint);
 static void ReadControlFile(void);
 static void WriteControlFile(void);
 
-static void free_waldiff_record(WaldiffRecord record);
+static void free_waldiff_record(WaldiffRecord record); /* Helper function */
 
+static int overlay_hot_update(WaldiffRecord prev_tup, WaldiffRecord curr_tup);
 
-
-
-// static int overlay_hot_update(WaldiffRecord prev_tup, WaldiffRecord curr_tup);
-// static XLogRecord *constructWALDIFF(WaldiffRecord WaldiffRec);
-
-// /* Helper functions */
-// static void free_waldiff_record(WaldiffRecord record);
 
 #define WalRecordHasImage(WalRec)					\
 (													\
@@ -267,97 +261,88 @@ collecting_chains(void)
 						ereport(ERROR, errmsg("WALDIFF: decode_insert failed"));
 
 					hash_key = GetHashKeyOfWaldiffRecord(WaldiffRec);
-					hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
+					entry = hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
 					if (is_found)
-						ereport(ERROR, errmsg("WALDIFF: found HTAB entry that shouldn't be there"));
+						ereport(WARNING, errmsg("WALDIFF: found HTAB entry with lsn = %08X/%08X that shouldn't be there for record with lsn = %08X/%08X\n"
+											  "type = %x:  relnum = %u; forknum = %u; blknum = %u; offset = %u; prev offset = %u \n"
+											  "type = %x: curr relnum = %u; curr forknum = %u; curr blknum = %u; curr offset = %u;\n",
+											   LSN_FORMAT_ARGS(entry->data->chain_start_lsn), LSN_FORMAT_ARGS(lsn),
+											   GetRecordType(entry->data), entry->data->blocks[0].file_loc.relNumber, entry->data->blocks[0].forknum, entry->data->blocks[0].blknum, entry->data->current_t_ctid.ip_posid, entry->data->prev_t_ctid.ip_posid,
+											   GetRecordType(WaldiffRec), WaldiffRec->blocks[0].file_loc.relNumber, WaldiffRec->blocks[0].forknum, WaldiffRec->blocks[0].blknum, WaldiffRec->current_t_ctid.ip_posid));
 
-					entry = (HTABEntry *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
+					entry = (HTABEntry *) hash_search(hash_table, (void *) &hash_key, HASH_ENTER, NULL);
 					entry->data = WaldiffRec;
 
 					Assert(entry->key == hash_key);
 
-// #define WALDIFF_DEBUG
-
-#ifdef WALDIFF_DEBUG
-					ereport(LOG, errmsg("WALDIFF: HEAP INSERT record lsn = %X/%X; hash_key = %u; chain length = %u", 
-										LSN_FORMAT_ARGS(entry->data->chain_start_lsn), hash_key, entry->data->chain_length));
-#endif				
+					ereport(LOG, errmsg("WALDIFF: HEAP INSERT record lsn = %08X/%08X;",	LSN_FORMAT_ARGS(lsn)));
 					break;
 				}
 
-// 				case XLOG_HEAP_HOT_UPDATE:
-// 				{
-// 					fetch_hot_update(&WaldiffRec);
-// 					if (WaldiffRec == NULL)
-// 						ereport(ERROR, errmsg("WALDIFF: fetch_hot_update failed"));
+				case XLOG_HEAP_HOT_UPDATE:
+				{
+					WaldiffRec = WalDiffDecodeRecord(WalRec, lsn);
+					pfree(WalRec);
 
-// 					prev_hash_key = GetHashKeyOfPrevWALDIFFRecord(WaldiffRec);
-// 					hash_key = GetHashKeyOfWALDIFFRecord(WaldiffRec);
+					if (WaldiffRec == NULL)
+						ereport(ERROR, errmsg("WALDIFF: decode_update failed"));
 
-// 					entry = (HTABEntry *) hash_search(hash_table, (void*) &prev_hash_key, HASH_FIND, &is_found);
-// 					if (is_found)
-// 					{
-// 						int overlay_result;
+					prev_hash_key = GetHashKeyOfPrevWaldiffRecord(WaldiffRec);
+					hash_key = GetHashKeyOfWaldiffRecord(WaldiffRec);
 
-// #ifdef WALDIFF_DEBUG
-// 						ereport(LOG, errmsg("WALDIFF: HEAP HOT UPDATE record has previous record"));
-// #endif		
+					entry = (HTABEntry *) hash_search(hash_table, (void *) &hash_key, HASH_FIND, &is_found);
+					if (is_found)
+						ereport(WARNING, errmsg("WALDIFF: found HTAB entry with lsn = %08X/%08X that shouldn't be there for record with lsn = %08X/%08X\n"
+											  "type = %x:  relnum = %u; forknum = %u; blknum = %u; offset = %u; prev offset = %u \n"
+											  "type = %x: curr relnum = %u; curr forknum = %u; curr blknum = %u; curr offset = %u;\n",
+											   LSN_FORMAT_ARGS(entry->data->chain_start_lsn), LSN_FORMAT_ARGS(lsn),
+											   GetRecordType(entry->data), entry->data->blocks[0].file_loc.relNumber, entry->data->blocks[0].forknum, entry->data->blocks[0].blknum, entry->data->current_t_ctid.ip_posid, entry->data->prev_t_ctid.ip_posid,
+											   GetRecordType(WaldiffRec), WaldiffRec->blocks[0].file_loc.relNumber, WaldiffRec->blocks[0].forknum, WaldiffRec->blocks[0].blknum, WaldiffRec->current_t_ctid.ip_posid));
 
-// 						overlay_result = overlay_hot_update(entry->data, WaldiffRec);
 
-// 						overlay_result = 0;
+					entry = (HTABEntry *) hash_search(hash_table, (void *) &prev_hash_key, HASH_FIND, &is_found);
+					if (is_found)
+					{
+						int overlay_result = 0;
 
-// 						if (overlay_result == -1)
-// 						{
-// 							/*
-// 							 * Overlaying failed - we must store both records, the previous one is already in the HTAB
-// 							 */
-// 							entry = (HTABEntry *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
-// 							entry->data = WaldiffRec;
+						Assert(entry != NULL);
 
-// #ifdef WALDIFF_DEBUG
-// 							ereport(LOG, errmsg("WALDIFF: cannot overlay HEAP HOT UPDATE record"));
-// #endif		
-// 						}
-// 						else
-// 						{
-// 							/*
-// 							 * Overlaying suceeded - we must store one overlaied record and free the previous one
-// 							 */
-// 							WaldiffRecord overlaied_WDRec = entry->data;
+						// ereport(LOG, errmsg("WALDIFF: HEAP HOT UPDATE record has previous record"));
 
-// 							entry = (HTABEntry *) hash_search(hash_table, (void*) &prev_hash_key, HASH_REMOVE, NULL);
+						overlay_result = overlay_hot_update(entry->data, WaldiffRec);
+						if (overlay_result == -1)
+						{
+							/* Overlaying failed - we must store both records, the previous one is already in the HTAB */
+							entry = (HTABEntry *) hash_search(hash_table, (void *) &hash_key, HASH_ENTER, NULL);
+							entry->data = WaldiffRec;
+						}
+						else
+						{
+							/* Overlaying suceeded - we must store one overlaied record and free the previous one */
+							WaldiffRecord overlaied_WDRec = entry->data;
 
-// 							Assert(entry != NULL);
-// 							Assert(entry->data != NULL);
-// 							free_waldiff_record(entry->data);
+							entry = (HTABEntry *) hash_search(hash_table, (void*) &prev_hash_key, HASH_FIND, NULL);
+							Assert(entry != NULL);
+							free_waldiff_record(entry->data);
+							(HTABEntry *) hash_search(hash_table, (void*) &prev_hash_key, HASH_REMOVE, NULL);
 
-// 							entry = (HTABEntry *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
-// 							entry->data = overlaied_WDRec;
+							entry = (HTABEntry *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
+							entry->data = overlaied_WDRec;
 
-// 							entry->data->chain_length += 1;
-// #ifdef WALDIFF_DEBUG
-// 							ereport(LOG, errmsg("WALDIFF: overlaied HEAP HOT UPDATE record"));
-// #endif		
-// 						}
-// 					}
-// 					else 
-// 					{
-// #ifdef WALDIFF_DEBUG
-// 						// ereport(LOG, errmsg("WALDIFF: HEAP HOT UPDATE record has no previous record"));
-// #endif	
-// 						entry = (HTABEntry *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
-// 						entry->data = WaldiffRec;
-// 					}
-// 					Assert(entry->key == hash_key);
+							entry->data->chain_length += 1;
+						}
+					}
+					else 
+					{
+						entry = (HTABEntry *) hash_search(hash_table, (void*) &hash_key, HASH_ENTER, NULL);
+						entry->data = WaldiffRec;
+					}
+					Assert(entry->key == hash_key);
 
-// #ifdef WALDIFF_DEBUG
-// 					ereport(LOG, errmsg("WALDIFF: HEAP HOT UPDATE record lsn = %X/%X; hash_key = %u; prev_hash_key = %u; chain lenght = %u; blknum = %d; old_offnum = %u; new_offnum = %u", 
-// 										LSN_FORMAT_ARGS(entry->data->lsn), hash_key, prev_hash_key, entry->data->chain_length, 
-// 										entry->data->blocks[0].blknum, ((xl_heap_update *)(entry->data->main_data))->old_offnum, ((xl_heap_update *)(entry->data->main_data))->new_offnum));
-// #endif		
-// 					break;
-				// }
+					ereport(LOG, errmsg("WALDIFF: HEAP HOT UPDATE record lsn = %08X/%08X;",	LSN_FORMAT_ARGS(lsn)));
+					// ereport(LOG, errmsg("WALDIFF: HEAP HOT UPDATE hash key = %u;", hash_key));
+					break;
+				}
 
 				/* unprocessed record type */
 				default:
@@ -398,32 +383,41 @@ constructing_waldiff(XLogRecPtr *last_checkpoint)
 		   without image */
 		/* firstly check in hash map*/
 		if (WalRec->xl_rmid == RM_HEAP_ID && !WalRecordHasImage(WalRec) &&
-		   	((WalRec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_INSERT)) // || 
-			// (WalRec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_HOT_UPDATE))
+		   	((WalRec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_INSERT || 
+			(WalRec->xl_info & XLOG_HEAP_OPMASK) == XLOG_HEAP_HOT_UPDATE))
 		{
 			uint32_t hash_key;
 			HTABEntry *entry;
 			bool is_found;
 
 			WaldiffRec = WalDiffDecodeRecord(WalRec, lsn);
-			pfree(WalRec);
-			hash_key = GetHashKeyOfWaldiffRecord(WaldiffRec);
+
+			hash_key = GetHashKeyOfWaldiffRecord(WaldiffRec);			
 			free_waldiff_record(WaldiffRec);
-			
+
 			entry = (HTABEntry *) hash_search(hash_table, (void*) &hash_key, HASH_FIND, &is_found);
 
-			if (entry && is_found)
+			if (is_found)
 			{
+				Assert(entry != NULL);
+				// ereport(LOG, errmsg("FOUND HOT UPD in HTAB with hash key = %u", hash_key));
 				WaldiffRec = entry->data;
 				Assert(WaldiffRec != NULL);
 
+				pfree(WalRec);
 				WalRec = WalDiffEncodeRecord(WaldiffRec);
 				free_waldiff_record(WaldiffRec);
 
 				WaldiffWriterWrite(writer, WalRec);
 				pfree(WalRec);
 				
-				hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, &is_found);
+				hash_search(hash_table, (void*) &hash_key, HASH_REMOVE, NULL);
+			}
+			else 
+			{
+				Assert(entry == NULL);
+				WaldiffWriterWrite(writer, WalRec);
+				pfree(WalRec);
 			}
 			continue;
 		}
@@ -465,6 +459,10 @@ static void free_waldiff_record(WaldiffRecord record)
 	Assert(record);
 	pfree(record);
 }
+
+
+
+
 
 static void
 get_old_tuple(HeapTupleData *old_tuple, Relation relation, 
@@ -604,8 +602,8 @@ overlay_tuple(TupleDesc tuple_desc, HeapTuple prev_tuple, HeapTuple curr_tuple)
 /* 
  * After this function, curr_tup can be deallocated (if return value is 0)
  *
- * insert block data = xl_heap_header + t_bits + padding + oid + tuple
- * update block data = prefix + suffix + xl_heap_header + t_bits + padding + oid + tuple
+ * insert block data = xl_heap_header + t_bits + padding + (oid) + tuple
+ * update block data = prefix + suffix + xl_heap_header + t_bits + padding + (oid) + tuple
  */
 static int
 overlay_hot_update(WaldiffRecord prev_record, WaldiffRecord curr_record)
@@ -625,8 +623,10 @@ overlay_hot_update(WaldiffRecord prev_record, WaldiffRecord curr_record)
 	char 		 *new_insert_block_data; // = xl_heap_hdr + bitmap + padding + (oid) + tuple
 	Size  		  new_insert_block_data_len = 0;
 
-	Oid 		  spcOid = prev_record->blocks[0].file_loc.spcOid;
+	Oid 		  spcOid 	= prev_record->blocks[0].file_loc.spcOid;
+	Oid			  dbOid 	= prev_record->blocks[0].file_loc.dbOid;
 	RelFileNumber relNumber = prev_record->blocks[0].file_loc.relNumber;
+	BlockNumber   blknum 	= prev_record->blocks[0].blknum;
 	Oid 		  rel_oid;
 	Relation 	  relation;
 	TupleDesc 	  tuple_desc;
@@ -646,48 +646,35 @@ overlay_hot_update(WaldiffRecord prev_record, WaldiffRecord curr_record)
 	if (curr_tuple == NULL)
 		curr_tuple = palloc(HEAPTUPLESIZE);
 
-	ereport(LOG, errmsg("MyDatabaseId = %d", MyDatabaseId));
-	MyDatabaseId = prev_record->blocks[0].file_loc.dbOid;
+	MyDatabaseId = dbOid;
 
-#ifdef WALDIFF_DEBUG
-	ereport(LOG, errmsg("WALDIFF: overlaying HEAP HOT UPDATE record: dbOid = %d, spaceOid = %d and relNum = %d", 
-						MyDatabaseId,
-						spcOid, 
-						relNumber));
-#endif		
+	ereport(LOG, errmsg("WALDIFF: overlaying HEAP HOT UPDATE record: \n"\
+						"dbOid = %u; spaceOid = %u; relNum = %u; blknum = %u",
+						dbOid, spcOid, relNumber, blknum));
 
 	Assert(!IsTransactionState());
-	StartTransactionCommand();
-
 	Assert(RelFileNumberIsValid(relNumber));
-	rel_oid = RelidByRelfilenumber(spcOid, relNumber);
 
+	StartTransactionCommand();
+	rel_oid = RelidByRelfilenumber(spcOid, relNumber);
 	CommitTransactionCommand();
 	Assert(OidIsValid(rel_oid));
 
-#ifdef WALDIFF_DEBUG
 	ereport(LOG, errmsg("WALDIFF: relation oid = %d", rel_oid));
-#endif	
 
-	// getting relation can be done only inside transaction
-	
+	StartTransactionCommand();
 	relation = RelationIdGetRelation(rel_oid);
+	CommitTransactionCommand();
 
 	Assert(relation != NULL);
-
-#ifdef WALDIFF_DEBUG
 	ereport(LOG, errmsg("WALDIFF: got relation"));
-#endif	
-
 	MyDatabaseId = 0;
 
 	tuple_desc = RelationGetDescr(relation);
 
 	Assert(tuple_desc != NULL);
 
-#ifdef WALDIFF_DEBUG
 	ereport(LOG, errmsg("WALDIFF: got tuple desc"));
-#endif	
 
 	prev_main_data = prev_record->main_data;
 	curr_main_data = curr_record->main_data;
@@ -701,9 +688,8 @@ overlay_hot_update(WaldiffRecord prev_record, WaldiffRecord curr_record)
 	prev_block_tuple_len = prev_record->blocks[0].block_data_len - SizeOfHeapHeader;
 	curr_block_tuple_len = curr_record->blocks[0].block_data_len - SizeOfHeapHeader;
 
-#ifdef WALDIFF_DEBUG
 	ereport(LOG, errmsg("WALDIFF: checking for suffix and prefix"));
-#endif	
+
 	if (GetRecordType(prev_record) == XLOG_HEAP_HOT_UPDATE) 
 	{
 		// before overlaying tuples get full tuple data if there is prefix or/and suffix from the old one
@@ -778,6 +764,8 @@ overlay_hot_update(WaldiffRecord prev_record, WaldiffRecord curr_record)
 		((xl_heap_update *) prev_main_data)->new_offnum = ((xl_heap_update *)curr_main_data)->new_offnum;
 		((xl_heap_update *) prev_main_data)->new_xmax = ((xl_heap_update *)curr_main_data)->new_xmax;
 	}
+
+	RelationClose(relation);
 
 	return 0;
 }
