@@ -8,7 +8,7 @@ WaldiffOpenSegment(WaldiffReader *reader,
 static void 
 WaldiffCloseSegment(WaldiffReader *reader);
 
-static void
+static int
 WaldiffReadToBuffer(WaldiffReader *reader);
 
 static void
@@ -102,7 +102,8 @@ WaldiffReaderRead(WaldiffReader *reader, XLogRecPtr *lsn)
 		non_read_space = XLOG_BLCKSZ - MAXALIGN(reader->readBufSize);
 		if (non_read_space == 0) 
 		{
-			WaldiffReadToBuffer(reader);
+			if (WaldiffReadToBuffer(reader) == -1)
+				return NULL;
 			continue;
 		}
 
@@ -164,7 +165,8 @@ WaldiffReaderRead(WaldiffReader *reader, XLogRecPtr *lsn)
 
 				rest_record_len -= non_read_space;		
 
-				WaldiffReadToBuffer(reader);
+				if (WaldiffReadToBuffer(reader) == -1)
+					return NULL;
 
 				continue;
 			}
@@ -208,7 +210,8 @@ WaldiffReaderRead(WaldiffReader *reader, XLogRecPtr *lsn)
 			reader->readRestRecordBufSize = non_read_space; 
 			record_len = record_len - non_read_space;
 
-			WaldiffReadToBuffer(reader);
+			if (WaldiffReadToBuffer(reader) == -1)
+					return NULL;
 
 			continue;
 		}
@@ -257,7 +260,7 @@ WaldiffCloseSegment(WaldiffReader *reader)
 	reader->seg.ws_file = -1;
 }
 
-static void
+static int
 WaldiffReadToBuffer(WaldiffReader *reader)
 {
 	int read_bytes;
@@ -272,10 +275,17 @@ WaldiffReadToBuffer(WaldiffReader *reader)
 	pgstat_report_wait_end();
 
 	if (read_bytes != XLOG_BLCKSZ)
+	{
 		ereport(ERROR, errmsg("read %d of %d bytes from file \"%d\": %m", read_bytes, XLOG_BLCKSZ, reader->seg.ws_file));
+	}
 	else if (read_bytes == 0)
-		ereport(ERROR, errmsg("file descriptor closed for read \"%d\": %m", reader->seg.ws_file));
+	{
+		ereport(WARNING, errmsg("file descriptor closed for read \"%d\": %m", reader->seg.ws_file));
+		return -1;
+	}
 
 	reader->ReadRecPtr += read_bytes;
 	reader->readBufSize = 0;
+
+	return 0;
 }
