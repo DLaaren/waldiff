@@ -206,7 +206,6 @@ WaldiffWriterWrite(WaldiffWriter *writer,
 
 			return;
 		}
-		
 	}
 }
 
@@ -223,11 +222,13 @@ WaldiffOpenSegment(WaldiffWriter *writer,
 
 	if (snprintf(fpath, MAXPGPATH, "%s/%s", writer->segcxt.ws_dir, fname) == -1)
 		ereport(ERROR,
-				errmsg("WALDIFF: error during reading WAL absolute path : %s/%s", writer->segcxt.ws_dir, fname));
+				errmsg("WALDIFF: error during reading WALDIFF absolute path : %s/%s", writer->segcxt.ws_dir, fname));
 
-	writer->seg.ws_file = OpenTransientFile(fpath, PG_BINARY | O_WRONLY | O_CREAT | O_APPEND);
+	writer->seg.ws_file = open(fpath, PG_BINARY | O_WRONLY | O_CREAT | O_APPEND | O_SYNC);
 	if (writer->seg.ws_file == -1)
-		ereport(ERROR, errmsg("WALDIFF: could not open WAL segment \"%s\": %m", fpath));
+		ereport(ERROR, errmsg("WALDIFF: could not open WALDIFF segment \"%s\": %m", fpath));
+
+	ereport(LOG, errmsg("WALDIFF: OPENED WALDIFF SEGMENT"));
 
 	writer->seg.ws_tli = tli;
 	writer->seg.ws_segno = nextSegNo;

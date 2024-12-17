@@ -244,9 +244,11 @@ WaldiffOpenSegment(WaldiffReader *reader,
 		ereport(ERROR,
 				errmsg("WALDIFF: error during reading WAL absolute path : %s/%s", reader->segcxt.ws_dir, fname));
 
-	reader->seg.ws_file = OpenTransientFile(fpath, PG_BINARY | O_RDONLY);
+	reader->seg.ws_file = open(fpath, PG_BINARY | O_RDONLY);
 	if (reader->seg.ws_file == -1)
 		ereport(ERROR, errmsg("WALDIFF: could not open WAL segment \"%s\": %m", fpath));
+
+	ereport(LOG, errmsg("WALDIFF: OPENED WAL SEGMENT"));
 
 	reader->seg.ws_tli = tli;
 	reader->seg.ws_segno = nextSegNo;
