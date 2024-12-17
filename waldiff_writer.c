@@ -224,7 +224,7 @@ WaldiffOpenSegment(WaldiffWriter *writer,
 		ereport(ERROR,
 				errmsg("WALDIFF: error during reading WALDIFF absolute path : %s/%s", writer->segcxt.ws_dir, fname));
 
-	writer->seg.ws_file = open(fpath, PG_BINARY | O_WRONLY | O_CREAT | O_APPEND | O_SYNC);
+	writer->seg.ws_file = BasicOpenFile(fpath, PG_BINARY | O_WRONLY | O_CREAT | O_APPEND | O_SYNC);
 	if (writer->seg.ws_file == -1)
 		ereport(ERROR, errmsg("WALDIFF: could not open WALDIFF segment \"%s\": %m", fpath));
 
